@@ -1,11 +1,54 @@
 use crate::model::*;
-use crate::normalize::is_ip_literal;
+use crate::normalize::{is_ip_literal, normalize_path};
 use rusqlite::{params, OptionalExtension};
 use sg_core::Vault;
 
+const FORBIDDEN_TARGET_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "proxy-connection",
+];
+
+/// `*` only as the single last character, no `?`/`#`, and already in normalized form
+/// (uppercase hex in every escape, so what is authorized is exactly what is forwarded).
+fn valid_path_pattern(p: &str) -> bool {
+    if p == "*" {
+        return true;
+    }
+    let body = p.strip_suffix('*').unwrap_or(p);
+    let b = body.as_bytes();
+    let escapes_ok = b.iter().enumerate().all(|(i, &c)| {
+        c != b'%'
+            || (b.len() > i + 2
+                && b[i + 1..i + 3]
+                    .iter()
+                    .all(|h| h.is_ascii_digit() || (b'A'..=b'F').contains(h)))
+    });
+    body.starts_with('/')
+        && !body.contains(['*', '?', '#'])
+        && escapes_ok
+        && normalize_path(body) == body
+}
+
 fn valid_host_pattern(p: &str) -> bool {
+    let wildcard = p.starts_with("*.");
     let body = p.strip_prefix("*.").unwrap_or(p);
-    !body.is_empty()
+    // `*.com` is too broad; bare labels are only allowed for `localhost`.
+    let labels_ok = if body.contains('.') {
+        true
+    } else {
+        !wildcard && body == "localhost"
+    };
+    labels_ok
+        && !body.is_empty()
         && !is_ip_literal(body)
         && body.contains(|c: char| c.is_ascii_alphabetic())
         && !body.contains('*')
@@ -23,9 +66,9 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
             "host_pattern must be a lowercase hostname or *.hostname (no IPs)",
         ));
     }
-    if !(r.path_pattern == "*" || r.path_pattern.starts_with('/')) {
+    if !valid_path_pattern(&r.path_pattern) {
         return Err(PolicyError::Invalid(
-            "path_pattern must be * or start with /",
+            "path_pattern must be * or a normalized path starting with / (optional trailing *)",
         ));
     }
     if r.methods
@@ -37,7 +80,12 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
         ));
     }
     let name_ok = match r.kind {
-        InjectionKind::Header => http::HeaderName::from_bytes(r.target_name.as_bytes()).is_ok(),
+        InjectionKind::Header => {
+            http::HeaderName::from_bytes(r.target_name.as_bytes()).is_ok()
+                && !FORBIDDEN_TARGET_HEADERS
+                    .iter()
+                    .any(|h| r.target_name.eq_ignore_ascii_case(h))
+        }
         InjectionKind::Query => {
             !r.target_name.is_empty()
                 && r.target_name
@@ -55,6 +103,11 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
     {
         return Err(PolicyError::Invalid(
             "template must contain {secret} and no CR/LF/NUL",
+        ));
+    }
+    if r.kind == InjectionKind::Query && r.template != "{secret}" {
+        return Err(PolicyError::Invalid(
+            "query template must be exactly {secret}",
         ));
     }
     if get_role(v, &r.role)?.is_none() {

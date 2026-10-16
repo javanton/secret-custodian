@@ -144,12 +144,19 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
 - `methods`: lista (`GET`, `POST`...), por defecto todos.
 - Inyección `header`: `target_name` = nombre de cabecera, `template` p. ej. `Bearer {secret}` o
   `Basic {secret}`.
-- Inyección `query`: `target_name` = parámetro, `template` = `{secret}`.
+- Inyección `query`: `target_name` = parámetro, `template` exactamente `{secret}`. Las cabeceras de
+  enmarcado y hop-by-hop (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`,
+  `TE`, `Trailer`, `Upgrade`, `Proxy-*`) no pueden ser destino de inyección.
 - Las reglas comparan el **hostname** normalizado (minúsculas, sin punto final, sin puerto); el
   puerto no forma parte del patrón. Los hosts con forma de IP no admiten reglas.
 - El path se normaliza antes de comparar (segmentos `.`/`..` resueltos, escapes de caracteres no
   reservados decodificados, `//` colapsado) y **se reenvía el path normalizado**: lo autorizado es
-  lo enviado.
+  lo enviado. Además se compara una forma estricta (decodificación porcentual repetida, `\` como `/`,
+  `;params` eliminados, puntos resueltos) y **ambas formas deben coincidir** con la regla; si la forma
+  estricta no se puede calcular (NUL, UTF-8 inválido, codificación sin fin) no coincide ninguna regla
+  salvo `*`. Un `/` codificado solo se admite mientras permanezca dentro del prefijo de la regla.
+- Por cada destino de inyección gana la regla más específica (host exacto, path exacto, patrón más
+  largo). Si su método queda excluido, la respuesta es `403`: no se cae a una regla más amplia.
 - Los valores de secreto no pueden contener CR, LF ni NUL; en inyección `query` el valor se codifica
   en porcentaje.
 

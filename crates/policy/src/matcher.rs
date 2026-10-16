@@ -1,4 +1,5 @@
 use crate::model::{InjectionKind, Rule};
+use crate::normalize::strict_path;
 use std::collections::HashMap;
 
 pub enum Decision<'a> {
@@ -21,18 +22,32 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+/// Path matching on two views: the forwarded (normalized) form against the pattern as written,
+/// AND the strict form (`strict_path`) against the strict form of the pattern. Both must match.
+/// `*` matches everything. An unjudgeable path (`strict` is `None`) matches no other pattern.
+fn path_matches(pattern: &str, path: &str, strict: Option<&str>) -> bool {
     if pattern == "*" {
         return true;
     }
+    let Some(strict) = strict else {
+        return false;
+    };
     match pattern.strip_suffix('*') {
-        Some(prefix) => path.starts_with(prefix),
-        None => pattern == path,
+        Some(prefix) => {
+            path.starts_with(prefix)
+                && strict_path(prefix).is_some_and(|sp| strict.starts_with(&sp))
+        }
+        None => pattern == path && strict_path(pattern).is_some_and(|sp| sp == strict),
     }
 }
 
-fn specificity(r: &Rule, host: &str) -> (u8, usize) {
-    (u8::from(r.host_pattern == host), r.path_pattern.len())
+/// (exact host, exact path, path pattern length): higher wins.
+fn specificity(r: &Rule, host: &str) -> (bool, bool, usize) {
+    (
+        r.host_pattern == host,
+        !r.path_pattern.ends_with('*'),
+        r.path_pattern.len(),
+    )
 }
 
 pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
@@ -40,34 +55,44 @@ pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
 }
 
 pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> Decision<'a> {
-    let for_host: Vec<&Rule> = rules
-        .iter()
-        .filter(|r| host_matches(&r.host_pattern, host))
-        .collect();
-    if for_host.is_empty() {
+    if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
     }
-    let mut best: HashMap<(InjectionKind, String), &Rule> = HashMap::new();
-    for r in for_host {
-        let method_ok =
-            r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method));
-        if !method_ok || !path_matches(&r.path_pattern, path) {
-            continue;
-        }
-        let key = (r.kind, r.target_name.to_ascii_lowercase());
-        match best.get(&key) {
-            Some(cur) if specificity(cur, host) >= specificity(r, host) => {}
-            _ => {
-                best.insert(key, r);
-            }
+    let strict = strict_path(path);
+    // Candidates match host and path (both views); methods are applied only AFTER the
+    // specificity comparison so a narrower rule is never shadowed by a broader one.
+    let mut groups: HashMap<(InjectionKind, String), Vec<&Rule>> = HashMap::new();
+    for r in rules {
+        if host_matches(&r.host_pattern, host)
+            && path_matches(&r.path_pattern, path, strict.as_deref())
+        {
+            groups
+                .entry((r.kind, r.target_name.to_ascii_lowercase()))
+                .or_default()
+                .push(r);
         }
     }
-    if best.is_empty() {
+    let mut chosen: Vec<&Rule> = Vec::new();
+    for cands in groups.values() {
+        let Some(top) = cands.iter().map(|r| specificity(r, host)).max() else {
+            continue;
+        };
+        let winner = cands
+            .iter()
+            .filter(|r| specificity(r, host) == top)
+            .filter(|r| {
+                r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+            })
+            .min_by_key(|r| r.id);
+        if let Some(r) = winner {
+            chosen.push(r);
+        }
+    }
+    if chosen.is_empty() {
         return Decision::Forbidden;
     }
-    let mut v: Vec<&Rule> = best.into_values().collect();
-    v.sort_by_key(|r| r.id);
-    Decision::Inject(v)
+    chosen.sort_by_key(|r| r.id);
+    Decision::Inject(chosen)
 }
 
 #[cfg(test)]
@@ -310,27 +335,117 @@ mod tests {
         assert_eq!(ids(evaluate(&rules, "a.com", "GET", "/v1/me/")), vec![-1]);
     }
 
+    /// Evaluates a RAW request path the way the proxy does: normalize, then evaluate.
+    fn evaluate_raw<'a>(rules: &'a [Rule], host: &str, method: &str, raw: &str) -> Decision<'a> {
+        let p = crate::normalize::normalize_path(raw);
+        evaluate(rules, host, method, &p)
+    }
+
     #[test]
-    fn encoded_traversal_cannot_escape_after_normalization() {
-        let rules = [rule(1, "a.com", "/repos/*", &["GET"], Header, "A")];
+    fn encoded_separators_and_path_params_cannot_escape_a_prefix_rule() {
+        let rules = [rule(
+            1,
+            "api.github.com",
+            "/repos/*",
+            &["GET"],
+            Header,
+            "Authorization",
+        )];
         for raw in [
             "/repos/%2e%2e/admin",
             "/repos/%2E%2E/admin",
             "/repos//../admin",
             "/repos/./../admin",
+            "/repos/..%2fadmin",
+            "/repos/..%2Fadmin",
+            "/repos/%2e%2e%2fadmin",
+            "/repos/..%5cadmin",
+            "/repos/..\\admin",
+            "/repos/..;/admin",
+            "/repos/%2e%2e;x/admin",
+            "/repos/%252e%252e%252fadmin",
+            "/repos/..%252fadmin",
+            "/repos/%00",
+            "/repos/%2e%2e%2f..",
         ] {
-            let p = crate::normalize::normalize_path(raw);
             assert_eq!(
-                ids(evaluate(&rules, "a.com", "GET", &p)),
+                ids(evaluate_raw(&rules, "api.github.com", "GET", raw)),
                 vec![-1],
-                "{raw} -> {p}"
+                "{raw}"
             );
         }
-        // Encoded slash stays one literal segment under /repos/, so it is still within the rule's prefix
-        // and is forwarded exactly as authorized.
-        let p = crate::normalize::normalize_path("/repos/%2e%2e%2f..");
-        assert_eq!(p, "/repos/..%2f..");
-        assert_eq!(ids(evaluate(&rules, "a.com", "GET", &p)), vec![1]);
+    }
+
+    #[test]
+    fn legitimate_encoded_slashes_inside_the_prefix_still_inject() {
+        let gl = [rule(1, "a.com", "/api/v4/*", &[], Header, "A")];
+        assert_eq!(
+            ids(evaluate_raw(
+                &gl,
+                "a.com",
+                "GET",
+                "/api/v4/projects/a%2Fb/issues"
+            )),
+            vec![1]
+        );
+        let gh = [rule(1, "a.com", "/repos/*", &[], Header, "A")];
+        assert_eq!(
+            ids(evaluate_raw(&gh, "a.com", "GET", "/repos/a%2Fb")),
+            vec![1]
+        );
+        assert_eq!(ids(evaluate_raw(&gh, "a.com", "GET", "/repos/ok")), vec![1]);
+    }
+
+    #[test]
+    fn exact_rule_requires_both_views_to_match() {
+        let rules = [rule(1, "a.com", "/v1/me", &[], Header, "A")];
+        assert_eq!(ids(evaluate_raw(&rules, "a.com", "GET", "/v1/me")), vec![1]);
+        assert_eq!(
+            ids(evaluate_raw(&rules, "a.com", "GET", "/v1%2fme")),
+            vec![-1]
+        );
+        assert_eq!(
+            ids(evaluate_raw(&rules, "a.com", "GET", "/v1/me;x")),
+            vec![-1]
+        );
+    }
+
+    #[test]
+    fn star_pattern_still_matches_unjudgeable_paths() {
+        let rules = [rule(1, "a.com", "*", &[], Header, "A")];
+        assert_eq!(ids(evaluate_raw(&rules, "a.com", "GET", "/x/%00")), vec![1]);
+    }
+
+    #[test]
+    fn narrower_rule_is_not_shadowed_by_broader_rule_for_excluded_method() {
+        let rules = [
+            rule(1, "a.com", "/repos/*", &["GET"], Header, "A"),
+            rule(2, "a.com", "*", &[], Header, "A"),
+        ];
+        assert_eq!(ids(evaluate(&rules, "a.com", "POST", "/repos/x")), vec![-1]);
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", "/repos/x")), vec![1]);
+        assert_eq!(ids(evaluate(&rules, "a.com", "POST", "/other")), vec![2]);
+    }
+
+    #[test]
+    fn same_specificity_rules_with_different_methods_coexist() {
+        let rules = [
+            rule(1, "a.com", "/x/*", &["GET"], Header, "A"),
+            rule(2, "a.com", "/x/*", &["POST"], Header, "A"),
+        ];
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", "/x/y")), vec![1]);
+        assert_eq!(ids(evaluate(&rules, "a.com", "POST", "/x/y")), vec![2]);
+        assert_eq!(ids(evaluate(&rules, "a.com", "PUT", "/x/y")), vec![-1]);
+    }
+
+    #[test]
+    fn exact_path_beats_prefix_of_equal_length() {
+        let rules = [
+            rule(1, "a.com", "/a*", &[], Header, "A"),
+            rule(2, "a.com", "/ab", &[], Header, "A"),
+        ];
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", "/ab")), vec![2]);
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", "/ac")), vec![1]);
     }
 
     #[test]

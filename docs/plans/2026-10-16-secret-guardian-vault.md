@@ -36,7 +36,7 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 1. Secreto o plantilla con CR/LF/NUL (inyección de cabeceras): rechazado al guardar y al renderizar. Tareas 2 y 3.
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
-4. Path con `..`, `%2e%2e`, `//`: se normaliza antes de comparar y se envía normalizado; una regla `GET /repos/*` no autoriza `/repos/../admin`. Tareas 3 y 8.
+4. Path con `..`, `%2e%2e`, `//`, `%2f`, `\`, `;params`, doble codificación o NUL: se compara en la forma normalizada que se reenvía Y en una forma estricta (decodificación repetida, `\` como `/`, `;params` fuera, puntos resueltos); deben coincidir ambas, y lo no juzgable falla cerrado. Una regla `GET /repos/*` no autoriza `/repos/../admin` ni `/repos/..%2fadmin`, pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia). Tareas 3 y 8.
 5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
 
 ---
@@ -1254,7 +1254,7 @@ fn decode_unreserved(segment: &str) -> String {
     out
 }
 
-/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded.
+/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded (forma reenviada); `strict_path` es la vista estricta solo para comparar.
 pub fn normalize_path(path: &str) -> String {
     let mut segs: Vec<String> = Vec::new();
     for raw in path.split('/') {
@@ -1272,10 +1272,71 @@ pub fn normalize_path(path: &str) -> String {
     }
     out
 }
+
+fn decode_all_once(input: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strict view of a path, used ONLY for matching (the proxy forwards `normalize_path`).
+/// Repeatedly percent-decodes everything (cap 8 rounds), maps `\` to `/`, strips `;params`
+/// from each segment, then resolves `.`/`..` and collapses `//`. `None` means the path cannot
+/// be judged safely (NUL, invalid UTF-8, or encoding that never stabilises).
+pub fn strict_path(p: &str) -> Option<String> {
+    let mut cur = p.as_bytes().to_vec();
+    let mut stable = false;
+    for _ in 0..8 {
+        let next = decode_all_once(&cur);
+        if next == cur {
+            stable = true;
+            break;
+        }
+        cur = next;
+    }
+    if !stable {
+        return None;
+    }
+    let text = String::from_utf8(cur).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    let text = text.replace('\\', "/");
+    let mut segs: Vec<&str> = Vec::new();
+    for raw in text.split('/') {
+        let seg = raw.split(';').next().unwrap_or("");
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            _ => segs.push(seg),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if text.ends_with('/') && out != "/" {
+        out.push('/');
+    }
+    Some(out)
+}
 ```
 `matcher.rs` (encima de los tests):
 ```rust
 use crate::model::{InjectionKind, Rule};
+use crate::normalize::strict_path;
 use std::collections::HashMap;
 
 pub enum Decision<'a> {
@@ -1298,18 +1359,32 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+/// Path matching on two views: the forwarded (normalized) form against the pattern as written,
+/// AND the strict form (`strict_path`) against the strict form of the pattern. Both must match.
+/// `*` matches everything. An unjudgeable path (`strict` is `None`) matches no other pattern.
+fn path_matches(pattern: &str, path: &str, strict: Option<&str>) -> bool {
     if pattern == "*" {
         return true;
     }
+    let Some(strict) = strict else {
+        return false;
+    };
     match pattern.strip_suffix('*') {
-        Some(prefix) => path.starts_with(prefix),
-        None => pattern == path,
+        Some(prefix) => {
+            path.starts_with(prefix)
+                && strict_path(prefix).is_some_and(|sp| strict.starts_with(&sp))
+        }
+        None => pattern == path && strict_path(pattern).is_some_and(|sp| sp == strict),
     }
 }
 
-fn specificity(r: &Rule, host: &str) -> (u8, usize) {
-    (u8::from(r.host_pattern == host), r.path_pattern.len())
+/// (exact host, exact path, path pattern length): higher wins.
+fn specificity(r: &Rule, host: &str) -> (bool, bool, usize) {
+    (
+        r.host_pattern == host,
+        !r.path_pattern.ends_with('*'),
+        r.path_pattern.len(),
+    )
 }
 
 pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
@@ -1317,28 +1392,44 @@ pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
 }
 
 pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> Decision<'a> {
-    let for_host: Vec<&Rule> = rules.iter().filter(|r| host_matches(&r.host_pattern, host)).collect();
-    if for_host.is_empty() {
+    if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
     }
-    let mut best: HashMap<(InjectionKind, String), &Rule> = HashMap::new();
-    for r in for_host {
-        let method_ok = r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method));
-        if !method_ok || !path_matches(&r.path_pattern, path) {
-            continue;
-        }
-        let key = (r.kind, r.target_name.to_ascii_lowercase());
-        match best.get(&key) {
-            Some(cur) if specificity(cur, host) >= specificity(r, host) => {}
-            _ => { best.insert(key, r); }
+    let strict = strict_path(path);
+    // Candidates match host and path (both views); methods are applied only AFTER the
+    // specificity comparison so a narrower rule is never shadowed by a broader one.
+    let mut groups: HashMap<(InjectionKind, String), Vec<&Rule>> = HashMap::new();
+    for r in rules {
+        if host_matches(&r.host_pattern, host)
+            && path_matches(&r.path_pattern, path, strict.as_deref())
+        {
+            groups
+                .entry((r.kind, r.target_name.to_ascii_lowercase()))
+                .or_default()
+                .push(r);
         }
     }
-    if best.is_empty() {
+    let mut chosen: Vec<&Rule> = Vec::new();
+    for cands in groups.values() {
+        let Some(top) = cands.iter().map(|r| specificity(r, host)).max() else {
+            continue;
+        };
+        let winner = cands
+            .iter()
+            .filter(|r| specificity(r, host) == top)
+            .filter(|r| {
+                r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+            })
+            .min_by_key(|r| r.id);
+        if let Some(r) = winner {
+            chosen.push(r);
+        }
+    }
+    if chosen.is_empty() {
         return Decision::Forbidden;
     }
-    let mut v: Vec<&Rule> = best.into_values().collect();
-    v.sort_by_key(|r| r.id);
-    Decision::Inject(v)
+    chosen.sort_by_key(|r| r.id);
+    Decision::Inject(chosen)
 }
 ```
 `render.rs` (encima de los tests):
@@ -1496,7 +1587,7 @@ mod store;
 
 pub use matcher::{evaluate, has_rules_for_host, Decision};
 pub use model::*;
-pub use normalize::{is_ip_literal, normalize_host, normalize_path};
+pub use normalize::{is_ip_literal, normalize_host, normalize_path, strict_path};
 pub use render::render;
 pub use store::*;
 ```
@@ -3126,7 +3217,7 @@ async fn disallowed_method_is_403_and_never_reaches_upstream() {
 async fn path_traversal_cannot_escape_a_restricted_rule() {
     let (env, up, t) = setup(&["GET"], "/repos/*").await;
     assert_eq!(proxy_request(&env, &t, HOST, "GET", "/repos/ok", &[], vec![], false).await.status, 200);
-    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/other"] {
+    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/other"] {
         assert_eq!(proxy_request(&env, &t, HOST, "GET", p, &[], vec![], false).await.status, 403, "{p}");
     }
     assert_eq!(up.received.lock().unwrap().len(), 1);

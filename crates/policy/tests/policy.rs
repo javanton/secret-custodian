@@ -270,3 +270,106 @@ fn unmatched_parses_and_prints() {
     assert!("other".parse::<Unmatched>().is_err());
     assert_eq!(Unmatched::Deny.as_str(), "deny");
 }
+
+// --- review fixes: fail-closed validation ---
+
+#[test]
+fn path_pattern_validation_is_strict() {
+    let (_d, v, sid) = setup();
+    let bad = |p: &str| {
+        let mut r = new_rule(sid);
+        r.path_pattern = p.into();
+        assert!(add_rule(&v, r).is_err(), "{p} should be rejected");
+    };
+    let ok = |p: &str| {
+        let mut r = new_rule(sid);
+        r.path_pattern = p.into();
+        add_rule(&v, r).unwrap_or_else(|e| panic!("{p} rejected: {e}"));
+    };
+    for p in [
+        "/a/*/b",
+        "/a*b",
+        "/**",
+        "/a/**",
+        "/a?x=1",
+        "/a#f",
+        "/a/../b",
+        "/a//b",
+        "/a/./b",
+        "/a%2fb",
+        "/a%2",
+        "/a%zz",
+        "/%41pi",
+        "/a/..%2fb/*",
+    ] {
+        bad(p);
+    }
+    for p in [
+        "*", "/", "/*", "/repos/*", "/v1/me", "/a%2Fb", "/a%2Fb/*", "/repos/",
+    ] {
+        ok(p);
+    }
+}
+
+#[test]
+fn host_pattern_rejects_wildcard_over_single_label_and_bare_labels() {
+    let (_d, v, sid) = setup();
+    let try_host = |h: &str| {
+        let mut r = new_rule(sid);
+        r.host_pattern = h.into();
+        add_rule(&v, r)
+    };
+    assert!(try_host("*.com").is_err());
+    assert!(try_host("*.localhost").is_err());
+    assert!(try_host("intranet").is_err());
+    assert!(try_host("localhost").is_ok());
+    assert!(try_host("*.example.com").is_ok());
+}
+
+#[test]
+fn framing_and_hop_by_hop_headers_cannot_be_injection_targets() {
+    let (_d, v, sid) = setup();
+    for h in [
+        "host",
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "connection",
+        "keep-alive",
+        "te",
+        "TRAILER",
+        "upgrade",
+        "proxy-authorization",
+        "Proxy-Authenticate",
+        "proxy-connection",
+    ] {
+        let mut r = new_rule(sid);
+        r.target_name = h.into();
+        assert!(add_rule(&v, r).is_err(), "{h} should be rejected");
+    }
+    let mut r = new_rule(sid);
+    r.target_name = "X-Api-Key".into();
+    assert!(add_rule(&v, r).is_ok());
+}
+
+#[test]
+fn query_template_must_be_exactly_secret() {
+    let (_d, v, sid) = setup();
+    for t in [
+        "Bearer {secret}",
+        "{secret}x",
+        " {secret}",
+        "{secret}{secret}",
+    ] {
+        let mut r = new_rule(sid);
+        r.kind = InjectionKind::Query;
+        r.target_name = "api_key".into();
+        r.template = t.into();
+        assert!(add_rule(&v, r).is_err(), "{t:?} should be rejected");
+    }
+    let mut r = new_rule(sid);
+    r.kind = InjectionKind::Query;
+    r.target_name = "api_key".into();
+    r.template = "{secret}".into();
+    assert!(add_rule(&v, r).is_ok());
+}

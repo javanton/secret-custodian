@@ -84,6 +84,66 @@ pub fn normalize_path(path: &str) -> String {
     out
 }
 
+fn decode_all_once(input: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strict view of a path, used ONLY for matching (the proxy forwards `normalize_path`).
+/// Repeatedly percent-decodes everything (cap 8 rounds), maps `\` to `/`, strips `;params`
+/// from each segment, then resolves `.`/`..` and collapses `//`. `None` means the path cannot
+/// be judged safely (NUL, invalid UTF-8, or encoding that never stabilises).
+pub fn strict_path(p: &str) -> Option<String> {
+    let mut cur = p.as_bytes().to_vec();
+    let mut stable = false;
+    for _ in 0..8 {
+        let next = decode_all_once(&cur);
+        if next == cur {
+            stable = true;
+            break;
+        }
+        cur = next;
+    }
+    if !stable {
+        return None;
+    }
+    let text = String::from_utf8(cur).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    let text = text.replace('\\', "/");
+    let mut segs: Vec<&str> = Vec::new();
+    for raw in text.split('/') {
+        let seg = raw.split(';').next().unwrap_or("");
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            _ => segs.push(seg),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if text.ends_with('/') && out != "/" {
+        out.push('/');
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +268,47 @@ mod tests {
             let once = normalize_path(p);
             assert_eq!(normalize_path(&once), once, "not idempotent for {p:?}");
         }
+    }
+
+    #[test]
+    fn strict_path_decodes_everything_and_resolves_dots() {
+        assert_eq!(strict_path("/repos/..%2fadmin").as_deref(), Some("/admin"));
+        assert_eq!(strict_path("/repos/..%2Fadmin").as_deref(), Some("/admin"));
+        assert_eq!(
+            strict_path("/repos/%2e%2e%2fadmin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(strict_path("/repos/..%5cadmin").as_deref(), Some("/admin"));
+        assert_eq!(strict_path("/repos/..\\admin").as_deref(), Some("/admin"));
+        assert_eq!(strict_path("/repos/..;/admin").as_deref(), Some("/admin"));
+        assert_eq!(
+            strict_path("/repos/%2e%2e;x/admin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(
+            strict_path("/repos/%252e%252e%252fadmin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(
+            strict_path("/repos/..%252fadmin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(strict_path("/a%2Fb").as_deref(), Some("/a/b"));
+        assert_eq!(strict_path("/a;x=1/b/").as_deref(), Some("/a/b/"));
+        assert_eq!(strict_path("//a///b").as_deref(), Some("/a/b"));
+        assert_eq!(strict_path("").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn strict_path_gives_up_on_nul_bad_utf8_and_deep_encoding() {
+        assert_eq!(strict_path("/repos/%00"), None);
+        assert_eq!(strict_path("/repos/%2500"), None);
+        assert_eq!(strict_path("/repos/%ff"), None);
+        // 9 layers of encoding never stabilise within the cap.
+        let mut s = String::from("/a/%2e");
+        for _ in 0..9 {
+            s = s.replace('%', "%25");
+        }
+        assert_eq!(strict_path(&s), None);
     }
 }
