@@ -202,7 +202,7 @@ struct SlowBody {
 
 impl hyper::body::Body for SlowBody {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -229,7 +229,36 @@ impl hyper::body::Body for SlowBody {
     }
 }
 
-type UpBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+type UpBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+/// Yields `partial` and then fails: the upstream connection dies in the middle of the response.
+struct AbortBody {
+    sent: bool,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl hyper::body::Body for AbortBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        if !self.sent {
+            self.sent = true;
+            Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                b"partial",
+            )))))
+        } else {
+            // Let the head and the first chunk reach the wire before dying.
+            match self.sleep.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => Poll::Ready(Some(Err(std::io::Error::other("upstream died")))),
+            }
+        }
+    }
+}
 
 async fn serve_recording<IO>(io: IO, received: Arc<Mutex<Vec<Recorded>>>)
 where
@@ -261,14 +290,27 @@ where
             if parts.uri.path() == "/delay" {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
-            let body: UpBody = if parts.uri.path() == "/stream" {
+            // `/big` answers 8 MiB; `/abort` dies mid-body; HEAD never carries a body.
+            let body: UpBody = if parts.uri.path() == "/big" {
+                Full::new(Bytes::from(vec![b'b'; 8 * 1024 * 1024]))
+                    .map_err(|never| match never {})
+                    .boxed()
+            } else if parts.uri.path() == "/abort" {
+                AbortBody {
+                    sent: false,
+                    sleep: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(200))),
+                }
+                .boxed()
+            } else if parts.uri.path() == "/stream" {
                 SlowBody {
                     step: 0,
                     sleep: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1500))),
                 }
                 .boxed()
             } else {
-                Full::new(Bytes::from_static(b"ok")).boxed()
+                Full::new(Bytes::from_static(b"ok"))
+                    .map_err(|never| match never {})
+                    .boxed()
             };
             let mut resp = hyper::Response::new(body);
             // Headers a proxy must not pass back to the agent, plus one it must.
@@ -276,7 +318,7 @@ where
             resp.headers_mut()
                 .insert("keep-alive", "timeout=5".parse().unwrap());
             resp.headers_mut().insert("proxy-foo", "1".parse().unwrap());
-            Ok::<_, std::convert::Infallible>(resp)
+            Ok::<_, std::io::Error>(resp)
         }
     });
     let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())

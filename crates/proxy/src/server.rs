@@ -221,11 +221,88 @@ async fn handle_request(
     if req.method() == Method::CONNECT {
         connect(req, session, state, limits, slot).await
     } else {
-        text(
-            StatusCode::NOT_IMPLEMENTED,
-            "plain HTTP proxying is not enabled yet\n",
-        )
+        plain(req, session, state).await
     }
+}
+
+/// An absolute-form `http://` request sent to the proxy port.
+///
+/// Credentials are never injected into plain HTTP, except for the host `localhost` (see
+/// `forward`): a host with rules is refused by `forward` (`plaintext-refused`), while a host
+/// without rules is forwarded untouched under a `passthrough` role and denied under `deny`.
+async fn plain(
+    req: Request<Incoming>,
+    session: Session,
+    state: Arc<ProxyState>,
+) -> Response<ProxyBody> {
+    let identity = &session.identity;
+    if req.uri().scheme_str() != Some("http") {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "send absolute-form http:// requests, or CONNECT for https\n",
+        );
+    }
+    let Some(authority) = req.uri().authority().cloned() else {
+        return text(StatusCode::BAD_REQUEST, "missing host\n");
+    };
+    // `user:pw@host` is never legitimate.
+    if authority.as_str().contains('@') {
+        return text(StatusCode::BAD_REQUEST, "bad request target\n");
+    }
+    let Some(host) = normalize_host(authority.host()) else {
+        return text(StatusCode::BAD_REQUEST, "bad host\n");
+    };
+    let port = authority.port_u16().unwrap_or(80);
+    if port == 0 {
+        return text(StatusCode::BAD_REQUEST, "bad port\n");
+    }
+    let method = req.method().to_string();
+    let target = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+
+    let role = match get_role(&state.vault, &identity.role) {
+        Ok(Some(r)) => r,
+        _ => {
+            audit(
+                &state,
+                identity,
+                &host,
+                &method,
+                &target,
+                "unknown-role",
+                Some(403),
+                None,
+            );
+            return text(StatusCode::FORBIDDEN, "role not found\n");
+        }
+    };
+    let rules = list_rules(&state.vault, Some(&identity.role)).unwrap_or_default();
+    let has_rules = has_rules_for_host(&rules, &host);
+    if !has_rules && role.unmatched == Unmatched::Deny {
+        audit(
+            &state,
+            identity,
+            &host,
+            &method,
+            &target,
+            "unmatched-denied",
+            Some(403),
+            None,
+        );
+        return text(StatusCode::FORBIDDEN, "host not allowed for this role\n");
+    }
+    let ctx = crate::forward::Ctx {
+        state,
+        identity: session.identity,
+        host,
+        port,
+        tls: false,
+        allow_unruled: !has_rules,
+    };
+    crate::forward::forward(req, &ctx).await
 }
 
 async fn connect(
