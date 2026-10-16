@@ -80,8 +80,9 @@ se confirma en el plan.
 
 - SQLite, un único fichero (`vault.db`).
 - **Clave maestra (KEK)**, de una de estas fuentes:
-  - `--key-file` / `VAULT_KEY_FILE`: 32 bytes aleatorios (Docker secret, permisos `0600`).
-  - `VAULT_MASTER_KEY`: la misma clave en base64.
+  - `--key-file` / `SG_KEY_FILE`: 32 bytes aleatorios codificados en base64 (Docker secret, permisos
+    `0600`); se genera con `sg keygen --out <fichero>`.
+  - `SG_MASTER_KEY`: la misma clave en base64.
   - `--passphrase`: se pide por terminal; Argon2id con sal guardada en la cabecera de la DB.
 - Una **DEK** aleatoria de 32 bytes cifrada con la KEK vive en la DB; cifra todos los valores
   secretos, la clave privada de la CA y la clave de firma de tokens. Cambiar la passphrase o la

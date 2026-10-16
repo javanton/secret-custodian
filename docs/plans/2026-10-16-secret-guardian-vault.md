@@ -111,7 +111,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 argon2 = "0.5"
 rand = "0.8"
 zeroize = "1"
@@ -308,7 +308,7 @@ pub enum CoreError {
 use crate::error::CoreError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -330,9 +330,15 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+/// Explicit Argon2id cost parameters: a future crate default change must never alter existing vaults.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(19 * 1024, 2, 1, Some(KEY_LEN)).expect("valid argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 pub fn kek_from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Result<Key32, CoreError> {
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    Argon2::default()
+    argon2id()
         .hash_password_into(passphrase.as_bytes(), salt, &mut *out)
         .map_err(|_| CoreError::Crypto)?;
     Ok(out)

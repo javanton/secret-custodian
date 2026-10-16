@@ -1,7 +1,7 @@
 use crate::error::CoreError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -23,9 +23,16 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+/// Argon2id with explicit cost parameters (19 MiB, 2 passes, 1 lane) so a future crate default
+/// change can never silently alter the key derived for an existing vault.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(19 * 1024, 2, 1, Some(KEY_LEN)).expect("valid argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 pub fn kek_from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Result<Key32, CoreError> {
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    Argon2::default()
+    argon2id()
         .hash_password_into(passphrase.as_bytes(), salt, &mut *out)
         .map_err(|_| CoreError::Crypto)?;
     Ok(out)
@@ -120,6 +127,36 @@ mod tests {
         let c = kek_from_passphrase("other", &salt).unwrap();
         assert_eq!(*a, *b);
         assert_ne!(*a, *c);
+    }
+
+    #[test]
+    fn passphrase_kdf_known_answer_pins_the_parameters() {
+        let key = kek_from_passphrase("correct horse", &[7u8; 16]).unwrap();
+        assert_eq!(
+            hex::encode(*key),
+            "7132e6a6028b7abb94eb36beb767146777cd7c75426211a827c8a7a5c50d7307"
+        );
+    }
+
+    #[test]
+    fn blob_format_is_nonce_then_ciphertext_and_tag() {
+        let blob = seal(&random_key(), b"a", b"hello");
+        assert_eq!(blob.len(), NONCE_LEN + 5 + 16);
+    }
+
+    #[test]
+    fn open_failures_are_a_single_opaque_error() {
+        let key = random_key();
+        let blob = seal(&key, b"a", b"hello");
+        assert!(matches!(
+            open(&random_key(), b"a", &blob),
+            Err(CoreError::Crypto)
+        ));
+        assert!(matches!(open(&key, b"b", &blob), Err(CoreError::Crypto)));
+        assert!(matches!(
+            open(&key, b"a", &[0u8; 3]),
+            Err(CoreError::Crypto)
+        ));
     }
 
     #[test]
