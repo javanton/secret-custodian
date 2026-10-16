@@ -169,7 +169,7 @@ Step notes (all from the cited files):
    failed authentication** (there is no identity to attribute it to). A request that is not CONNECT
    gets `501` "plain HTTP proxying is not enabled yet".
 2. **CONNECT target** (`server.rs`, `connect`): the authority must exist, contain no `@`, and its host
-   must pass `normalize_host`; port defaults to 443; port 0 is rejected (`400`, no audit row).
+   must pass `normalize_host`; port defaults to 443; port 0 is rejected (`400`, audited as `bad-request` with the identity).
 3. **Role and rules**: an unknown role (e.g. the role was deleted after the token was issued) gives
    `403` with audit decision `unknown-role`. If the role has any rule whose host pattern matches the
    host (`has_rules_for_host`), the proxy MITMs; otherwise the role's `Unmatched` policy applies:
@@ -211,7 +211,8 @@ Audit decision values written by the proxy (all found in `server.rs`, `mitm.rs`,
 `mitm`, `passthrough` (CONNECT and, in `forward`, no-rule requests, which cannot occur today because
 `allow_unruled` is always `false`), `unmatched-denied`, `unknown-role`, `ca-not-permitted`,
 `tunnel-connect-failed`, `token-invalid`, `host-mismatch`, `forbidden`, `plaintext-refused`
-(unreachable today, since the only constructed `Ctx` has `tls: true`), `inject`, `upstream-error`.
+(plain `http://` to a host with rules, always: credentials are never injected without TLS), `bad-request`
+(authenticated but malformed `400`), `identity-limit` (`429`, per-token cap), `inject`, `upstream-error`.
 
 Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`): at most 1024 simultaneous client
 connections (excess clients wait in the kernel backlog because the permit is taken before `accept`), and

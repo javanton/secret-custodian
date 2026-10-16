@@ -23,7 +23,7 @@
 - Ninguna ruta de API, CLI ni web devuelve el valor de un secreto guardado. Los valores secretos y los tokens nunca se registran en logs. El audit no guarda query strings.
 - Los valores de secreto no pueden contener CR, LF ni NUL; en `query` se codifican en porcentaje.
 - Las reglas comparan hostname normalizado (minúsculas, sin punto final, sin puerto); no admiten IPs. El path se normaliza y se reenvía normalizado.
-- Inyección sobre HTTP en claro: `403` salvo host `localhost`.
+- Inyección sobre HTTP en claro: nunca; `403` (`plaintext-refused`) sin excepciones. La excepción de loopback de `NetPolicy` solo aplica a peticiones reenviadas por TLS al host exacto `localhost` con regla.
 - CA con name constraints siempre presentes (`invalid` si no hay dominios); `allow-domain` rechaza TLDs y dominios de una etiqueta (salvo `localhost`).
 - CLI por socket Unix `$XDG_RUNTIME_DIR/secret-guardian.sock` con permisos `0600`; los valores de secreto se leen de stdin o de un prompt sin eco, nunca de argumentos.
 - Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host`; cookie `HttpOnly` + `SameSite=Strict`; cabecera anti-CSRF en escrituras; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
@@ -37,7 +37,7 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
 4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, `..+`, solo puntos/espacios/tab/`+`) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, espacios y caracteres invisibles no ASCII (NBSP, U+200B, U+FF1F, U+FE68...), más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb` (los `..`/`%2e%2e` simples los resuelve `normalize_path` antes de juzgar), pero sí `/repos/a%2Fb`. `/repos/a\..%3B\k/../admin` NO es un `403`: `normalize_path` lo reduce a `/repos/admin`, que cae dentro del prefijo y se reenvía normalizado. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
-5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
+5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red, ni siquiera a `localhost` (un agente podría abrir su propio listener). Tarea 9.
 
 ---
 
@@ -3506,7 +3506,7 @@ pub async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<ProxyBody> {
     let rules = list_rules(&st.vault, Some(&id.role)).unwrap_or_default();
     let (matched, rule_id) = match evaluate(&rules, &ctx.host, &method, &path) {
         Decision::Inject(m) => {
-            if !ctx.tls && ctx.host != "localhost" {
+            if !ctx.tls {
                 audit(st, id, &ctx.host, &method, &raw_target, "plaintext-refused", Some(403), None);
                 return text(StatusCode::FORBIDDEN, "refusing to inject credentials over plain HTTP\n");
             }
@@ -3599,7 +3599,7 @@ git add -A && git commit -m "feat(proxy): terminate TLS and inject credentials p
 
 **Interfaces:**
 - Consumes: `forward::{forward, Ctx}`.
-- Produces: soporte de `GET http://host/path` a través del proxy, con política por rol y rechazo de inyección sin TLS (excepto `localhost`).
+- Produces: soporte de `GET http://host/path` a través del proxy, con política por rol y rechazo de inyección sin TLS (sin excepciones: ni `localhost`).
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -3644,7 +3644,7 @@ async fn plain_http_to_a_host_with_rules_never_gets_the_secret() {
 }
 
 #[tokio::test]
-async fn plain_http_to_localhost_with_a_rule_is_allowed() {
+async fn plain_http_to_localhost_with_a_rule_is_refused_never_injected() {
     let up = spawn_plain_upstream().await;
     let mut cfg = no_extra_roots();
     cfg.resolve_override.insert("localhost".into(), up.addr);
@@ -3657,8 +3657,9 @@ async fn plain_http_to_localhost_with_a_rule_is_allowed() {
     }).unwrap();
     let t = env.token("m", "developer");
     let raw = plain_get(&env, &t, "http://localhost/ping", "localhost").await;
-    assert!(status(&raw).contains("200"), "{raw}");
-    assert_eq!(up.header(0, "x-api-key"), vec!["LOCAL-SECRET".to_string()]);
+    // No plaintext exception: an agent could run its own listener on any port of `localhost`.
+    assert!(status(&raw).contains("403"), "{raw}");
+    assert!(up.received.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

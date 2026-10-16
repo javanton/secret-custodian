@@ -139,6 +139,12 @@ se confirma en el plan.
 6. Se devuelve la respuesta tal cual. La entrada de audit se escribe cuando se ha recibido la
    cabecera de respuesta del destino y antes de devolverla al agente (en las peticiones que el
    proxy rechaza, antes de devolver el rechazo).
+7. Una petición `http://` en forma absoluta (sin CONNECT) **nunca recibe una credencial inyectada**:
+   si el host tiene reglas para el rol se responde siempre `403` (decisión `plaintext-refused`), sin
+   excepciones (tampoco `localhost`, ni con puerto explícito); un host sin reglas sigue la política
+   del rol (6.4) y, bajo `passthrough`, se reenvía sin inyección.
+8. Un CONNECT o una petición de forma absoluta mal formados (`400`) de un agente autenticado se
+   auditan con decisión `bad-request` y la identidad; la autenticación fallida (`407`) no escribe nada.
 
 ### 6.2 Reglas
 
@@ -200,9 +206,15 @@ El argumento de cierre descansa en estas suposiciones:
 - **A6**: el origen recibe exactamente la cadena que se juzgó (el proxy reenvía
   `normalize_path(raw)`; la query no interviene en el enrutado).
 - **A7**: el proxy elimina las cabeceras de override de enrutado y de reenvío (`X-HTTP-Method-Override`,
-  `X-Original-URL`, `X-Forwarded-*`, `Forwarded`, `Via`...) y rechaza `TRACE`/`CONNECT` dentro del
-  túnel (`405`). **No** defiende contra overrides de método o ruta transportados en la query o el
-  cuerpo (parámetros `_method` de algunos frameworks).
+  `X-Original-URL`, `X-Original-URI`, `X-Forwarded-*`, `Forwarded`, `Via`, `X-Client-IP`,
+  `True-Client-IP`, `CF-Connecting-IP`, `X-Cluster-Client-IP`...) comparando el nombre normalizado
+  (minúsculas, `_` equivale a `-`: `X_HTTP_METHOD_OVERRIDE` también se elimina; `Referer` y `Origin`
+  se conservan), y rechaza `TRACE`, `TRACK` y `CONNECT` dentro del túnel (`405`, sin distinguir
+  mayúsculas). `COPY` y `MOVE` (WebDAV, con cabecera `Destination`) solo se reenvían si todas las
+  reglas aplicables listan ese método de forma **explícita** (`methods` no vacío que lo contiene);
+  si no, `403` (`forbidden`). Incluso entonces `Destination` **no** se valida contra el path de la
+  regla. **No** defiende contra overrides de método o ruta transportados en la query o el cuerpo
+  (parámetros `_method` de algunos frameworks).
 
 ### 6.3 CA acotada
 
@@ -228,15 +240,33 @@ El argumento de cierre descansa en estas suposiciones:
 
 - Política de red del proxy: el destino se resuelve una sola vez y se conecta a la dirección ya
   validada. Se rechazan (`403`, decisión `target-denied`) las direcciones sin especificar
-  (`0.0.0.0`, `::`), link-local (169.254.0.0/16 y fe80::/10, que incluye los metadatos de la nube),
-  multicast, broadcast y las direcciones de escucha del propio proxy y de la administración
-  (`denied`; un puerto denegado lo está en todas las direcciones locales). Loopback se rechaza salvo
-  `--allow-loopback-targets` o, en peticiones reenviadas, el host exacto `localhost` con regla
-  aplicable (nunca sobre `denied`). RFC 1918 y ULA se permiten (homelab). El puerto no forma parte de
-  la autorización: una regla para un host vale para cualquier puerto de ese host.
+  (`0.0.0.0`, `::`), `0.0.0.0/8` y `240.0.0.0/4`, link-local (169.254.0.0/16 y fe80::/10, que
+  incluye los metadatos de la nube), los metadatos fuera de link-local (`100.100.100.200` de
+  Alibaba y `fd00:ec2::254` de AWS IPv6), multicast, broadcast y las direcciones de `denied`.
+  Las direcciones IPv6 que embeben una IPv4 (mapeada, compatible, NAT64 `64:ff9b::/96` y
+  `64:ff9b:1::/48`, 6to4 `2002::/16`) se juzgan como esa IPv4; Teredo queda fuera de alcance.
+  100.64.0.0/10 (Tailscale), RFC 1918 y ULA se permiten (homelab).
+- `denied` cubre las direcciones loopback y sin especificar en los puertos indicados (`0.0.0.0:9090`
+  bloquea el 9090 en loopback y en las direcciones sin especificar), **no** las demás direcciones de
+  las interfaces del equipo: quien arranca el servicio debe añadirlas, y `NetPolicy::denied_for_binds`
+  lo hace (para un bind sin especificar añade cada dirección de interfaz con ese puerto).
+- Loopback se rechaza salvo `--allow-loopback-targets` o, **solo en peticiones reenviadas por TLS**
+  (dentro de un CONNECT con MITM), el host exacto `localhost` con regla aplicable (nunca sobre
+  `denied`; un agente no puede forjar un certificado válido para `localhost`). `localhost` se
+  resuelve solo a 127.0.0.1 y ::1 sin consultar el resolvedor del sistema (RFC 6761);
+  `foo.localhost` no está cubierto. El puerto no forma parte de la autorización: una regla para un
+  host vale para cualquier puerto de ese host, por eso nunca se inyecta sin TLS (6.1, punto 7).
 - Límites de túnel: el permiso del tope de conexiones vive lo que vive el túnel; el handshake TLS
   del MITM, la inactividad (`tunnel_idle_timeout`, 10 min) y la vida máxima (`tunnel_max_lifetime`,
   8 h) están acotados, y hay un tope global de conexiones salientes (`max_upstream_connections`, 256).
+  La vida máxima también acota las conexiones de cliente HTTP en claro (keep-alive); en los túneles
+  *passthrough* la inactividad se mide en ambos sentidos y una escritura bloqueada durante ese tiempo
+  corta el túnel aunque el otro sentido siga moviéndose.
+- Límites por identidad (`jti`): `max_tunnels_per_identity` (64) y `max_upstream_per_identity` (64,
+  de que se reenvía hasta que termina el cuerpo de la respuesta); el exceso recibe `429` con
+  `Retry-After: 1` y decisión `identity-limit`, de modo que un token no agota los recursos de otros.
+  Un cuerpo en streaming (respuesta al agente o petición al origen) sin progreso durante
+  `body_idle_timeout` (60 s) se aborta y libera su conexión saliente y sus contadores.
   En túneles *passthrough* no hay verificación por petición: la revocación de un token solo surte
   efecto cuando el túnel termina, así que queda acotada por la inactividad y la vida máxima.
 
@@ -262,9 +292,13 @@ necesitan credenciales. **Decisión a confirmar en la revisión.**
 - Herramientas con certificate pinning, Java (almacén propio) o binarios Go que ignoran las
   variables de entorno no funcionarán con el MITM.
 - Si el destino refleja el secreto en su respuesta, el agente lo vería. Fuera de alcance.
-- Websockets / upgrades: solo se inyecta en la petición de handshake.
-- Inyección sobre HTTP en claro: se rechaza con `403` salvo que el host sea `localhost`; una regla
-  nunca envía credenciales por una conexión sin TLS hacia Internet.
+- Websockets / `Upgrade` **no están soportados** a través del MITM: las cabeceras del handshake se
+  eliminan, así que las conexiones a hosts con regla que dependan de un upgrade fallan.
+- Los cuerpos de respuesta truncados se registran en el audit solo con el estado de la cabecera.
+- Inyección sobre HTTP en claro: **nunca** se realiza. Una petición `http://` a un host con reglas se
+  rechaza con `403` (`plaintext-refused`) sin excepciones. Limitación: los servicios locales sin TLS
+  no pueden recibir credenciales inyectadas; hay que usar TLS o poner delante un terminador TLS
+  (el host `localhost` con regla sí se inyecta por TLS, 6.3 «Red y túneles»).
 
 ## 7. Administración
 
@@ -318,8 +352,9 @@ permitidos), audit log.
 - `tracing` estructurado; los valores secretos y los tokens nunca se registran.
 - El audit log se escribe de forma síncrona cuando se ha recibido la cabecera de respuesta del
   destino y antes de devolverla al agente (si el proxy rechaza la petición, antes de devolver el
-  rechazo). No se escribe fila de audit para la autenticación fallida (`407`) ni para destinos
-  CONNECT o de forma absoluta mal formados (`400`). Si la escritura del audit falla, se registra
+  rechazo). No se escribe fila de audit para la autenticación fallida (`407`); los destinos CONNECT o de
+  forma absoluta mal formados (`400`) de un agente autenticado se auditan como `bad-request` con
+  su identidad. Si la escritura del audit falla, se registra
   en el log y no bloquea una petición ya reenviada. Los cuerpos de respuesta truncados se
   registran con el estado de la cabecera que se envió.
 
