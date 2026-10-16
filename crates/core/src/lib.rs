@@ -1,1 +1,3 @@
-// placeholder: se rellena en su tarea
+pub mod crypto;
+pub mod error;
+pub use error::CoreError;
