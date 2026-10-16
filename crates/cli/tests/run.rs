@@ -4,6 +4,7 @@ use clap::Parser;
 use sg_cli::{run_io, ClientCommand, ClientOpts, Io};
 use std::{
     io::Read,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -40,6 +41,7 @@ impl Fake {
 /// Starts a server that records every request and answers with `respond(&rec) -> (status, body)`.
 fn fake(respond: impl Fn(&Rec) -> (u16, Vec<u8>) + Clone + Send + Sync + 'static) -> Fake {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let sock = dir.path().join("t.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let log: Arc<Mutex<Vec<Rec>>> = Default::default();
@@ -660,6 +662,31 @@ async fn audit_builds_an_encoded_query() {
         f.log()[0].uri,
         "/audit?limit=5&role=dev&host=a%26b.com&since=100"
     );
+}
+
+// ---- login-url ------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn login_url_prints_the_url_from_the_socket_route() {
+    let f = fake(|_| {
+        ok_json(serde_json::json!({"token": "abc", "url": "http://localhost:9090/#t=abc"}))
+    });
+    let r = cli(&f, &["login-url"], b"").await;
+    r.ok();
+    assert_eq!(r.out().trim(), "http://localhost:9090/#t=abc");
+    assert!(r.out().contains("#t="));
+    assert_eq!(
+        (f.log()[0].method.as_str(), f.log()[0].uri.as_str()),
+        ("POST", "/admin/login-token")
+    );
+}
+
+#[tokio::test]
+async fn login_url_falls_back_to_the_bare_token() {
+    let f = fake(|_| ok_json(serde_json::json!({"token": "abc"})));
+    let r = cli(&f, &["login-url"], b"").await;
+    r.ok();
+    assert_eq!(r.out().trim(), "abc");
 }
 
 // ---- path safety ----------------------------------------------------------------------------

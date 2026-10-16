@@ -48,6 +48,8 @@ pub enum ClientCommand {
     Ca(CaCmd),
     /// Show the audit log
     Audit(AuditArgs),
+    /// Print a fresh single-use URL to log in to the web UI (no restart needed)
+    LoginUrl,
 }
 
 #[derive(Subcommand)]
@@ -356,6 +358,7 @@ pub async fn run_io(
         ClientCommand::Token(c) => token(socket, opts, c, io).await,
         ClientCommand::Ca(c) => ca(socket, opts, c, io).await,
         ClientCommand::Audit(a) => audit(socket, opts, a, io).await,
+        ClientCommand::LoginUrl => login_url(socket, opts, io).await,
     }
 }
 
@@ -623,6 +626,16 @@ async fn ca(socket: &Path, opts: &ClientOpts, c: CaCmd, io: &mut Io<'_>) -> anyh
             Ok(())
         }
     }
+}
+
+async fn login_url(socket: &Path, opts: &ClientOpts, io: &mut Io<'_>) -> anyhow::Result<()> {
+    let v = api(socket, Method::POST, "/admin/login-token", None).await?;
+    let line = v["url"]
+        .as_str()
+        .or_else(|| v["token"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("the vault returned no login token"))?
+        .to_owned();
+    done(io, opts, &v, line)
 }
 
 async fn audit(

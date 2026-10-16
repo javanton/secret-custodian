@@ -30,7 +30,18 @@ const MAX_AUDIT_LIMIT: usize = 1000;
 
 /// Router for the Unix socket: no authentication of its own (the socket permissions are it).
 pub fn api_router(state: AppState) -> Router {
-    Router::new()
+    build_router(state, false)
+}
+
+/// [`api_router`] plus `POST /admin/login-token`, which mints a web login token. Only the Unix
+/// socket router has it: whoever can open the socket (mode `0600`) is the operator, while the
+/// web listener must never be able to mint its own credentials.
+pub fn socket_router(state: AppState) -> Router {
+    build_router(state, true)
+}
+
+fn build_router(state: AppState, socket_only: bool) -> Router {
+    let router = Router::new()
         .route("/secrets", get(list_secrets).post(add_secret))
         .route(
             "/secrets/{name}",
@@ -46,7 +57,13 @@ pub fn api_router(state: AppState) -> Router {
         .route("/ca", get(ca_status))
         .route("/ca/cert", get(ca_cert))
         .route("/ca/domains", post(ca_allow))
-        .route("/audit", get(audit))
+        .route("/audit", get(audit));
+    let router = if socket_only {
+        router.route("/admin/login-token", post(login_token))
+    } else {
+        router
+    };
+    router
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError(StatusCode::METHOD_NOT_ALLOWED, "method not allowed".into())
@@ -64,7 +81,7 @@ fn is_json_content_type(ct: &str) -> bool {
 
 /// State-changing requests must be JSON: a cross-site HTML form cannot send that content type
 /// without a CORS preflight. A body with no declared type is refused too.
-async fn write_guard(req: Request, next: Next) -> Response {
+pub(crate) async fn write_guard(req: Request, next: Next) -> Response {
     if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         let headers = req.headers();
         let ok = match headers.get(header::CONTENT_TYPE) {
@@ -428,4 +445,14 @@ async fn audit(
         limit: q.limit.unwrap_or(0),
     };
     Ok(Json(s.vault.list_audit(&f)?))
+}
+
+/// Mints a single-use web login token; `url` is present when the server knows its public base.
+async fn login_token(State(s): State<AppState>) -> impl IntoResponse {
+    let token = s.sessions.new_login_token();
+    let mut body = serde_json::json!({ "token": token });
+    if let Some(base) = &s.web_base_url {
+        body["url"] = format!("{}/#t={token}", base.trim_end_matches('/')).into();
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(body))
 }

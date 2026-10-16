@@ -12,4 +12,6 @@ pub struct AppState {
     pub sessions: Arc<Sessions>,
     /// Accepted `Host` header values (and, as `http://<host>`, `Origin` values) of the web listener.
     pub allowed_hosts: Vec<String>,
+    /// Base URL the browser uses (e.g. `http://localhost:9090`), used to build login URLs.
+    pub web_base_url: Option<String>,
 }

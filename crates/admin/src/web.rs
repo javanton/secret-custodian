@@ -1,11 +1,16 @@
-use crate::{api::api_router, state::AppState};
+use crate::{
+    api::{api_router, write_guard},
+    error::ApiError,
+    state::AppState,
+};
 use axum::{
-    extract::{Query, Request, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{from_fn_with_state, map_response, Next},
-    response::{IntoResponse, Redirect, Response},
-    routing::get,
-    Router,
+    middleware::{from_fn, from_fn_with_state, map_response, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -16,14 +21,27 @@ struct Assets;
 
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
-/// Router for the local web listener: `Host` guard on everything, `/login` to trade a
-/// one-time token for a session cookie, `/api/*` behind session + CSRF checks, and the
-/// embedded frontend. No request-logging layer is installed on purpose: the login token
-/// travels once in a query string and must not reach any log.
+/// Requests to `/login` are small JSON documents.
+const MAX_LOGIN_BODY: usize = 64 * 1024;
+
+/// Router for the local web listener: `Host` guard on everything, `POST /login` to trade a
+/// one-time token for a session id, `/api/*` behind a `Bearer` session check, and the
+/// embedded frontend.
+///
+/// The session id is deliberately not a cookie: browsers share host-only cookies between
+/// every `localhost` port, so another local web server could read it. The UI keeps it in
+/// `sessionStorage` (scoped by origin, port included) and sends `Authorization: Bearer`.
+/// The login token arrives in a URL fragment (never sent to a server) and is posted in a
+/// JSON body, so it appears in no URL, log or `Referer`; no request-logging layer exists.
 pub fn web_router(state: AppState) -> Router {
     let api = api_router(state.clone()).layer(from_fn_with_state(state.clone(), session_guard));
+    let login_route = post(login)
+        .fallback(|| async { ApiError::not_found() })
+        .layer(DefaultBodyLimit::max(MAX_LOGIN_BODY))
+        .layer(from_fn(write_guard))
+        .layer(from_fn_with_state(state.clone(), origin_guard));
     Router::new()
-        .route("/login", get(login))
+        .route("/login", login_route)
         .fallback(static_asset)
         .with_state(state.clone())
         .nest("/api", api)
@@ -64,13 +82,25 @@ async fn host_guard(State(s): State<AppState>, req: Request, next: Next) -> Resp
     next.run(req).await
 }
 
-fn session_cookie(req: &Request) -> Option<String> {
-    req.headers()
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|raw| raw.split(';'))
-        .find_map(|p| p.trim().strip_prefix("sg_session=").map(String::from))
+fn unauthorized() -> Response {
+    ApiError(
+        StatusCode::UNAUTHORIZED,
+        "login required: use the URL printed by `sg serve`".into(),
+    )
+    .into_response()
+}
+
+/// The session id from exactly one `Authorization: Bearer <id>` header (scheme is
+/// case-insensitive). Anything else, cookies included, is ignored.
+fn bearer_session(req: &Request) -> Option<&str> {
+    let mut all = req.headers().get_all(header::AUTHORIZATION).iter();
+    let value = all.next()?.to_str().ok()?;
+    if all.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.contains(' '))
+        .then_some(token)
 }
 
 /// A present `Origin` must be exactly `http://<allowed host>` (the web listener is plain HTTP).
@@ -85,59 +115,55 @@ fn origin_allowed(req: &Request, s: &AppState) -> bool {
     }
 }
 
+fn cross_origin() -> Response {
+    ApiError(StatusCode::FORBIDDEN, "cross-origin request refused".into()).into_response()
+}
+
+async fn origin_guard(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    if !origin_allowed(&req, &s) {
+        return cross_origin();
+    }
+    next.run(req).await
+}
+
+/// Authentication comes first (so an unauthenticated caller learns nothing about content
+/// types or bodies), then the `Origin` check on writes. There is no CSRF header: the
+/// credential is not ambient, a cross-site page cannot attach `Authorization` without a CORS
+/// preflight, and this server answers none.
 async fn session_guard(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    match session_cookie(&req) {
-        Some(c) if s.sessions.is_valid(&c) => {}
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "login required: use the URL printed by `sg serve`",
-            )
-                .into_response()
-        }
+    match bearer_session(&req) {
+        Some(id) if s.sessions.is_valid(id) => {}
+        _ => return unauthorized(),
     }
     let is_write = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if is_write {
-        if !req.headers().contains_key("x-sg-csrf") {
-            return (StatusCode::FORBIDDEN, "missing X-SG-CSRF header").into_response();
-        }
-        if !origin_allowed(&req, &s) {
-            return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
-        }
+    if is_write && !origin_allowed(&req, &s) {
+        return cross_origin();
     }
     next.run(req).await
 }
 
 #[derive(Deserialize)]
-struct LoginQuery {
-    t: Option<String>,
+struct LoginBody {
+    token: String,
 }
 
-/// Same `401` for missing, unknown, used and evicted tokens; the token is never echoed.
-async fn login(
-    State(s): State<AppState>,
-    q: Result<Query<LoginQuery>, axum::extract::rejection::QueryRejection>,
-) -> Response {
-    let session = q
-        .ok()
-        .and_then(|Query(q)| q.t)
-        .and_then(|t| s.sessions.exchange(&t));
-    match session {
-        Some(session) => {
-            let cookie =
-                format!("sg_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
-            let mut r = Redirect::to("/").into_response();
-            r.headers_mut().insert(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&cookie).expect("hex cookie is a valid header value"),
-            );
-            r
-        }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            "invalid or already used login link",
+/// Same `401` for missing, unknown, used, expired and malformed tokens; the token is never
+/// echoed. A body that is not the expected JSON is a plain `400` that does not repeat it.
+async fn login(State(s): State<AppState>, body: Bytes) -> Response {
+    let Ok(LoginBody { token }) = serde_json::from_slice(&body) else {
+        return ApiError::bad_request("invalid JSON body").into_response();
+    };
+    match s.sessions.exchange(&token) {
+        Some(session) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({ "session": session })),
         )
             .into_response(),
+        None => ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or already used login token".into(),
+        )
+        .into_response(),
     }
 }
 

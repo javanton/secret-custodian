@@ -2,9 +2,17 @@ use axum::{body::Body, http::Request, routing::get, Json, Router};
 use serde_json::json;
 use tokio::net::UnixListener;
 
+/// A private (0700) directory, as the client now requires for the socket's parent.
+fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 #[tokio::test]
 async fn call_roundtrips_json_over_a_unix_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let sock = dir.path().join("t.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let app = Router::new().route("/ping", get(|| async { Json(json!({"pong": true})) }));
@@ -33,7 +41,7 @@ async fn missing_socket_gives_an_actionable_error() {
 
 #[tokio::test]
 async fn writes_declare_json_content_type() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let sock = dir.path().join("t.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let app = Router::new().fallback(|req: Request<Body>| async move {
@@ -54,7 +62,7 @@ async fn writes_declare_json_content_type() {
 
 #[tokio::test]
 async fn oversized_responses_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let sock = dir.path().join("t.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let app = Router::new().fallback(|| async { "a".repeat(2 * 1024 * 1024) });
@@ -67,7 +75,7 @@ async fn oversized_responses_are_refused() {
 
 #[tokio::test]
 async fn non_json_and_non_utf8_responses_do_not_panic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let sock = dir.path().join("t.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let app = Router::new().fallback(|| async { vec![0xffu8, 0xfe, b'x'] });
@@ -91,4 +99,37 @@ async fn oversized_request_bodies_are_refused_before_connecting() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("too large"), "{err}");
+}
+
+#[tokio::test]
+async fn refuses_a_socket_whose_directory_is_open_to_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sock = dir.path().join("t.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let app = Router::new().route("/ping", get(|| async { Json(json!({"pong": true})) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let err = sg_cli::call(&sock, http::Method::GET, "/ping", None)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("accessible to group/others"), "{msg}");
+    assert!(msg.contains(dir.path().to_str().unwrap()), "{msg}");
+}
+
+#[tokio::test]
+async fn refuses_a_group_writable_socket_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = private_tempdir();
+    let sock = dir.path().join("t.sock");
+    let _listener = UnixListener::bind(&sock).unwrap();
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let err = sg_cli::call(&sock, http::Method::GET, "/ping", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("writable by group/others"),
+        "{err}"
+    );
 }

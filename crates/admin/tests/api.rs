@@ -34,6 +34,7 @@ fn env() -> Env {
         vault,
         sessions: Arc::new(Sessions::new()),
         allowed_hosts: vec!["localhost:9090".into()],
+        web_base_url: None,
     };
     Env {
         _dir: dir,
@@ -555,6 +556,7 @@ async fn audit_filters_and_validation() {
         vault,
         sessions: Arc::new(Sessions::new()),
         allowed_hosts: vec![],
+        web_base_url: None,
     });
     let n = |q: &'static str| {
         let app = app.clone();

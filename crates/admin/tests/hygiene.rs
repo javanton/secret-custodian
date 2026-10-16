@@ -32,7 +32,7 @@ fn admin_never_references_reveal_for_injection() {
 
 #[test]
 fn admin_does_not_log_request_uris() {
-    // The login token travels in the query string once; no request-logging layer may exist.
+    // The login token is posted in a JSON body; no request-logging layer may exist anyway.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![];
     rs_files(&src, &mut files);
