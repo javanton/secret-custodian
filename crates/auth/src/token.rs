@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sg_core::{now, CoreError, Vault};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
+use zeroize::Zeroizing;
 
 const ISS: &str = "secret-guardian";
 const KEY_AAD: &[u8] = b"sg:token-signing-key";
@@ -18,6 +19,8 @@ pub enum AuthError {
     Expired,
     #[error("token revoked")]
     Revoked,
+    #[error("ttl out of range")]
+    InvalidTtl,
     #[error(transparent)]
     Core(#[from] CoreError),
     #[error("database error: {0}")]
@@ -68,33 +71,36 @@ pub struct TokenService {
 
 impl TokenService {
     pub fn new(vault: Arc<Vault>) -> Result<Self, AuthError> {
-        // The connection guard is a temporary dropped at the end of this statement, so it is
-        // never held while calling `open_value`/`seal_value` or re-locking below.
-        let stored: Option<Vec<u8>> = vault
-            .conn()
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'token_signing_key'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let key = match stored {
-            Some(blob) => {
-                let raw = vault.open_value(KEY_AAD, &blob)?;
-                let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| AuthError::Invalid)?;
-                SigningKey::from_bytes(&bytes)
-            }
+        // Each connection guard below is a temporary dropped at the end of its statement, so it
+        // is never held while calling `open_value`/`seal_value`.
+        let read = |vault: &Vault| -> Result<Option<Vec<u8>>, AuthError> {
+            Ok(vault
+                .conn()
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'token_signing_key'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        };
+        let blob = match read(&vault)? {
+            Some(blob) => blob,
             None => {
                 let seed = sg_core::crypto::random_key();
-                let key = SigningKey::from_bytes(&seed);
-                let blob = vault.seal_value(KEY_AAD, &*seed);
+                let sealed = vault.seal_value(KEY_AAD, &*seed);
+                // Racing creators converge: the first insert wins, everyone re-reads the stored key.
                 vault.conn().execute(
-                    "INSERT INTO meta (key, value) VALUES ('token_signing_key', ?1)",
-                    [blob],
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('token_signing_key', ?1)",
+                    [sealed],
                 )?;
-                key
+                read(&vault)?.ok_or(AuthError::Core(CoreError::Crypto))?
             }
         };
+        let raw = vault.open_value(KEY_AAD, &blob)?;
+        // A decrypted blob that is not exactly 32 bytes means a corrupt key record.
+        let seed =
+            Zeroizing::new(<[u8; 32]>::try_from(raw.as_slice()).map_err(|_| CoreError::Crypto)?);
+        let key = SigningKey::from_bytes(&seed);
         Ok(Self { vault, key })
     }
 
@@ -105,13 +111,21 @@ impl TokenService {
         ttl: Option<Duration>,
     ) -> Result<IssuedToken, AuthError> {
         let iat = now();
+        let exp = ttl
+            .map(|t| {
+                i64::try_from(t.as_secs())
+                    .ok()
+                    .and_then(|s| iat.checked_add(s))
+                    .ok_or(AuthError::InvalidTtl)
+            })
+            .transpose()?;
         let claims = Claims {
             iss: ISS.into(),
             jti: uuid::Uuid::new_v4().to_string(),
             sub: machine.into(),
             role: role.into(),
             iat,
-            exp: ttl.map(|t| iat + t.as_secs() as i64),
+            exp,
         };
         let signing_input = format!(
             "{}.{}",

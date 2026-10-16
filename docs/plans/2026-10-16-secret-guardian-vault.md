@@ -1730,7 +1730,7 @@ git add -A && git commit -m "feat(policy): add roles, rules, matching and normal
   - `struct TokenService` con `new(Arc<Vault>) -> Result<Self, AuthError>`, `issue(&self, machine: &str, role: &str, ttl: Option<Duration>) -> Result<IssuedToken, AuthError>`, `revoke(&self, jti: &str) -> Result<(), AuthError>`, `revoke_machine(&self, machine: &str) -> Result<usize, AuthError>`, `list(&self) -> Result<Vec<TokenMeta>, AuthError>`; `impl TokenVerifier for TokenService`
   - `struct IssuedToken { token: String, jti: String }`, `struct TokenMeta { jti, machine, role, created_at, expires_at: Option<i64>, revoked_at: Option<i64> }` (`Serialize`)
   - `fn extract_proxy_token(header: &str) -> Option<String>`
-  - `enum AuthError { Invalid, Expired, Revoked, Core(CoreError), Db(rusqlite::Error) }`
+  - `enum AuthError { Invalid, Expired, Revoked, InvalidTtl, Core(CoreError), Db(rusqlite::Error) }`
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -1902,6 +1902,8 @@ pub enum AuthError {
     Expired,
     #[error("token revoked")]
     Revoked,
+    #[error("ttl out of range")]
+    InvalidTtl,
     #[error(transparent)]
     Core(#[from] CoreError),
     #[error("database error: {0}")]
@@ -4031,6 +4033,7 @@ impl From<sg_auth::AuthError> for ApiError {
     fn from(e: sg_auth::AuthError) -> Self {
         match e {
             sg_auth::AuthError::Core(c) => c.into(),
+            sg_auth::AuthError::InvalidTtl => ApiError(StatusCode::BAD_REQUEST, "ttl out of range".into()),
             other => ApiError(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
     }
@@ -4141,6 +4144,9 @@ struct NewToken { machine: String, role: String, ttl_secs: Option<u64> }
 async fn create_token(State(s): State<AppState>, Json(b): Json<NewToken>) -> ApiResult<(StatusCode, Json<Value>)> {
     if b.machine.trim().is_empty() || sg_policy::get_role(&s.vault, &b.role)?.is_none() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "machine is required and the role must exist".into()));
+    }
+    if b.ttl_secs.is_some_and(|t| t > 315_360_000) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "ttl_secs must be at most 10 years (315360000)".into()));
     }
     let t = s.tokens.issue(&b.machine, &b.role, b.ttl_secs.map(Duration::from_secs))?;
     Ok((StatusCode::CREATED, Json(json!({ "token": t.token, "jti": t.jti, "machine": b.machine, "role": b.role }))))

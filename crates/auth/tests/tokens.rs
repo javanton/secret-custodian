@@ -239,11 +239,169 @@ fn zero_ttl_token_is_immediately_expired() {
 }
 
 #[test]
-fn expired_check_precedes_revocation_lookup_but_revoked_beats_valid() {
+fn revoked_unexpired_token_reports_revoked() {
     let (_d, _v, s) = svc();
     let t = s.issue("m", "r", Some(Duration::from_secs(3600))).unwrap();
     s.revoke(&t.jti).unwrap();
     assert!(matches!(s.verify(&t.token), Err(AuthError::Revoked)));
+}
+
+#[test]
+fn expiry_is_evaluated_before_the_revocation_lookup() {
+    let (_d, _v, s) = svc();
+    let t = s.issue("m", "r", Some(Duration::ZERO)).unwrap();
+    s.revoke(&t.jti).unwrap();
+    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired)));
+}
+
+fn token_count(v: &Vault) -> i64 {
+    v.conn()
+        .query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn out_of_range_ttl_is_rejected_without_inserting_a_row() {
+    let (_d, v, s) = svc();
+    let huge = [
+        Duration::from_secs(u64::MAX),
+        Duration::from_secs(i64::MAX as u64),
+        // fits in i64 but iat + ttl overflows
+        Duration::from_secs(i64::MAX as u64 - 1),
+    ];
+    for ttl in huge {
+        assert!(
+            matches!(s.issue("m", "r", Some(ttl)), Err(AuthError::InvalidTtl)),
+            "{ttl:?}"
+        );
+    }
+    assert_eq!(token_count(&v), 0);
+    assert_eq!(AuthError::InvalidTtl.to_string(), "ttl out of range");
+    let ok = s.issue("m", "r", Some(Duration::from_secs(3600))).unwrap();
+    assert!(s.verify(&ok.token).is_ok());
+    assert!(s.issue("m", "r", Some(Duration::ZERO)).is_ok());
+    assert_eq!(token_count(&v), 2);
+}
+
+#[test]
+fn wrong_length_signing_key_blob_maps_to_crypto_error() {
+    let dir = tempdir().unwrap();
+    let v = Arc::new(
+        Vault::init(
+            &dir.path().join("v.db"),
+            KeyInput::Raw(crypto::random_key()),
+        )
+        .unwrap(),
+    );
+    for len in [0usize, 31, 33, 64] {
+        let blob = v.seal_value(b"sg:token-signing-key", &vec![7u8; len]);
+        v.conn()
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('token_signing_key', ?1)",
+                [blob],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                TokenService::new(v.clone()),
+                Err(AuthError::Core(sg_core::CoreError::Crypto))
+            ),
+            "len {len}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_service_creation_converges_on_one_key() {
+    let (_d, v, _s) = svc();
+    // sequential: a second service on the same vault verifies the first's tokens and vice versa
+    let a = TokenService::new(v.clone()).unwrap();
+    let b = TokenService::new(v.clone()).unwrap();
+    let ta = a.issue("m", "r", None).unwrap();
+    let tb = b.issue("m", "r", None).unwrap();
+    assert!(b.verify(&ta.token).is_ok());
+    assert!(a.verify(&tb.token).is_ok());
+}
+
+#[test]
+fn racing_first_creators_converge_on_one_key() {
+    for _ in 0..20 {
+        let dir = tempdir().unwrap();
+        let v = Arc::new(
+            Vault::init(
+                &dir.path().join("v.db"),
+                KeyInput::Raw(crypto::random_key()),
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let spawn = |v: Arc<Vault>, bar: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                bar.wait();
+                TokenService::new(v).unwrap()
+            })
+        };
+        let h1 = spawn(v.clone(), barrier.clone());
+        let h2 = spawn(v.clone(), barrier.clone());
+        let (a, b) = (h1.join().unwrap(), h2.join().unwrap());
+        let ta = a.issue("m", "r", None).unwrap();
+        let tb = b.issue("m", "r", None).unwrap();
+        assert!(b.verify(&ta.token).is_ok());
+        assert!(a.verify(&tb.token).is_ok());
+        let n: i64 = v
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key = 'token_signing_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+}
+
+#[test]
+fn non_canonical_or_padded_signature_is_rejected() {
+    let (_d, _v, s) = svc();
+    let t = s.issue("m", "r", None).unwrap();
+    let parts: Vec<&str> = t.token.split('.').collect();
+    let sig = parts[2];
+    assert_eq!(sig.len(), 86); // 64 bytes -> 86 chars, last char carries 4 unused bits
+    let last = sig.chars().last().unwrap();
+    let idx = |c: char| {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            .find(c)
+            .unwrap()
+    };
+    let alphabet: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        .chars()
+        .collect();
+    // flip a trailing (non-canonical) bit in the last character
+    let noncanon = alphabet[idx(last) ^ 1];
+    let bad = format!("{}.{}.{}{}", parts[0], parts[1], &sig[..85], noncanon);
+    assert!(s.verify(&bad).is_err());
+    // '=' padding
+    let padded = format!("{}.{}.{}==", parts[0], parts[1], sig);
+    assert!(s.verify(&padded).is_err());
+    // control: the untouched token is fine
+    assert!(s.verify(&t.token).is_ok());
+}
+
+#[test]
+fn single_flipped_signature_byte_is_rejected() {
+    let (_d, _v, s) = svc();
+    let t = s.issue("m", "r", None).unwrap();
+    let parts: Vec<&str> = t.token.split('.').collect();
+    let mut sig = B64.decode(parts[2]).unwrap();
+    for i in [0usize, 31, 32, 63] {
+        sig[i] ^= 0x01;
+        let bad = format!("{}.{}.{}", parts[0], parts[1], B64.encode(&sig));
+        assert!(
+            matches!(s.verify(&bad), Err(AuthError::Invalid)),
+            "byte {i}"
+        );
+        sig[i] ^= 0x01;
+    }
 }
 
 #[test]
