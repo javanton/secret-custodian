@@ -31,7 +31,7 @@ y sin sincronización entre instancias.
 ### Fuera de alcance (fase 1)
 
 - Federación OIDC y tokens por agente (sí por máquina y rol).
-- Sidecar / launcher `vault run` que guarda el token fuera del alcance del agente.
+- Sidecar / launcher `sg run` que guarda el token fuera del alcance del agente.
 - Administración remota con login, multiusuario, alta disponibilidad.
 - Inyección en body y firma de peticiones (AWS SigV4, HMAC).
 - Redacción de secretos reflejados en la respuesta del destino.
@@ -129,8 +129,9 @@ se confirma en el plan.
    (host, path, método). Sin coincidencia exacta con método permitido: `403` y entrada en audit.
 4. Se **elimina** cualquier cabecera o parámetro que el agente haya enviado con el mismo nombre
    que el destino de la inyección, y se inyecta el valor descifrado.
-5. Se reenvía al destino real con TLS saliente (`rustls`, raíces del sistema), en streaming,
-   sin almacenar cuerpos en memoria.
+5. Se reenvía al destino real con TLS saliente (`rustls`, raíces del sistema más las CA añadidas
+   con `--upstream-ca`, útil para servicios internos con CA privada), en streaming, sin almacenar
+   cuerpos en memoria.
 6. Se devuelve la respuesta tal cual y se escribe la entrada de audit.
 
 ### 6.2 Reglas
@@ -143,14 +144,24 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
 - Inyección `header`: `target_name` = nombre de cabecera, `template` p. ej. `Bearer {secret}` o
   `Basic {secret}`.
 - Inyección `query`: `target_name` = parámetro, `template` = `{secret}`.
+- Las reglas comparan el **hostname** normalizado (minúsculas, sin punto final, sin puerto); el
+  puerto no forma parte del patrón. Los hosts con forma de IP no admiten reglas.
+- El path se normaliza antes de comparar (segmentos `.`/`..` resueltos, escapes de caracteres no
+  reservados decodificados, `//` colapsado) y **se reenvía el path normalizado**: lo autorizado es
+  lo enviado.
+- Los valores de secreto no pueden contener CR, LF ni NUL; en inyección `query` el valor se codifica
+  en porcentaje.
 
 ### 6.3 CA acotada
 
 - La CA se crea en el primer arranque con **name constraints** (`permitted dNSName`) limitadas
-  a los dominios registrados con `vault ca allow-domain <dominio>`.
+  a los dominios registrados con `sg ca allow-domain <dominio>`. Un dominio permitido cubre sus
+  subdominios.
+- Sin dominios permitidos la CA se restringe al TLD reservado `invalid`, de modo que nunca queda
+  sin restricciones. `allow-domain` rechaza TLDs y dominios de una sola etiqueta (salvo `localhost`).
 - Añadir un dominio fuera de lo permitido reemite el certificado de la CA **con la misma clave**
   y requiere que los agentes recarguen el certificado público. La UI y la CLI avisan.
-- El certificado público se descarga con `vault ca export` o desde la web; la clave privada
+- El certificado público se descarga con `sg ca export` o desde la web; la clave privada
   no sale nunca.
 - Certificados de hoja de corta duración (24 h) y cacheados en memoria.
 - Distribución a los agentes por variable de entorno (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
@@ -168,6 +179,8 @@ necesitan credenciales. **Decisión a confirmar en la revisión.**
   variables de entorno no funcionarán con el MITM.
 - Si el destino refleja el secreto en su respuesta, el agente lo vería. Fuera de alcance.
 - Websockets / upgrades: solo se inyecta en la petición de handshake.
+- Inyección sobre HTTP en claro: se rechaza con `403` salvo que el host sea `localhost`; una regla
+  nunca envía credenciales por una conexión sin TLS hacia Internet.
 
 ## 7. Administración
 
@@ -195,16 +208,17 @@ REST/JSON sobre `axum`. Recursos: `secrets`, `roles`, `rules`, `tokens`, `ca`, `
 ### 7.3 CLI
 
 ```
-vault serve [--key-file|--passphrase] [--proxy-bind] [--admin-bind] [--data-dir]
-vault secret   add|rotate|rm|ls
-vault role     add|rm|ls            (--unmatched passthrough|deny)
-vault rule     add|rm|ls            (--role --host --path --methods --header|--query --template --secret)
-vault token    create|revoke|ls     (--machine --role --ttl)
-vault ca       export|allow-domain|status
-vault audit    ls [--role --host --since]
+sg serve [--key-file|--passphrase] [--proxy-bind] [--admin-bind] [--data-dir] [--socket] [--upstream-ca <pem>]
+sg keygen   [--out <fichero>]
+sg secret   add|rotate|rm|ls
+sg role     add|rm|ls            (--unmatched passthrough|deny)
+sg rule     add|rm|ls            (--role --host --path --methods --header|--query --template --secret)
+sg token    create|revoke|ls     (--machine --role --ttl)
+sg ca       export|allow-domain|status
+sg audit    ls [--role --host --since]
 ```
 
-`vault secret add` lee el valor de stdin o de un prompt sin eco, nunca de argumentos de línea
+`sg secret add` lee el valor de stdin o de un prompt sin eco, nunca de argumentos de línea
 de comandos (evita que aparezca en el historial y en `ps`).
 
 ### 7.4 Web
@@ -236,7 +250,7 @@ permitidos), audit log.
 
 1. **Esta spec:** núcleo cifrado, CA acotada, proxy con inyección en header/query, tokens por
    (máquina, rol), reglas, audit, CLI y web local.
-2. Sidecar / launcher `vault run` (el agente no ve el token).
+2. Sidecar / launcher `sg run` (el agente no ve el token).
 3. Modo de administración remota con login (opt-in).
 4. Federación OIDC como segundo `TokenVerifier` y tokens por agente.
 5. Inyección en body y firmas (SigV4).
@@ -255,4 +269,4 @@ permitidos), audit log.
 
 1. Política por defecto para hosts sin regla: `passthrough` (propuesto) o `deny`.
 2. Puertos por defecto: proxy `8080`, web `9090`.
-3. Nombre final del binario y del proyecto (`vault` es provisional; choca con HashiCorp Vault).
+3. ~~Nombre~~ Resuelto en el plan: binario `sg`, paquete `secret-guardian` (`vault` chocaba con HashiCorp Vault).
