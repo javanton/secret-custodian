@@ -1,0 +1,19 @@
+[package]
+name = "sg-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

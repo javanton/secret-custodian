@@ -1,0 +1,21 @@
+[package]
+name = "sg-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sg-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+http.workspace = true
+serde_json.workspace = true
+rpassword.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
