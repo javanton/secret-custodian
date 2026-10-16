@@ -1613,6 +1613,7 @@ dependencies = [
  "percent-encoding",
  "rusqlite",
  "serde",
+ "serde_json",
  "sg-core",
  "tempfile",
  "thiserror",
