@@ -27,7 +27,7 @@
 - CA con name constraints siempre presentes (`invalid` si no hay dominios); `allow-domain` rechaza TLDs y dominios de una etiqueta (salvo `localhost`).
 - CLI por socket Unix `$XDG_RUNTIME_DIR/secret-guardian.sock` con permisos `0600`; los valores de secreto se leen de stdin o de un prompt sin eco, nunca de argumentos.
 - Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host`; cookie `HttpOnly` + `SameSite=Strict`; cabecera anti-CSRF en escrituras; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
-- Rama de trabajo: `feature/phase1-core`. Commits Conventional Commits por tarea. **Altitud de tests:** cada tarea ejecuta solo los tests de su crate; la suite completa corre una única vez en `/ship`.
+- Rama de trabajo: `feature/phase1-core`. Commits Conventional Commits por tarea. **Altitud de tests:** cada tarea ejecuta solo los tests de su crate; la suite completa corre una única vez en `/ship`. En `/ship` se ejecuta además `cargo test --workspace --release -- --include-ignored` (incluye el test exhaustivo de rutas de `policy`, ~40 s).
 
 ## Review Focus
 

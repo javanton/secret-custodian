@@ -661,8 +661,7 @@ mod tests {
         None
     }
 
-    #[test]
-    fn exhaustive_prefix_rule_never_authorizes_an_escaping_path() {
+    fn run_exhaustive(max_len: usize, min_paths: u64) {
         let rules = [rule(
             1,
             "api.github.com",
@@ -675,16 +674,27 @@ mod tests {
             "/repos/", "x", "..", ".", "%2F", "%252F", ";", "\\", "%3F", "/",
         ];
         let mut count = (0, 0);
-        // Length 6 (about 1.1M paths) in release; length 5 (about 111k) in debug, where it is ~10x slower.
-        let max_len = if cfg!(debug_assertions) { 5 } else { 6 };
         let r = walk(&rules, &toks, max_len, &mut String::new(), &mut count);
         assert!(r.is_none(), "{}", r.unwrap());
-        assert!(count.0 > 100_000, "enumerated only {}", count.0);
+        assert!(count.0 >= min_paths, "enumerated only {}", count.0);
         assert!(
             count.1 > 100,
             "only {} paths injected: test is vacuous",
             count.1
         );
+    }
+
+    /// Quick run (about 11k paths), part of the normal suite.
+    #[test]
+    fn exhaustive_prefix_rule_never_authorizes_an_escaping_path() {
+        run_exhaustive(4, 10_000);
+    }
+
+    /// Full run (about 1.1M paths). Run in /ship: `cargo test -p sg-policy --release -- --include-ignored`.
+    #[test]
+    #[ignore = "slow: run with --release -- --include-ignored"]
+    fn exhaustive_prefix_rule_never_authorizes_an_escaping_path_full() {
+        run_exhaustive(6, 1_000_000);
     }
 
     #[test]
