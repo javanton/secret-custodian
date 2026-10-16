@@ -1,0 +1,169 @@
+use sg_core::{crypto, CoreError, KeyInput, Vault};
+use tempfile::tempdir;
+
+fn raw(k: &sg_core::crypto::Key32) -> KeyInput {
+    KeyInput::Raw(zeroize::Zeroizing::new(**k))
+}
+
+#[test]
+fn init_then_open_with_same_key() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let key = crypto::random_key();
+    Vault::init(&path, raw(&key)).unwrap();
+    Vault::open(&path, raw(&key)).unwrap();
+}
+
+#[test]
+fn open_with_wrong_key_fails_without_detail() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    let err = Vault::open(&path, raw(&crypto::random_key()))
+        .err()
+        .unwrap();
+    assert!(matches!(err, CoreError::WrongKey));
+}
+
+#[test]
+fn passphrase_vault_rejects_raw_key_and_vice_versa() {
+    let dir = tempdir().unwrap();
+    let p1 = dir.path().join("a.db");
+    Vault::init(&p1, KeyInput::Passphrase("pw".into())).unwrap();
+    Vault::open(&p1, KeyInput::Passphrase("pw".into())).unwrap();
+    assert!(matches!(
+        Vault::open(&p1, raw(&crypto::random_key())).err().unwrap(),
+        CoreError::KeySourceMismatch
+    ));
+    assert!(matches!(
+        Vault::open(&p1, KeyInput::Passphrase("bad".into()))
+            .err()
+            .unwrap(),
+        CoreError::WrongKey
+    ));
+}
+
+#[test]
+fn secret_lifecycle_and_metadata_only_listing() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    let meta = v.add_secret("github-pat", "ghp_SUPERSECRET").unwrap();
+    assert_eq!(v.list_secrets().unwrap().len(), 1);
+    assert_eq!(
+        &**v.reveal_for_injection(meta.id).unwrap(),
+        "ghp_SUPERSECRET"
+    );
+    let rotated = v.rotate_secret("github-pat", "ghp_NEW").unwrap();
+    assert!(rotated.rotated_at.is_some());
+    assert_eq!(&**v.reveal_for_injection(meta.id).unwrap(), "ghp_NEW");
+    v.remove_secret("github-pat").unwrap();
+    assert!(v.list_secrets().unwrap().is_empty());
+    assert!(matches!(
+        v.remove_secret("github-pat"),
+        Err(CoreError::NotFound)
+    ));
+}
+
+#[test]
+fn duplicate_name_is_rejected() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    v.add_secret("a", "x").unwrap();
+    assert!(matches!(
+        v.add_secret("a", "y"),
+        Err(CoreError::AlreadyExists)
+    ));
+}
+
+#[test]
+fn values_with_crlf_or_nul_or_empty_are_rejected() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    for bad in ["a\r\nX-Evil: 1", "a\nb", "a\0b", ""] {
+        assert!(
+            matches!(
+                v.add_secret("s", bad),
+                Err(CoreError::InvalidSecretValue(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        v.add_secret("Bad Name!", "x"),
+        Err(CoreError::InvalidName(_))
+    ));
+}
+
+#[test]
+fn database_file_never_contains_plaintext_secret() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let v = Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    v.add_secret("tok", "PLAINTEXT-MARKER-12345").unwrap();
+    drop(v);
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(!bytes.windows(22).any(|w| w == b"PLAINTEXT-MARKER-12345"));
+    }
+}
+
+#[test]
+fn database_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn removing_secret_referenced_by_a_rule_is_in_use() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    let meta = v.add_secret("tok", "x").unwrap();
+    {
+        let c = v.conn();
+        c.execute(
+            "INSERT INTO roles (name, unmatched_policy) VALUES ('r', 'deny')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO rules (role, host_pattern, path_pattern, methods, injection_kind, target_name, template, secret_id) \
+             VALUES ('r', 'h.com', '/*', '*', 'header', 'Authorization', '{secret}', ?1)",
+            [meta.id],
+        )
+        .unwrap();
+    }
+    assert!(matches!(v.remove_secret("tok"), Err(CoreError::InUse)));
+    assert_eq!(v.list_secrets().unwrap().len(), 1);
+}
+
+#[test]
+fn too_long_value_is_rejected_and_secret_cannot_move_between_rows() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    assert!(matches!(
+        v.add_secret("big", &"a".repeat(8193)),
+        Err(CoreError::InvalidSecretValue(_))
+    ));
+    let a = v.add_secret("a", "AAA").unwrap();
+    let b = v.add_secret("b", "BBB").unwrap();
+    {
+        let c = v.conn();
+        let blob: Vec<u8> = c
+            .query_row("SELECT value_enc FROM secrets WHERE id = ?1", [a.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        c.execute(
+            "UPDATE secrets SET value_enc = ?1 WHERE id = ?2",
+            rusqlite::params![blob, b.id],
+        )
+        .unwrap();
+    }
+    assert!(v.reveal_for_injection(b.id).is_err());
+}
