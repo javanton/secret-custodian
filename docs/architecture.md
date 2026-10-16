@@ -38,8 +38,10 @@ Explicit limit (spec section 2): an agent that can reach the proxy can make requ
 permissions of its role. The guarantee is that it cannot extract the secret and that rules bound what it
 can do with it. Secrets reflected by the destination in a response are out of scope.
 
-The threat model items about the local web UI (rebinding, CSRF, sessions) belong to the planned `admin`
-crate and are not implemented.
+The threat model items about the local web UI (rebinding, cross-site requests, sessions) belong to the `admin`
+crate. Its sessions deliberately do not use cookies (browsers share host-only cookies across all `localhost`
+ports): the login token travels in the URL fragment, is exchanged once through `POST /login`, and the session
+is then sent as `Authorization: Bearer`.
 
 ## 2. Crate map
 

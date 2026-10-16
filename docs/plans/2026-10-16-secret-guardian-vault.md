@@ -26,7 +26,7 @@
 - Inyección sobre HTTP en claro: nunca; `403` (`plaintext-refused`) sin excepciones. La excepción de loopback de `NetPolicy` solo aplica a peticiones reenviadas por TLS al host exacto `localhost` con regla.
 - CA con name constraints siempre presentes (`invalid` si no hay dominios); `allow-domain` rechaza TLDs y dominios de una etiqueta (salvo `localhost`).
 - CLI por socket Unix `$XDG_RUNTIME_DIR/secret-guardian.sock` con permisos `0600`; los valores de secreto se leen de stdin o de un prompt sin eco, nunca de argumentos.
-- Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host`; cookie `HttpOnly` + `SameSite=Strict`; cabecera anti-CSRF en escrituras; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
+- Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host` y `Origin`; sesión por `Authorization: Bearer` (sin cookies: no se aíslan por puerto en `localhost`), token de login en el fragmento `#t=`; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
 - Rama de trabajo: `feature/phase1-core`. Commits Conventional Commits por tarea. **Altitud de tests:** cada tarea ejecuta solo los tests de su crate; la suite completa corre una única vez en `/ship`. En `/ship` se ejecuta además `cargo test --workspace --release -- --include-ignored` (incluye el test exhaustivo de rutas de `policy`, ~40 s).
 
 ## Review Focus
@@ -3761,11 +3761,13 @@ git add -A && git commit -m "feat(proxy): handle plain http requests and refuse 
 **Interfaces:**
 - Consumes: `sg_core::Vault`, `sg_policy::*`, `sg_auth::TokenService`, `sg_ca::CaService`.
 - Produces:
-  - `struct AppState { vault: Arc<Vault>, tokens: Arc<TokenService>, ca: Arc<CaService>, sessions: Arc<Sessions>, allowed_hosts: Vec<String> }` (`Clone`)
-  - `fn api_router(state: AppState) -> Router` (sin guarda; para el socket Unix)
-  - `fn web_router(state: AppState) -> Router` (guarda de `Host`, `/login`, `/api` con sesión + CSRF, estáticos con CSP)
-  - `struct Sessions` con `new() -> Self`, `new_login_token(&self) -> String`, `exchange(&self, token: &str) -> Option<String>`, `is_valid(&self, session: &str) -> bool`
-  - `async fn serve_unix(path: &Path, state: AppState) -> io::Result<()>`, `async fn serve_web(addr: SocketAddr, state: AppState) -> io::Result<()>`
+  - `struct AppState { vault: Arc<Vault>, tokens: Arc<TokenService>, ca: Arc<CaService>, sessions: Arc<Sessions>, allowed_hosts: Vec<String>, web_base_url: Option<String> }` (`Clone`)
+  - `fn api_router(state: AppState) -> Router` (sin guarda; no se sirve por HTTP)
+  - `fn socket_router(state: AppState) -> Router` (`api_router` + `POST /admin/login-token` -> `{token, url?}`; solo para el socket Unix)
+  - `fn web_router(state: AppState) -> Router` (guarda de `Host`, `POST /login`, `/api` con `Authorization: Bearer` + `Origin`, estáticos con CSP; sin cookies ni `GET /login`)
+  - `struct AdminServeOptions { max_connections: 256, header_read_timeout: 10 s, max_connection_lifetime: 1 h }` (`Default`)
+  - `struct Sessions` con `new() -> Self`, `with_limits(ttl, max_sessions, max_login_tokens, login_ttl)` (tokens y sesiones guardados como SHA-256; tokens de login caducan a los 10 min), `new_login_token(&self) -> String`, `exchange(&self, token: &str) -> Option<String>`, `is_valid(&self, session: &str) -> bool`
+  - `async fn serve_unix(path, state)`, `serve_unix_with(path, state, opts)`, `serve_web(listener, state)`, `serve_web_with(listener, state, opts)` (hyper directo con timeout de cabeceras, vida máxima y tope de conexiones con `Semaphore` adquirido antes de `accept`); `bind_unix` exige directorio padre y socket propiedad del usuario actual y padre `0700`
   - Rutas JSON: `GET|POST /secrets`, `GET|PUT|DELETE /secrets/{name}`, `GET|POST /roles`, `DELETE /roles/{name}`, `GET|POST /rules`, `DELETE /rules/{id}`, `GET|POST /tokens`, `DELETE /tokens/{jti}`, `POST /machines/{machine}/revoke`, `GET /ca`, `GET /ca/cert`, `POST /ca/domains`, `GET /audit`
 
 - [ ] **Step 1: Escribir los tests que fallan**
@@ -3891,59 +3893,75 @@ fn app() -> (tempfile::TempDir, Router, Arc<Sessions>) {
         tokens: Arc::new(TokenService::new(vault.clone()).unwrap()),
         ca: Arc::new(CaService::init_or_load(vault.clone()).unwrap()),
         vault, sessions: sessions.clone(), allowed_hosts: vec!["localhost:9090".into(), "127.0.0.1:9090".into()],
+        web_base_url: Some("http://localhost:9090".into()),
     };
     (dir, web_router(state), sessions)
 }
 
-fn req(method: &str, uri: &str, host: &str, cookie: Option<&str>, csrf: bool) -> Request<Body> {
+fn req(method: &str, uri: &str, host: &str, bearer: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method(method).uri(uri).header(header::HOST, host);
-    if let Some(c) = cookie { b = b.header(header::COOKIE, format!("sg_session={c}")); }
-    if csrf { b = b.header("x-sg-csrf", "1"); }
+    if let Some(c) = bearer { b = b.header(header::AUTHORIZATION, format!("Bearer {c}")); }
     b.body(Body::empty()).unwrap()
+}
+
+fn login_req(token: &str) -> Request<Body> {
+    Request::builder().method("POST").uri("/login").header(header::HOST, "localhost:9090")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"token":"{token}"}}"#))).unwrap()
 }
 
 #[tokio::test]
 async fn wrong_host_header_is_rejected_everywhere() {
     let (_d, app, _s) = app();
-    for uri in ["/", "/login?t=x", "/api/secrets"] {
-        let r = app.clone().oneshot(req("GET", uri, "evil.com", None, false)).await.unwrap();
+    for uri in ["/", "/login", "/api/secrets"] {
+        let r = app.clone().oneshot(req("GET", uri, "evil.com", None)).await.unwrap();
         assert_eq!(r.status(), StatusCode::MISDIRECTED_REQUEST, "{uri}");
     }
 }
 
 #[tokio::test]
-async fn api_requires_a_session() {
-    let (_d, app, _s) = app();
-    let r = app.oneshot(req("GET", "/api/secrets", "localhost:9090", None, false)).await.unwrap();
+async fn api_requires_a_bearer_session_and_ignores_cookies() {
+    let (_d, app, sessions) = app();
+    let r = app.clone().oneshot(req("GET", "/api/secrets", "localhost:9090", None)).await.unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let sid = sessions.exchange(&sessions.new_login_token()).unwrap();
+    let mut stolen = req("GET", "/api/secrets", "localhost:9090", None);
+    stolen.headers_mut().insert(header::COOKIE, format!("sg_session={sid}").parse().unwrap());
+    assert_eq!(app.oneshot(stolen).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn login_token_is_single_use_and_sets_a_strict_cookie() {
+async fn login_token_is_single_use_and_returns_a_no_store_session() {
     let (_d, app, sessions) = app();
     let t = sessions.new_login_token();
-    let r = app.clone().oneshot(req("GET", &format!("/login?t={t}"), "localhost:9090", None, false)).await.unwrap();
-    assert_eq!(r.status(), StatusCode::SEE_OTHER);
-    let cookie = r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
-    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
-    let again = app.oneshot(req("GET", &format!("/login?t={t}"), "localhost:9090", None, false)).await.unwrap();
+    let r = app.clone().oneshot(login_req(&t)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+    let body = r.into_body().collect().await.unwrap().to_bytes();
+    let sid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session"].as_str().unwrap().to_string();
+    assert_eq!(sid.len(), 64);
+    let ok = app.clone().oneshot(req("GET", "/api/secrets", "localhost:9090", Some(&sid))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let again = app.clone().oneshot(login_req(&t)).await.unwrap();
     assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    // GET /login no longer exists
+    let get = app.oneshot(req("GET", "/login", "localhost:9090", None)).await.unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn writes_need_the_csrf_header() {
-    let (_d, app, sessions) = app();
-    let s = sessions.exchange(&sessions.new_login_token()).unwrap();
-    let no = app.clone().oneshot(req("POST", "/api/roles", "localhost:9090", Some(&s), false)).await.unwrap();
-    assert_eq!(no.status(), StatusCode::FORBIDDEN);
-    let get = app.oneshot(req("GET", "/api/secrets", "localhost:9090", Some(&s), false)).await.unwrap();
-    assert_eq!(get.status(), StatusCode::OK);
+async fn unauthenticated_writes_get_401_before_415() {
+    let (_d, app, _s) = app();
+    let r = app.oneshot(Request::builder().method("POST").uri("/api/roles").header(header::HOST, "localhost:9090")
+        .header(header::CONTENT_TYPE, "text/plain").body(Body::from("x")).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn static_pages_carry_a_strict_csp() {
     let (_d, app, _s) = app();
-    let r = app.oneshot(req("GET", "/", "localhost:9090", None, false)).await.unwrap();
+    let r = app.oneshot(req("GET", "/", "localhost:9090", None)).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let csp = r.headers().get("content-security-policy").unwrap().to_str().unwrap();
     assert!(csp.contains("default-src 'self'") && csp.contains("frame-ancestors 'none'"));
@@ -3959,43 +3977,39 @@ Expected: FAIL (no compila).
 
 `sessions.rs`:
 ```rust
-use std::{collections::{HashMap, HashSet}, sync::Mutex, time::{Duration, Instant}};
+use sha2::{Digest as _, Sha256};
+use std::{collections::{HashMap, VecDeque}, sync::Mutex, time::{Duration, Instant}};
 
-const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+type Digest = [u8; 32];
 
-#[derive(Default)]
+/// Solo se guardan hashes SHA-256: ningún secreto en claro en memoria y la búsqueda
+/// por hash no depende de cuánto acierte un intento. Tope de 8 tokens y 16 sesiones.
 pub struct Sessions {
-    login: Mutex<HashSet<String>>,
-    active: Mutex<HashMap<String, Instant>>,
+    ttl: Duration,        // sesión: 8 h
+    login_ttl: Duration,  // token de login pendiente: 10 min
+    max_sessions: usize,
+    max_login: usize,
+    login: Mutex<VecDeque<(Digest, Instant)>>,
+    active: Mutex<HashMap<Digest, Instant>>,
 }
 
-fn random_hex() -> String {
-    hex::encode(sg_core::crypto::random_bytes::<32>())
-}
+fn random_hex() -> String { hex::encode(sg_core::crypto::random_bytes::<32>()) }
+fn digest(s: &str) -> Digest { Sha256::digest(s.as_bytes()).into() }
 
 impl Sessions {
-    pub fn new() -> Self { Self::default() }
+    pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+    pub const DEFAULT_LOGIN_TTL: Duration = Duration::from_secs(600);
+    pub fn new() -> Self { Self::with_limits(Self::DEFAULT_SESSION_TTL, 16, 8, Self::DEFAULT_LOGIN_TTL) }
+    pub fn with_limits(ttl: Duration, max_sessions: usize, max_login: usize, login_ttl: Duration) -> Self { /* ... */ }
 
-    pub fn new_login_token(&self) -> String {
-        let t = random_hex();
-        self.login.lock().unwrap().insert(t.clone());
-        t
-    }
+    /// Token de login de 256 bits y un solo uso; al llegar al tope se descarta el más antiguo.
+    pub fn new_login_token(&self) -> String { /* poda caducados, encola digest(t) */ }
 
-    pub fn exchange(&self, token: &str) -> Option<String> {
-        if !self.login.lock().unwrap().remove(token) {
-            return None;
-        }
-        let s = random_hex();
-        self.active.lock().unwrap().insert(s.clone(), Instant::now());
-        Some(s)
-    }
+    /// Consume el token bajo un único lock (de N intentos concurrentes gana exactamente uno)
+    /// y devuelve un id de sesión de 256 bits (hex).
+    pub fn exchange(&self, token: &str) -> Option<String> { /* ... */ }
 
-    pub fn is_valid(&self, session: &str) -> bool {
-        let mut a = self.active.lock().unwrap();
-        a.retain(|_, at| at.elapsed() < SESSION_TTL);
-        a.contains_key(session)
-    }
+    pub fn is_valid(&self, session: &str) -> bool { /* busca digest(session), poda caducadas */ }
 }
 ```
 
@@ -4014,6 +4028,7 @@ pub struct AppState {
     pub ca: Arc<CaService>,
     pub sessions: Arc<Sessions>,
     pub allowed_hosts: Vec<String>,
+    pub web_base_url: Option<String>, // p. ej. http://localhost:9090, para construir la URL de login
 }
 ```
 
@@ -4214,14 +4229,15 @@ async fn audit(State(s): State<AppState>, Query(f): Query<AuditFilter>) -> ApiRe
 
 `web.rs`:
 ```rust
-use crate::{api::api_router, state::AppState};
+use crate::{api::{api_router, write_guard}, error::ApiError, state::AppState};
 use axum::{
-    extract::{Query, Request, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{from_fn_with_state, Next},
-    response::{IntoResponse, Redirect, Response},
-    routing::get,
-    Router,
+    middleware::{from_fn, from_fn_with_state, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -4234,13 +4250,19 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-
 
 pub fn web_router(state: AppState) -> Router {
     let api = api_router(state.clone()).layer(from_fn_with_state(state.clone(), session_guard));
+    // POST /login: solo JSON (415), Origin comprobado, cuerpo <= 64 KiB; GET/HEAD -> 404 (no consumen nada)
+    let login_route = post(login)
+        .fallback(|| async { ApiError::not_found() })
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(from_fn(write_guard))
+        .layer(from_fn_with_state(state.clone(), origin_guard));
     Router::new()
-        .route("/login", get(login))
-        .nest("/api", api)
+        .route("/login", login_route)
         .fallback(static_asset)
-        .layer(from_fn_with_state(state.clone(), host_guard))
+        .with_state(state.clone())
+        .nest("/api", api)
+        .layer(from_fn_with_state(state, host_guard))
         .layer(axum::middleware::map_response(security_headers))
-        .with_state(state)
 }
 
 async fn security_headers(mut resp: Response) -> Response {
@@ -4265,35 +4287,40 @@ async fn host_guard(State(s): State<AppState>, req: Request, next: Next) -> Resp
     next.run(req).await
 }
 
-fn session_cookie(req: &Request) -> Option<String> {
-    let raw = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|p| p.trim().strip_prefix("sg_session=").map(String::from))
+/// Exactamente una cabecera `Authorization: Bearer <id>` (esquema sin distinguir mayúsculas).
+/// Las cookies se ignoran: no se aíslan por puerto en localhost.
+fn bearer_session(req: &Request) -> Option<&str> {
+    let mut all = req.headers().get_all(header::AUTHORIZATION).iter();
+    let value = all.next()?.to_str().ok()?;
+    if all.next().is_some() { return None; }
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.contains(' ')).then_some(token)
 }
 
+/// Un `Origin` presente debe ser exactamente `http://<host permitido>`.
+fn origin_allowed(req: &Request, s: &AppState) -> bool { /* ... */ }
+
 async fn session_guard(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    match session_cookie(&req) {
-        Some(c) if s.sessions.is_valid(&c) => {}
-        _ => return (StatusCode::UNAUTHORIZED, "login required: use the URL printed by `sg serve`").into_response(),
+    match bearer_session(&req) {          // 401 primero: antes que 415/400
+        Some(id) if s.sessions.is_valid(id) => {}
+        _ => return unauthorized(),
     }
     let is_write = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if is_write && req.headers().get("x-sg-csrf").is_none() {
-        return (StatusCode::FORBIDDEN, "missing X-SG-CSRF header").into_response();
-    }
-    next.run(req).await
+    if is_write && !origin_allowed(&req, &s) { return cross_origin(); }   // 403
+    next.run(req).await                    // sin cabecera CSRF: la credencial no es ambiental
 }
 
 #[derive(Deserialize)]
-struct LoginQuery { t: String }
+struct LoginBody { token: String }
 
-async fn login(State(s): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
-    match s.sessions.exchange(&q.t) {
-        Some(session) => {
-            let cookie = format!("sg_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
-            let mut r = Redirect::to("/").into_response();
-            r.headers_mut().insert(header::SET_COOKIE, cookie.parse().unwrap());
-            r
-        }
-        None => (StatusCode::UNAUTHORIZED, "invalid or already used login link").into_response(),
+/// El mismo 401 para token desconocido, usado, caducado o malformado; nunca se repite el token.
+async fn login(State(s): State<AppState>, body: Bytes) -> Response {
+    let Ok(LoginBody { token }) = serde_json::from_slice(&body) else {
+        return ApiError::bad_request("invalid JSON body").into_response();
+    };
+    match s.sessions.exchange(&token) {
+        Some(session) => ([(header::CACHE_CONTROL, "no-store")], Json(json!({ "session": session }))).into_response(),
+        None => ApiError(StatusCode::UNAUTHORIZED, "invalid or already used login token".into()).into_response(),
     }
 }
 
@@ -4307,28 +4334,27 @@ async fn static_asset(req: Request) -> Response {
 }
 ```
 
-`serve.rs`:
+`serve.rs` (resumen; el código completo está en el repositorio):
 ```rust
-use crate::{api::api_router, state::AppState, web::web_router};
-use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::Path};
-use tokio::net::{TcpListener, UnixListener};
+pub struct AdminServeOptions { pub max_connections: usize, pub header_read_timeout: Duration, pub max_connection_lifetime: Duration } // 256 / 10 s / 1 h
 
-pub async fn serve_unix(path: &Path, state: AppState) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    axum::serve(listener, api_router(state)).await
-}
+/// Bucle propio sobre hyper: el permiso del `Semaphore` se toma ANTES de `accept` (los clientes
+/// de más esperan en el backlog); `http1::Builder` con `TokioTimer` y `header_read_timeout`;
+/// `timeout(max_connection_lifetime, conn)`; el router es el servicio (`TowerToHyperService`).
+async fn serve_loop<S, F, Fut>(accept: F, app: Router, opts: AdminServeOptions) -> io::Result<()> { /* ... */ }
 
-pub async fn serve_web(listener: TcpListener, state: AppState) -> std::io::Result<()> {
-    axum::serve(listener, web_router(state)).await
-}
+pub async fn bind_unix(path: &Path) -> io::Result<UnixListener>; // padre propio y 0700; socket obsoleto propio; 0600
+pub async fn serve_unix(path: &Path, state: AppState) -> io::Result<()>;      // socket_router
+pub async fn serve_unix_with(path: &Path, state: AppState, opts: AdminServeOptions) -> io::Result<()>;
+pub async fn serve_web(listener: TcpListener, state: AppState) -> io::Result<()>;   // web_router
+pub async fn serve_web_with(listener: TcpListener, state: AppState, opts: AdminServeOptions) -> io::Result<()>;
 
 pub fn allowed_hosts_for(addr: SocketAddr) -> Vec<String> {
     let p = addr.port();
     vec![format!("localhost:{p}"), format!("127.0.0.1:{p}"), format!("[::1]:{p}")]
 }
 ```
+
 (Para `--admin-bind` no-loopback se añade en la Tarea 13 el aviso y, si procede, el host publicado.)
 
 `lib.rs`:
@@ -4340,8 +4366,8 @@ mod sessions;
 mod state;
 mod web;
 
-pub use api::api_router;
-pub use serve::{allowed_hosts_for, serve_unix, serve_web};
+pub use api::{api_router, socket_router};
+pub use serve::{allowed_hosts_for, bind_unix, serve_unix, serve_unix_with, serve_web, serve_web_with, AdminServeOptions};
 pub use sessions::Sessions;
 pub use state::AppState;
 pub use web::web_router;
@@ -4740,7 +4766,7 @@ git add -A && git commit -m "feat(cli): add unix-socket admin client and command
 - Test: `crates/admin/tests/web_assets.rs`
 
 **Interfaces:**
-- Consumes: la API `/api/*` (Tarea 10) con la cookie de sesión y la cabecera `X-SG-CSRF: 1` en escrituras.
+- Consumes: la API `/api/*` (Tarea 10) con `Authorization: Bearer <sesión>`. Al cargar lee el token del fragmento (`#t=`), lo borra con `history.replaceState`, hace `POST /login` (JSON `{"token"}`) y guarda la sesión devuelta en `sessionStorage` (aislado por origen, puerto incluido). Sin cookies ni cabecera `X-SG-CSRF`; `fetch` con `credentials: "omit"`.
 - Produces: SPA estática con pestañas Secretos, Roles y reglas, Tokens, CA, Audit.
 
 - [ ] **Step 1: Escribir el test que falla** (`crates/admin/tests/web_assets.rs`)
@@ -4787,9 +4813,12 @@ async fn frontend_never_uses_dangerous_dom_sinks_or_external_resources() {
 }
 
 #[tokio::test]
-async fn frontend_sends_the_csrf_header_on_writes() {
+async fn frontend_uses_fragment_session_storage_and_bearer() {
     let (_, js) = get("/app.js").await;
-    assert!(js.contains("X-SG-CSRF"));
+    assert!(js.contains("Authorization") && js.contains("Bearer"));
+    assert!(js.contains("sessionStorage") && js.contains("replaceState") && js.contains("location.hash"));
+    assert!(js.contains("credentials: \"omit\""));
+    assert!(!js.contains("X-SG-CSRF") && !js.contains("document.cookie"));
 }
 ```
 
@@ -4853,10 +4882,20 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
+// Token de login: viene en el fragmento (#t=...), que el navegador nunca envía al servidor.
+async function login() {
+  const m = /(?:^#|&)t=([0-9a-f]+)/.exec(location.hash);
+  if (!m) return;
+  history.replaceState(null, "", location.pathname + location.search); // fuera de la barra y del historial
+  const resp = await fetch("/login", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: m[1] }), credentials: "omit" });
+  if (!resp.ok) throw new Error("login link invalid or already used; run `sg login-url`");
+  sessionStorage.setItem("sg_session", (await resp.json()).session);
+}
+
 async function api(method, path, body) {
-  const headers = { "Content-Type": "application/json" };
-  if (method !== "GET") headers["X-SG-CSRF"] = "1";
-  const resp = await fetch("/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" });
+  const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + (sessionStorage.getItem("sg_session") || "") };
+  const resp = await fetch("/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: "omit" });
   const text = await resp.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -4970,11 +5009,11 @@ async function show(name) {
   try {
     view.replaceChildren(...(await tabs[name]()));
   } catch (err) {
-    view.replaceChildren(el("div", { class: "error" }, err.message, " (open the login URL printed by `sg serve` if your session expired)"));
+    view.replaceChildren(el("div", { class: "error" }, err.message, " (run `sg login-url` and open the URL if your session expired)"));
   }
 }
 
-show("Secrets");
+login().then(() => show("Secrets"), (err) => view.replaceChildren(el("div", { class: "error" }, err.message)));
 ```
 
 - [ ] **Step 4: Ejecutar y ver que pasa**
@@ -4999,10 +5038,16 @@ git add -A && git commit -m "feat(web): add embedded admin UI without dom inject
 **Interfaces:**
 - Consumes: todos los crates.
 - Produces:
-  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>] [--allow-loopback-targets]` (variable `SG_MASTER_KEY` como tercera fuente)
+  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--admin-allowed-host <host:puerto>]... [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>] [--allow-loopback-targets]` (variable `SG_MASTER_KEY` como tercera fuente)
   - `sg keygen [--out <fichero>]`
   - Subcomandos de cliente aplanados (`sg secret ...`, `sg --socket <ruta> ...`)
   - `keys::resolve_key(args: &KeySource, interactive_confirm: bool) -> anyhow::Result<KeyInput>`
+
+**Notas de seguridad para esta tarea (revisión de la Tarea 10):**
+- `allowed_hosts_for(addr)` solo admite el puerto de bind. En contenedores el puerto publicado del host debe ser igual al del contenedor (`127.0.0.1:9090:9090`); para otras asignaciones se usa `--admin-allowed-host <host:puerto>` (repetible, se añade a `allowed_hosts`).
+- `bind_unix` rechaza un directorio padre accesible por grupo/otros o ajeno. El directorio de datos y sus padres bajo `$HOME` se crean con `DirBuilder::new().recursive(true).mode(0o700)`, y el socket por defecto vive en `$XDG_RUNTIME_DIR` (0700).
+- El límite de 256 conexiones por listener (`AdminServeOptions`) no sustituye a `RLIMIT_NOFILE`; subirlo queda fuera de alcance (documentarlo si el despliegue espera muchos clientes).
+- La URL de login impresa usa el fragmento `#t=`; `sg login-url` (solo por el socket Unix, ruta `POST /admin/login-token`) emite otra sin reiniciar.
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -5082,7 +5127,10 @@ fn sg(s: &Server, args: &[&str], stdin: Option<&str>) -> (bool, String) {
 #[test]
 fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
     let s = start();
-    assert!(s.login.contains("/login?t="));
+    assert!(s.login.contains("/#t="));
+    // `sg login-url` mints another single-use URL without restarting
+    let (ok, url) = sg(&s, &["login-url"], None);
+    assert!(ok && url.contains("/#t="), "{url}");
     assert!(sg(&s, &["secret", "add", "gh"], Some("E2E-PLAINTEXT-MARKER\n")).0);
     assert!(sg(&s, &["role", "add", "reviewer", "--unmatched", "deny"], None).0);
     assert!(sg(&s, &["ca", "allow-domain", "github.com"], None).0);
@@ -5217,10 +5265,13 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
 
     let sessions = Arc::new(Sessions::new());
     let login = sessions.new_login_token();
-    let app = AppState { vault, tokens, ca, sessions, allowed_hosts: allowed_hosts_for(admin_addr) };
+    let mut allowed_hosts = allowed_hosts_for(admin_addr);
+    allowed_hosts.extend(args.admin_allowed_host.iter().cloned()); // --admin-allowed-host <host:port>, repeatable
+    let web_base_url = Some(format!("http://localhost:{}", admin_addr.port()));
+    let app = AppState { vault, tokens, ca, sessions, allowed_hosts, web_base_url };
 
     println!("proxy: http://{proxy_addr}");
-    println!("admin: http://localhost:{}/login?t={login}", admin_addr.port());
+    println!("admin: http://localhost:{}/#t={login}", admin_addr.port()); // fragmento: nunca viaja al servidor
     println!("socket: {}", socket.display());
 
     tokio::select! {

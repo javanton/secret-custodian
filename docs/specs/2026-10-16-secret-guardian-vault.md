@@ -45,7 +45,7 @@ y sin sincronización entre instancias.
 | Robo de la base de datos | Valores cifrados con AES-256-GCM; clave maestra fuera de la DB |
 | Fuga de la clave de la CA | CA con name constraints: solo puede firmar para los dominios permitidos |
 | Token del agente filtrado | TTL opcional, revocación inmediata, audit log por `jti`; ligado a máquina/rol |
-| Página web maliciosa ataca la UI local | Solo `127.0.0.1`, validación de `Host`, sesión `HttpOnly`/`SameSite=Strict`, anti-CSRF |
+| Página web maliciosa ataca la UI local | Solo `127.0.0.1`, validación de `Host` y `Origin`, sesión en cabecera `Authorization: Bearer` (no en cookie), token de login en el fragmento de la URL |
 | Agente usa el vault para llegar a hosts no previstos | Política por rol para hosts sin regla (ver 6.4) |
 
 **Límite asumido:** un agente con acceso al proxy puede hacer peticiones a través
@@ -318,9 +318,26 @@ REST/JSON sobre `axum`. Recursos: `secrets`, `roles`, `rules`, `tokens`, `ca`, `
 ### 7.2 Seguridad de la web local
 
 - Validación estricta de `Host` (`localhost`, `127.0.0.1`) contra DNS rebinding.
-- Al arrancar se imprime una URL de un solo uso con token de sesión; se canjea por cookie
-  `HttpOnly`, `SameSite=Strict`, caducidad corta.
-- Cabecera anti-CSRF obligatoria en las operaciones de escritura.
+- Al arrancar (o con `sg login-url`, que usa solo el socket Unix) se imprime una URL de un solo
+  uso `http://localhost:<puerto>/#t=<token>`. El token va en el **fragmento**, que el navegador
+  nunca envía al servidor ni en `Referer`. La página lo lee, lo borra con `history.replaceState`
+  y lo canjea con `POST /login` (JSON `{"token": ...}`, con guarda de `Host`, comprobación de
+  `Origin` y respuesta `no-store`), que devuelve `{"session": "<64 hex>"}`. El token caduca a
+  los 10 minutos, es de un solo uso y hay como máximo 8 pendientes.
+- **No se usa cookie.** Los navegadores envían las cookies host-only a *todos* los puertos de
+  `localhost` (RFC 6265), de modo que otro proceso local que sirva `http://localhost:3000` y que
+  el operador visite recibiría la sesión y podría llamar a la API. La sesión vive en
+  `sessionStorage` (aislado por origen, puerto incluido) y se envía como
+  `Authorization: Bearer <sesión>` en cada llamada a `/api`; las cookies se ignoran por completo.
+  Sesiones de 256 bits, máximo 16, caducidad de 8 h; el servidor guarda solo hashes SHA-256 de
+  tokens y sesiones.
+- No hay cabecera anti-CSRF: la credencial no es ambiental, y una página de otro origen no puede
+  añadir `Authorization` sin un preflight CORS, que el servidor no responde (sin cabeceras CORS).
+  Se mantienen: solo `application/json` en escrituras (`415`), `Origin` presente debe ser
+  `http://<host permitido>`, límite de cuerpo de 64 KiB y `401` antes que `415`/`400`.
+- El servidor limita las conexiones: timeout de lectura de cabeceras (10 s), vida máxima por
+  conexión (1 h) y 256 conexiones simultáneas. El cliente de la CLI y `bind_unix` exigen que el
+  socket y su directorio padre pertenezcan al usuario actual y que el directorio sea `0700`.
 - `Content-Security-Policy` restrictiva; sin recursos de terceros.
 
 ### 7.3 CLI
@@ -367,7 +384,7 @@ permitidos), audit log.
   grandes, hosts sin regla en ambos modos.
 - **CA:** un cliente `rustls` rechaza una hoja de un dominio fuera de las name constraints.
 - **Seguridad:** ninguna respuesta de la API contiene el valor; un volcado de la DB no contiene
-  el valor en claro; validación de `Host` y CSRF en la web.
+  el valor en claro; validación de `Host`/`Origin` en la web; las cookies se ignoran y la API exige `Authorization: Bearer`.
 - **E2E:** script con `curl` a través del proxy, con y sin CA, y rol `reviewer` frente a `developer`.
 
 ## 10. Fases
