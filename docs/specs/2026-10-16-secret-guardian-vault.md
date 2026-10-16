@@ -85,16 +85,18 @@ se confirma en el plan.
   - `SG_MASTER_KEY`: la misma clave en base64.
   - `--passphrase`: se pide por terminal; Argon2id con sal guardada en la cabecera de la DB.
 - Una **DEK** aleatoria de 32 bytes cifrada con la KEK vive en la DB; cifra todos los valores
-  secretos, la clave privada de la CA y la clave de firma de tokens. Cambiar la passphrase o la
-  clave maestra solo reescribe la DEK.
-- AES-256-GCM, nonce aleatorio de 96 bits por valor, AAD = id del registro (evita mover
-  valores entre filas).
+  secretos, la clave privada de la CA y la clave de firma de tokens. El diseño permite re-envolver
+  la DEK con una KEK nueva sin recifrar los valores, pero la rotación de passphrase o clave
+  maestra **no está implementada en la fase 1** (queda para una fase posterior).
+- AES-256-GCM, nonce aleatorio de 96 bits por valor, AAD = cadena de propósito, no solo el
+  id del registro: `sg:dek`, `secret:{id}`, `sg:token-signing-key`, `sg:ca-key` (evita mover
+  valores entre filas o entre usos).
 - Si la KEK es incorrecta, el servidor no arranca y no revela cuál era el fallo concreto.
 - Los valores descifrados solo existen en memoria durante la inyección y se limpian con `zeroize` en la medida de lo posible (*best effort*: las copias dentro de `hyper`/`http` no se borran).
 
 ### Esquema (resumen)
 
-- `meta`: versión de esquema, sal Argon2, DEK cifrada.
+- `meta`: versión de esquema, `kdf`, sal Argon2, DEK cifrada, `token_signing_key`.
 - `secrets`: `id`, `name` (único), `value_enc`, `created_at`, `rotated_at`.
 - `roles`: `name`, `unmatched_policy` (`passthrough` | `deny`).
 - `rules`: `id`, `role`, `host_pattern`, `path_pattern`, `methods`, `injection_kind`
@@ -125,7 +127,8 @@ se confirma en el plan.
 2. `CONNECT host:443`: se busca si el rol tiene alguna regla para `host`.
    - Hay regla: se responde `200`, se termina TLS con un certificado de hoja de `host` firmado
      por la CA, se lee la petición descifrada.
-   - No hay regla: se aplica `unmatched_policy` del rol (6.4).
+   - No hay regla: se aplica `unmatched_policy` del rol (6.4). La librería no tiene valor por
+     defecto; la CLI `sg role add` usa `--unmatched passthrough` por defecto.
 3. Por cada petición descifrada se evalúan las reglas del rol por orden de especificidad
    (host, path, método). Sin coincidencia exacta con método permitido: `403` y entrada en audit.
 4. Se **elimina** cualquier cabecera o parámetro que el agente haya enviado con el mismo nombre
@@ -133,7 +136,9 @@ se confirma en el plan.
 5. Se reenvía al destino real con TLS saliente (`rustls`, raíces del sistema más las CA añadidas
    con `--upstream-ca`, útil para servicios internos con CA privada), en streaming, sin almacenar
    cuerpos en memoria.
-6. Se devuelve la respuesta tal cual y se escribe la entrada de audit.
+6. Se devuelve la respuesta tal cual. La entrada de audit se escribe cuando se ha recibido la
+   cabecera de respuesta del destino y antes de devolverla al agente (en las peticiones que el
+   proxy rechaza, antes de devolver el rechazo).
 
 ### 6.2 Reglas
 
@@ -311,7 +316,12 @@ permitidos), audit log.
 - Códigos del proxy: `407` sin token válido, `403` sin regla o método no permitido, `502` si falla
   el destino. Los mensajes no incluyen valores ni detalles de reglas.
 - `tracing` estructurado; los valores secretos y los tokens nunca se registran.
-- El audit log se escribe de forma síncrona antes de enviar el primer byte al agente.
+- El audit log se escribe de forma síncrona cuando se ha recibido la cabecera de respuesta del
+  destino y antes de devolverla al agente (si el proxy rechaza la petición, antes de devolver el
+  rechazo). No se escribe fila de audit para la autenticación fallida (`407`) ni para destinos
+  CONNECT o de forma absoluta mal formados (`400`). Si la escritura del audit falla, se registra
+  en el log y no bloquea una petición ya reenviada. Los cuerpos de respuesta truncados se
+  registran con el estado de la cabecera que se envió.
 
 ## 9. Pruebas
 

@@ -95,8 +95,8 @@ does not open as `secret:2`; a signing-key blob does not open as `sg:other`; tes
 `crates/auth/tests/tokens.rs`, `private_key_is_not_recoverable_from_the_db_without_the_vault_key` in
 `crates/ca/tests/ca.rs`). `rotate_secret` re-seals under the same `secret:{id}` with a fresh nonce.
 
-The spec (section 4) says "AAD = id del registro"; the code uses a purpose-specific string for every
-use and the record id only for secrets. See the discrepancy list delivered with this documentation.
+The spec (section 4) also states that the AAD is a purpose string, not just the record id: `sg:dek`,
+`secret:{id}`, `sg:token-signing-key`, `sg:ca-key`.
 
 ## 4. What lives under each key
 
@@ -146,7 +146,7 @@ What it cannot guarantee:
 | Operation | Supported today? |
 |---|---|
 | Rotate a secret value (`Vault::rotate_secret`) | Yes: new ciphertext, same AAD, `rotated_at` set. |
-| Change the passphrase or key file (re-wrap the DEK under a new KEK) | **No.** No function in `sg-core` does it; `meta.dek_wrapped`, `kdf` and `salt` are only written by `init`. The spec describes it as cheap because only the DEK is rewritten, but the code does not implement it. |
+| Change the passphrase or key file (re-wrap the DEK under a new KEK) | **No.** No function in `sg-core` does it; `meta.dek_wrapped`, `kdf` and `salt` are only written by `init`. The spec says the design allows it cheaply (only the DEK is re-wrapped) but that rotation is not implemented in phase 1. |
 | Rotate the DEK (re-encrypt every secret, signing key, CA key) | **No.** |
 | Rotate the token signing key | **No.** Generated once; deleting the `meta` row by hand would invalidate every issued token (and is not supported by any API). |
 | Rotate the CA key | **No.** `allow_domain` re-issues the certificate with the **same** key. |

@@ -204,7 +204,7 @@ git add -A && git commit -m "chore: scaffold cargo workspace for phase 1"
   - `pub fn kek_from_base64(s: &str) -> Result<Key32, CoreError>`
   - `pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8>` (formato `nonce(12) || ciphertext+tag`)
   - `pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, CoreError>`
-  - `pub enum CoreError { WrongKey, KeySourceMismatch, InvalidKey, InvalidSecretValue(&'static str), InvalidName(&'static str), NotFound, AlreadyExists, InUse, Crypto, Db(rusqlite::Error), Io(std::io::Error) }`
+  - `pub enum CoreError { WrongKey, KeySourceMismatch, UnsupportedSchema { found: i64, supported: i64 }, InvalidKey, InvalidSecretValue(&'static str), InvalidName(&'static str), NotFound, AlreadyExists, InUse, Crypto, Db(rusqlite::Error), Io(std::io::Error) }`
 
 - [ ] **Step 1: Escribir los tests que fallan** (en `crypto.rs`, módulo `tests`)
 
@@ -282,6 +282,8 @@ pub enum CoreError {
     WrongKey,
     #[error("the vault was created with a different key source")]
     KeySourceMismatch,
+    #[error("database schema version {found} is not supported by this build (supports {supported})")]
+    UnsupportedSchema { found: i64, supported: i64 },
     #[error("invalid key material")]
     InvalidKey,
     #[error("invalid secret value: {0}")]
@@ -576,7 +578,7 @@ CREATE TABLE ca (
 use crate::crypto::{self, Key32};
 use crate::error::CoreError;
 use crate::schema::{SCHEMA, SCHEMA_VERSION};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -657,7 +659,11 @@ impl Vault {
     }
 
     pub fn open(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
-        let conn = Connection::open(path)?;
+        if !path.try_exists()? {
+            return Err(CoreError::Io(std::io::ErrorKind::NotFound.into()));
+        }
+        // No CREATE flag: opening must never create a file.
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let kdf = meta_get(&conn, "kdf")?;
         let kek = match (kdf.as_slice(), key) {
@@ -671,6 +677,14 @@ impl Vault {
         let wrapped = meta_get(&conn, "dek_wrapped")?;
         let dek_bytes = crypto::open(&kek, DEK_AAD, &wrapped).map_err(|_| CoreError::WrongKey)?;
         let dek: [u8; 32] = dek_bytes.as_slice().try_into().map_err(|_| CoreError::WrongKey)?;
+        // Checked only after the key is verified, so a wrong key never learns the version.
+        let found: i64 = std::str::from_utf8(&meta_get(&conn, "schema_version")?)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or(CoreError::UnsupportedSchema { found: -1, supported: SCHEMA_VERSION })?;
+        if found != SCHEMA_VERSION {
+            return Err(CoreError::UnsupportedSchema { found, supported: SCHEMA_VERSION });
+        }
         Ok(Self { conn: Mutex::new(conn), dek: Zeroizing::new(dek) })
     }
 
@@ -4023,6 +4037,7 @@ impl From<sg_core::CoreError> for ApiError {
             InvalidSecretValue(_) | InvalidName(_) | InvalidKey => StatusCode::BAD_REQUEST,
             NotFound => StatusCode::NOT_FOUND,
             AlreadyExists | InUse => StatusCode::CONFLICT,
+            // includes UnsupportedSchema: internal error by default
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())

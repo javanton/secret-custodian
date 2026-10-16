@@ -202,7 +202,8 @@ Step notes (all from the cited files):
     exchange; 60 s bound on handshake plus request until the response head arrives; the response body
     is streamed and not bounded. Failures give `502` with audit `upstream-error`.
 11. **Audit and response**: the row (`inject`, status of the upstream response, id of the first
-    matching rule) is written before the response is returned to the agent. The audited path is the raw
+    matching rule) is written once the upstream response head has been received and before the response
+    is returned to the agent (truncated bodies keep the status of the head that was sent). The audited path is the raw
     request path with the query string removed, not the normalized one. If writing the audit row fails,
     the error is logged and the request proceeds (`server.rs`, `audit`).
 
@@ -270,8 +271,8 @@ Reasons visible in the code: foreign keys give integrity between rules, roles an
 (`ON DELETE RESTRICT` on `rules.secret_id`, `ON DELETE CASCADE` on `rules.role`); schema and `meta` rows
 are created in one transaction so a half-initialised vault is never visible (`init_with`); and backup is
 one file plus the key (see [database-schema.md](database-schema.md)). One DEK protects every encrypted
-value, so changing the passphrase or key source only has to re-wrap one 32-byte DEK (the code that
-would do that does not exist yet; see [crypto-and-keys.md](crypto-and-keys.md)).
+value, so the design allows changing the passphrase or key source by re-wrapping one 32-byte DEK
+(rotation is not implemented in phase 1; see [crypto-and-keys.md](crypto-and-keys.md)).
 
 ### Why per-secret AAD
 

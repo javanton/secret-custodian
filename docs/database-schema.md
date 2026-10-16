@@ -234,9 +234,9 @@ value, no token signing key and no CA private key. The test `database_file_never
   only computes a path (`$XDG_DATA_HOME/secret-guardian`, else `$HOME/.local/share/secret-guardian`, else
   `/tmp/secret-guardian`; empty or relative variables are ignored). Creating and securing the directory
   is left to the (planned) CLI.
-- `Vault::open` never creates the file with `0600`: if the path does not exist, `Connection::open`
-  creates an empty database using the process umask and the call then fails (no `meta` table, reported
-  as a database error). `Vault::open_or_init` avoids this by checking `path.exists()` first.
+- `Vault::open` never creates a file: if the path does not exist it returns `CoreError::Io` (kind
+  `NotFound`) and creates nothing, and it opens SQLite with `SQLITE_OPEN_READ_WRITE` only (no `CREATE`
+  flag). `Vault::open_or_init` calls `init` when the path does not exist.
 
 ## 6. Initialisation and failure behaviour
 
@@ -258,27 +258,31 @@ asserts exactly that. Because the schema and meta rows share a transaction, a ha
 
 `Vault::open`:
 
-1. `Connection::open` and `foreign_keys=ON`.
+1. If the path does not exist, return `CoreError::Io(NotFound)`. Otherwise open with
+   `SQLITE_OPEN_READ_WRITE` (no create) and set `foreign_keys=ON`.
 2. Read `kdf` from `meta`. A missing row yields `CoreError::WrongKey`.
 3. The `kdf` must match the supplied `KeyInput` variant (`raw` with `Raw`, `argon2id` with `Passphrase`),
    otherwise `CoreError::KeySourceMismatch`.
 4. Read `salt` (for `argon2id`; it must be 16 bytes, else `WrongKey`), derive the KEK.
 5. Read `dek_wrapped` and decrypt with AAD `sg:dek`; failure or a DEK that is not 32 bytes gives
    `CoreError::WrongKey`.
+6. Only after the key is verified, read `schema_version`; a value that differs from `SCHEMA_VERSION`,
+   is missing or is not numeric gives `CoreError::UnsupportedSchema { found, supported }` (a wrong key
+   never reaches this step, so it does not leak the version).
 
-`open` does not read `schema_version`, does not run `PRAGMA integrity_check`, and does not set
+`open` does not run `PRAGMA integrity_check`, and does not set
 `journal_mode` (WAL is a persistent property of the file, set at init). A file that is not an SQLite
 database, or has no `meta` table, produces `CoreError::Db`.
 
 ## 7. Versioning and migration status
 
-`SCHEMA_VERSION` is `1` and is written to `meta.schema_version` at init. **Nothing reads it back.**
-There is no migration framework, no `ALTER TABLE` and no version comparison anywhere in the code.
-As the code stands:
+`SCHEMA_VERSION` is `1` and is written to `meta.schema_version` at init. `Vault::open` reads it back
+after the key is verified and refuses any other value with `CoreError::UnsupportedSchema`, which is
+mapped to an internal error (500) by the admin API. There is no migration framework and no
+`ALTER TABLE` in the code. As the code stands:
 
-- A vault created by a future version that changed the schema would still be opened by this code
-  without any version check, and would fail later, at the first statement that touches a changed table
-  or column (a `CoreError::Db`), or work incorrectly if the change was semantic.
+- A vault created by a future version that changed the schema is refused by this code with
+  `UnsupportedSchema` instead of failing later.
 - A vault created by this version and opened by a future version depends entirely on that version
   implementing the check. Spec section 3 lists "migraciones" among the responsibilities of `core`; this
   is not implemented yet.
