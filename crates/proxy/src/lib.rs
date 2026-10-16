@@ -1,3 +1,4 @@
+mod forward;
 mod inject;
 mod mitm;
 mod server;

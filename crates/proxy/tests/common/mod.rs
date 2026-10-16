@@ -1,16 +1,21 @@
 #![allow(dead_code)]
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::CertificateDer;
 use sg_auth::TokenService;
 use sg_auth::TokenVerifier;
 use sg_ca::CaService;
 use sg_core::{crypto, KeyInput, Vault};
 use sg_proxy::{ProxyState, ServeOptions, UpstreamConfig};
-use std::{net::SocketAddr, sync::Arc};
+use std::future::Future;
+use std::{net::SocketAddr, sync::Arc, sync::Mutex};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
 
 pub struct Env {
     pub dir: TempDir,
@@ -130,4 +135,428 @@ pub async fn echo_server() -> SocketAddr {
 
 pub fn no_extra_roots() -> UpstreamConfig {
     UpstreamConfig::new(Vec::<CertificateDer<'static>>::new())
+}
+
+// ---------------------------------------------------------------------------------------------
+// TLS/plain test upstreams
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    pub method: String,
+    pub uri: String,
+    pub headers: Vec<(String, String)>,
+    pub body_len: usize,
+}
+
+pub struct TestUpstream {
+    pub addr: SocketAddr,
+    pub received: Arc<Mutex<Vec<Recorded>>>,
+    pub ca_der: CertificateDer<'static>,
+}
+
+impl TestUpstream {
+    pub fn header(&self, i: usize, name: &str) -> Vec<String> {
+        self.received.lock().unwrap()[i]
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    pub fn count(&self) -> usize {
+        self.received.lock().unwrap().len()
+    }
+}
+
+/// Body that yields `first`, waits 1.5 s, then yields `second`: proves responses are streamed.
+struct SlowBody {
+    step: u8,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl hyper::body::Body for SlowBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        match self.step {
+            0 => {
+                self.step = 1;
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                    b"first",
+                )))))
+            }
+            1 => match self.sleep.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.step = 2;
+                    Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                        b"second",
+                    )))))
+                }
+            },
+            _ => Poll::Ready(None),
+        }
+    }
+}
+
+type UpBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+async fn serve_recording<IO>(io: IO, received: Arc<Mutex<Vec<Recorded>>>)
+where
+    IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let received = received.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let n = body
+                .collect()
+                .await
+                .map(|b| b.to_bytes().len())
+                .unwrap_or(0);
+            received.lock().unwrap().push(Recorded {
+                method: parts.method.to_string(),
+                uri: parts.uri.to_string(),
+                headers: parts
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect(),
+                body_len: n,
+            });
+            // `/slow` never answers within the test timeouts; `/stream` answers in two parts.
+            if parts.uri.path() == "/slow" {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            let body: UpBody = if parts.uri.path() == "/stream" {
+                SlowBody {
+                    step: 0,
+                    sleep: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1500))),
+                }
+                .boxed()
+            } else {
+                Full::new(Bytes::from_static(b"ok")).boxed()
+            };
+            let mut resp = hyper::Response::new(body);
+            // Headers a proxy must not pass back to the agent, plus one it must.
+            resp.headers_mut().insert("x-up", "1".parse().unwrap());
+            resp.headers_mut()
+                .insert("keep-alive", "timeout=5".parse().unwrap());
+            resp.headers_mut().insert("proxy-foo", "1".parse().unwrap());
+            Ok::<_, std::convert::Infallible>(resp)
+        }
+    });
+    let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(io, svc)
+        .await;
+}
+
+pub async fn spawn_tls_upstream(host: &str) -> TestUpstream {
+    use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec![host.to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .unwrap();
+    let cfg = rustls::ServerConfig::builder_with_provider(sg_ca::crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            rustls::pki_types::PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                leaf_key.serialize_der(),
+            )),
+        )
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let rec = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (acceptor, rec) = (acceptor.clone(), rec.clone());
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(tcp).await {
+                    serve_recording(TokioIo::new(tls), rec).await;
+                }
+            });
+        }
+    });
+    TestUpstream {
+        addr,
+        received,
+        ca_der: ca.der().clone(),
+    }
+}
+
+pub async fn spawn_plain_upstream() -> TestUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let rec = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let rec = rec.clone();
+            tokio::spawn(serve_recording(TokioIo::new(tcp), rec));
+        }
+    });
+    TestUpstream {
+        addr,
+        received,
+        ca_der: CertificateDer::from(Vec::new()),
+    }
+}
+
+/// Env wired to a TLS test upstream reachable under `host`, with the CA allowing `host`.
+pub async fn env_with_upstream(host: &str) -> (Env, TestUpstream) {
+    env_with_upstream_cfg(host, |_| {}).await
+}
+
+/// Like `env_with_upstream`, letting the test tweak the `UpstreamConfig` (timeouts...).
+pub async fn env_with_upstream_cfg(
+    host: &str,
+    tweak: impl FnOnce(&mut UpstreamConfig),
+) -> (Env, TestUpstream) {
+    let up = spawn_tls_upstream(host).await;
+    let mut cfg = UpstreamConfig::new(vec![up.ca_der.clone()]);
+    cfg.resolve_override.insert(host.to_string(), up.addr);
+    tweak(&mut cfg);
+    let env = Env::new(cfg).await;
+    env.ca.allow_domain(host).unwrap();
+    (env, up)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client side of a MITM tunnel
+// ---------------------------------------------------------------------------------------------
+
+pub struct Resp {
+    pub status: u16,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Resp {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// CONNECT through the proxy and complete the TLS handshake trusting the proxy CA.
+/// `Err(resp)` carries the proxy's refusal when CONNECT was not answered with 200.
+pub async fn tunnel_tls(
+    env: &Env,
+    token: &str,
+    host: &str,
+    http2: bool,
+) -> Result<TlsStream<TcpStream>, Resp> {
+    let (line, tcp) =
+        raw_connect(env.proxy_addr, &format!("{host}:443"), Some(&basic(token))).await;
+    if !line.contains("200") {
+        return Err(Resp {
+            status: line
+                .split(' ')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            body: line,
+            headers: vec![],
+        });
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut env.ca.cert_pem().as_bytes()) {
+        roots
+            .add(CertificateDer::from(c.unwrap().to_vec()))
+            .unwrap();
+    }
+    let mut cfg = rustls::ClientConfig::builder_with_provider(sg_ca::crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![if http2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    }];
+    Ok(TlsConnector::from(Arc::new(cfg))
+        .connect(
+            rustls::pki_types::ServerName::try_from(host.to_string()).unwrap(),
+            tcp,
+        )
+        .await
+        .expect("client must trust the proxy CA for this host"))
+}
+
+async fn into_resp(resp: hyper::Response<hyper::body::Incoming>) -> Resp {
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let body =
+        String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).to_string();
+    Resp {
+        status,
+        body,
+        headers,
+    }
+}
+
+fn build_request(
+    http2: bool,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> hyper::Request<Full<Bytes>> {
+    let mut rb = hyper::Request::builder()
+        .method(method)
+        .uri(format!("https://{host}{path}"));
+    if !http2 {
+        rb = rb.header("host", host);
+    }
+    for (k, v) in headers {
+        rb = rb.header(*k, *v);
+    }
+    rb.body(Full::new(Bytes::from(body))).unwrap()
+}
+
+/// CONNECT through the proxy, then send one request (HTTP/1.1 or HTTP/2) through the tunnel.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_request(
+    env: &Env,
+    token: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    http2: bool,
+) -> Resp {
+    let tls = match tunnel_tls(env, token, host, http2).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let req = build_request(http2, host, method, path, headers, body);
+    let resp = if http2 {
+        let (mut s, c) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(c);
+        s.send_request(req).await.unwrap()
+    } else {
+        let (mut s, c) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        tokio::spawn(c);
+        s.send_request(req).await.unwrap()
+    };
+    into_resp(resp).await
+}
+
+/// An open HTTP/1.1 keep-alive MITM tunnel on which several requests can be sent in turn.
+pub struct Tunnel {
+    host: String,
+    sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+}
+
+pub async fn open_tunnel(env: &Env, token: &str, host: &str) -> Tunnel {
+    let tls = tunnel_tls(env, token, host, false)
+        .await
+        .ok()
+        .expect("CONNECT must succeed");
+    let (sender, c) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(c);
+    Tunnel {
+        host: host.to_string(),
+        sender,
+    }
+}
+
+impl Tunnel {
+    /// `None` when the proxy closed the connection instead of answering.
+    pub async fn try_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Option<Resp> {
+        let req = build_request(false, &self.host, method, path, headers, vec![]);
+        let resp = self.sender.send_request(req).await.ok()?;
+        Some(into_resp(resp).await)
+    }
+
+    pub async fn request(&mut self, method: &str, path: &str, headers: &[(&str, &str)]) -> Resp {
+        self.try_request(method, path, headers)
+            .await
+            .expect("tunnel closed")
+    }
+
+    /// Sends a GET and returns the response before its body is consumed.
+    pub async fn send_streaming(&mut self, path: &str) -> hyper::Response<hyper::body::Incoming> {
+        let req = build_request(false, &self.host, "GET", path, &[], vec![]);
+        self.sender.send_request(req).await.unwrap()
+    }
+}
+
+/// Writes raw HTTP/1.1 bytes through a MITM tunnel (for request targets `hyper`'s client cannot
+/// build: raw `\`, non-ASCII bytes...) and reads the response until the connection closes. The
+/// request must carry `Connection: close`. Status 0 means the proxy closed without a response.
+pub async fn proxy_raw_request(env: &Env, token: &str, host: &str, raw: &[u8]) -> Resp {
+    let mut tls = match tunnel_tls(env, token, host, false).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    tls.write_all(raw).await.unwrap();
+    let mut out = Vec::new();
+    let _ = tls.read_to_end(&mut out).await; // a reset after the response is fine
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Resp {
+        status,
+        body,
+        headers: vec![],
+    }
+}
+
+/// Raw GET with a request target of the test's choosing (`Host` set to `host`).
+pub fn raw_get(host: &str, target: &[u8]) -> Vec<u8> {
+    let mut v = b"GET ".to_vec();
+    v.extend_from_slice(target);
+    v.extend_from_slice(
+        format!(" HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    v
 }

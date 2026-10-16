@@ -26,6 +26,11 @@ pub struct UpstreamConfig {
     pub tls: Arc<rustls::ClientConfig>,
     /// Test/ops knob: connect to this address instead of resolving the host.
     pub resolve_override: HashMap<String, SocketAddr>,
+    /// Bound on the TCP connect to the destination.
+    pub connect_timeout: Duration,
+    /// Bound on TLS handshake plus sending the request until the response head arrives. The
+    /// response body is not bounded (it is streamed).
+    pub response_header_timeout: Duration,
 }
 
 impl UpstreamConfig {
@@ -45,6 +50,8 @@ impl UpstreamConfig {
         Self {
             tls: Arc::new(tls),
             resolve_override: HashMap::new(),
+            connect_timeout: Duration::from_secs(10),
+            response_header_timeout: Duration::from_secs(60),
         }
     }
 
@@ -55,7 +62,7 @@ impl UpstreamConfig {
                 None => TcpStream::connect((host, port)).await,
             }
         };
-        tokio::time::timeout(Duration::from_secs(10), fut)
+        tokio::time::timeout(self.connect_timeout, fut)
             .await
             .map_err(|_| UpstreamError::Timeout)?
             .map_err(|e| UpstreamError::Connect(e.to_string()))
@@ -82,7 +89,7 @@ impl UpstreamConfig {
                 roundtrip(TokioIo::new(tcp), req).await
             }
         };
-        tokio::time::timeout(Duration::from_secs(60), fut)
+        tokio::time::timeout(self.response_header_timeout, fut)
             .await
             .map_err(|_| UpstreamError::Timeout)?
     }

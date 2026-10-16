@@ -19,7 +19,6 @@ const MAX_PROXY_AUTH_LEN: usize = 8 * 1024;
 /// every request inside a CONNECT tunnel: revoking a token must stop an already-open tunnel.
 pub(crate) struct Session {
     pub identity: Identity,
-    #[allow(dead_code)] // consumed by the MITM re-verification added in Task 8
     pub token: Zeroizing<String>,
 }
 
