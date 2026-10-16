@@ -19,6 +19,7 @@ rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pemfile.workspace = true
 percent-encoding.workspace = true
+if-addrs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true

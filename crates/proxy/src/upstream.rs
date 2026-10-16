@@ -5,7 +5,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -15,7 +15,10 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
-pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
+/// Error of the bodies the proxy relays (the origin's, or a progress-timeout abort).
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+pub type ProxyBody = BoxBody<Bytes, BoxError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
@@ -35,33 +38,66 @@ pub enum UpstreamError {
 /// that is actually connected to, after resolution, for passthrough tunnels and forwarded
 /// requests alike.
 ///
-/// Multicast and broadcast addresses and everything in `denied` are always refused. Unspecified
+/// Always refused: multicast, broadcast, `0.0.0.0/8` (except `0.0.0.0` itself, see
+/// `allow_unspecified`), `240.0.0.0/4`, the cloud metadata addresses outside link-local
+/// (`100.100.100.200` Alibaba, `fd00:ec2::254` AWS IPv6) and everything in `denied`. Unspecified
 /// (`0.0.0.0`, `::`), link-local (169.254.0.0/16, fe80::/10: cloud metadata lives there) and
-/// loopback are refused unless the matching `allow_*` flag is set. RFC 1918 and ULA ranges stay
-/// allowed (homelab).
+/// loopback are refused unless the matching `allow_*` flag is set. RFC 1918, ULA and CGNAT
+/// (100.64.0.0/10, Tailscale) ranges stay allowed (homelab).
+///
+/// IPv6 addresses that embed an IPv4 address (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`
+/// and `64:ff9b:1::/48`, 6to4 `2002::/16`) are judged as the IPv4 address they carry. Teredo
+/// (`2001::/32`) is out of scope: its embedded address is obfuscated and it is not routed here.
 #[derive(Debug, Clone, Default)]
 pub struct NetPolicy {
-    /// Allow 127.0.0.0/8 and ::1. Off by default. Forwarded requests whose host is exactly
+    /// Allow 127.0.0.0/8 and ::1. Off by default. Forwarded TLS requests whose host is exactly
     /// `localhost` and that matched a rule are exempt (the local-service case), never from `denied`.
     pub allow_loopback: bool,
     pub allow_link_local: bool,
     pub allow_unspecified: bool,
     /// Addresses the proxy itself and the admin API listen on. An entry also blocks its port on
-    /// every loopback and unspecified address, so `0.0.0.0:9090` means port 9090 on every local
-    /// address.
+    /// every loopback and unspecified address, so `0.0.0.0:9090` means port 9090 on loopback and
+    /// unspecified targets. It does NOT cover the host's other interface addresses (a LAN IP of
+    /// this machine): the caller must add them, see `NetPolicy::denied_for_binds`.
     pub denied: Vec<SocketAddr>,
 }
 
-/// IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) addresses are judged as the
-/// IPv4 address they carry.
+/// Addresses whose embedded IPv4 is extracted before classification, or `None`.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    let s = v6.segments();
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the IPv4 address is the last 32 bits.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // Local-use NAT64 prefix 64:ff9b:1::/48 (RFC 8215), RFC 6052 /48 layout: bytes 6-7, then
+    // (skipping the reserved byte 8) bytes 9-10.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+        return Some(Ipv4Addr::new(o[6], o[7], o[9], o[10]));
+    }
+    // 6to4 2002::/16: the IPv4 address follows the prefix.
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    None
+}
+
+/// IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 and 6to4 addresses are
+/// judged as the IPv4 address they carry.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) if v6 != Ipv6Addr::UNSPECIFIED && v6 != Ipv6Addr::LOCALHOST => {
-            v6.to_ipv4().map(IpAddr::V4).unwrap_or(ip)
+            embedded_ipv4(v6)
+                .or_else(|| v6.to_ipv4())
+                .map(IpAddr::V4)
+                .unwrap_or(ip)
         }
         other => other,
     }
 }
+
+const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+const ALIBABA_METADATA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 impl NetPolicy {
     pub fn new(denied: Vec<SocketAddr>) -> Self {
@@ -76,13 +112,45 @@ impl NetPolicy {
         self
     }
 
+    /// The `denied` list for the addresses the proxy and the admin API listen on.
+    ///
+    /// A specific bind contributes just that address. An unspecified bind (`0.0.0.0:p`, `[::]:p`)
+    /// listens on every interface, so it also contributes every local interface address at port
+    /// `p` (a LAN IP of this machine would otherwise be a way around the loopback-based check).
+    /// Interfaces are read once, when this is called: call it again if addresses change. If the
+    /// interfaces cannot be listed, only the binds themselves are returned.
+    pub fn denied_for_binds(binds: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = Vec::new();
+        let mut push = |a: SocketAddr| {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        };
+        let mut ifaces: Option<Vec<IpAddr>> = None;
+        for b in binds {
+            push(*b);
+            if b.ip().is_unspecified() {
+                let ips = ifaces.get_or_insert_with(|| {
+                    if_addrs::get_if_addrs()
+                        .map(|v| v.into_iter().map(|i| i.ip()).collect())
+                        .unwrap_or_default()
+                });
+                for ip in ips.iter() {
+                    push(SocketAddr::new(*ip, b.port()));
+                }
+                push(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), b.port()));
+            }
+        }
+        out
+    }
+
     pub fn with_allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = allow;
         self
     }
 
     /// Whether the proxy may connect to `addr`. `local_service` grants the loopback exception
-    /// (forwarded request to host `localhost` with an applicable rule); `denied` still wins.
+    /// (forwarded TLS request to host `localhost` with an applicable rule); `denied` still wins.
     pub fn permits(&self, addr: SocketAddr, local_service: bool) -> bool {
         let ip = canonical(addr.ip());
         let local = ip.is_loopback() || ip.is_unspecified();
@@ -98,7 +166,11 @@ impl NetPolicy {
         }
         match ip {
             IpAddr::V4(v4) => {
-                if v4.is_broadcast() {
+                if v4.is_broadcast() || v4.octets()[0] >= 240 || v4 == ALIBABA_METADATA {
+                    return false;
+                }
+                // 0.0.0.0/8: only 0.0.0.0 itself is subject to `allow_unspecified`.
+                if v4.octets()[0] == 0 && !v4.is_unspecified() {
                     return false;
                 }
                 if v4.is_link_local() && !self.allow_link_local {
@@ -106,6 +178,9 @@ impl NetPolicy {
                 }
             }
             IpAddr::V6(v6) => {
+                if v6 == AWS_IMDS_V6 {
+                    return false;
+                }
                 if v6.segments()[0] & 0xffc0 == 0xfe80 && !self.allow_link_local {
                     return false;
                 }
@@ -124,7 +199,8 @@ impl NetPolicy {
 #[derive(Clone)]
 pub struct UpstreamConfig {
     pub tls: Arc<rustls::ClientConfig>,
-    /// Test/ops knob: connect to this address instead of resolving the host.
+    /// Test/ops knob: connect to this address instead of resolving the host. An address with
+    /// port 0 only supplies the IP; the requested port is kept.
     pub resolve_override: HashMap<String, SocketAddr>,
     /// Bound on the TCP connect to the destination.
     pub connect_timeout: Duration,
@@ -181,7 +257,12 @@ impl UpstreamConfig {
     ) -> Result<TcpStream, UpstreamError> {
         let fut = async {
             let addrs: Vec<SocketAddr> = match self.resolve_override.get(host) {
+                // An override that only supplies an IP (port 0) keeps the requested port.
+                Some(addr) if addr.port() == 0 => vec![SocketAddr::new(addr.ip(), port)],
                 Some(addr) => vec![*addr],
+                // RFC 6761: the exact name `localhost` is loopback, resolved without
+                // consulting the system resolver (search domains, hosts file, DNS).
+                None if host == "localhost" => localhost_addrs(port),
                 None => tokio::net::lookup_host((host, port))
                     .await
                     .map_err(|e| UpstreamError::Connect(e.to_string()))?
@@ -263,6 +344,14 @@ impl UpstreamConfig {
     }
 }
 
+/// The addresses of the exact name `localhost` (RFC 6761).
+fn localhost_addrs(port: u16) -> Vec<SocketAddr> {
+    vec![
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+    ]
+}
+
 async fn roundtrip<I>(
     io: I,
     req: Request<ProxyBody>,
@@ -282,4 +371,16 @@ where
         .send_request(req)
         .await
         .map_err(|e| UpstreamError::Request(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_resolves_to_loopback_only() {
+        let a = localhost_addrs(8080);
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|a| a.ip().is_loopback() && a.port() == 8080));
+    }
 }

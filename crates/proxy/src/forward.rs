@@ -1,7 +1,8 @@
 use crate::{
+    body::{watch, Keep},
     inject,
-    server::{audit, text},
-    upstream::{ProxyBody, UpstreamError},
+    server::{audit, identity_limit, text, Limits},
+    upstream::{BoxError, ProxyBody, UpstreamError},
     ProxyState,
 };
 use http_body_util::BodyExt;
@@ -20,6 +21,7 @@ pub(crate) struct Ctx {
     pub tls: bool,
     /// True only for plain-HTTP requests to hosts with no rules under a `passthrough` role.
     pub allow_unruled: bool,
+    pub limits: Limits,
 }
 
 /// Every host the request declares (`Host` header values and the URI authority) must normalize
@@ -68,7 +70,10 @@ fn fail(
 /// The audit row is written before the response is returned (so before its first byte reaches
 /// the agent). The path judged by `evaluate` is `normalize_path(uri.path())` and exactly that
 /// path is forwarded.
-pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<ProxyBody> {
+///
+/// `keep` is held by the response body until it is done, aborted or dropped. Bodies in both
+/// directions are aborted when they stop moving for `limits.body_idle_timeout`.
+pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Response<ProxyBody> {
     let (mut parts, body) = req.into_parts();
     let method = parts.method.to_string();
     let raw_target = parts
@@ -78,8 +83,11 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
         .unwrap_or_else(|| "/".into());
     let st = &ctx.state;
 
-    // Never legitimate for an API client, and TRACE would reflect the injected credentials.
-    if matches!(parts.method.as_str(), "TRACE" | "CONNECT") {
+    // Never legitimate for an API client, and TRACE/TRACK would reflect the injected credentials.
+    if ["TRACE", "TRACK", "CONNECT"]
+        .iter()
+        .any(|m| parts.method.as_str().eq_ignore_ascii_case(m))
+    {
         return fail(
             ctx,
             &method,
@@ -122,7 +130,8 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
     };
     let (matched, rule_id) = match evaluate(&rules, &ctx.host, &method, &path) {
         Decision::Inject(m) => {
-            if !ctx.tls && ctx.host != "localhost" {
+            // Credentials are NEVER injected over plain HTTP (no exception, not even localhost).
+            if !ctx.tls {
                 return fail(
                     ctx,
                     &method,
@@ -131,6 +140,26 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
                     StatusCode::FORBIDDEN,
                     None,
                     "refusing to inject credentials over plain HTTP\n",
+                );
+            }
+            // WebDAV `Destination` is an uncontrolled second target: COPY/MOVE only when every
+            // matched rule names the method explicitly.
+            let webdav = ["COPY", "MOVE"]
+                .iter()
+                .any(|w| method.eq_ignore_ascii_case(w));
+            if webdav
+                && !m
+                    .iter()
+                    .all(|r| r.methods.iter().any(|x| x.eq_ignore_ascii_case(&method)))
+            {
+                return fail(
+                    ctx,
+                    &method,
+                    &raw_target,
+                    "forbidden",
+                    StatusCode::FORBIDDEN,
+                    None,
+                    "not allowed for this role\n",
                 );
             }
             let rid = m.first().map(|r| r.id);
@@ -227,9 +256,29 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
     }
     parts.version = hyper::Version::HTTP_11;
 
-    let outgoing = Request::from_parts(parts, body.boxed());
-    // Local services: a rule for the host `localhost` is the one case where loopback is allowed.
-    let local_service = ctx.host == "localhost" && rule_id.is_some();
+    // One identity may only have so many requests towards upstream at once; the share is
+    // returned when the response body is done (or aborted).
+    let Some(up_guard) = ctx
+        .limits
+        .upstream
+        .try_acquire(&ctx.identity.jti, ctx.limits.max_upstream_per_identity)
+    else {
+        return identity_limit(
+            &ctx.state,
+            &ctx.identity,
+            &ctx.host,
+            &method,
+            &raw_target,
+            rule_id,
+            "too many concurrent requests for this token\n",
+        );
+    };
+    let idle = ctx.limits.body_idle_timeout;
+    let req_body: ProxyBody = body.map_err(|e| -> BoxError { Box::new(e) }).boxed();
+    let outgoing = Request::from_parts(parts, watch(req_body, idle, Vec::new()));
+    // Local services: loopback is reachable only over TLS (an agent cannot forge a certificate
+    // trusted for `localhost`), for the exact host `localhost` and with an applicable rule.
+    let local_service = ctx.tls && ctx.host == "localhost" && rule_id.is_some();
     let result = st
         .upstream
         .send_to(&ctx.host, ctx.port, ctx.tls, outgoing, local_service)
@@ -254,7 +303,10 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
             );
             let (mut rparts, rbody) = resp.into_parts();
             inject::strip_hop_by_hop(&mut rparts.headers);
-            Response::from_parts(rparts, rbody.boxed())
+            let rbody: ProxyBody = rbody.map_err(|e| -> BoxError { Box::new(e) }).boxed();
+            let mut keep = keep;
+            keep.push(Box::new(up_guard));
+            Response::from_parts(rparts, watch(rbody, idle, keep))
         }
         Err(UpstreamError::TargetDenied) => fail(
             ctx,

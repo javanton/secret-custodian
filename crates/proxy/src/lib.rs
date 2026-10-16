@@ -1,4 +1,6 @@
+mod body;
 mod forward;
+mod ident;
 mod inject;
 mod mitm;
 mod server;
@@ -38,6 +40,18 @@ pub struct ServeOptions {
     /// this bounds how long a revoked token can keep using a passthrough tunnel (MITM requests
     /// re-verify the token each time).
     pub tunnel_max_lifetime: Duration,
+    /// Maximum simultaneous CONNECT tunnels (passthrough and MITM) per token identity (`jti`,
+    /// default 64). Excess CONNECTs get 429 with `Retry-After: 1` (audit `identity-limit`).
+    pub max_tunnels_per_identity: usize,
+    /// Maximum simultaneous upstream requests per token identity (default 64), counted from
+    /// forwarding until the response body is done. Excess requests get 429 with
+    /// `Retry-After: 1` (audit `identity-limit`). Keep it below the global
+    /// `UpstreamConfig::max_upstream_connections` so one identity cannot starve the others.
+    pub max_upstream_per_identity: usize,
+    /// A streamed body (response to the agent, or request to the origin) that moves no frame
+    /// for this long is aborted and everything it holds (upstream slot, per-identity slot,
+    /// in-flight accounting) is released (default 60 s).
+    pub body_idle_timeout: Duration,
 }
 
 impl Default for ServeOptions {
@@ -47,6 +61,9 @@ impl Default for ServeOptions {
             header_read_timeout: Duration::from_secs(30),
             tunnel_idle_timeout: Duration::from_secs(10 * 60),
             tunnel_max_lifetime: Duration::from_secs(8 * 60 * 60),
+            max_tunnels_per_identity: 64,
+            max_upstream_per_identity: 64,
+            body_idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -61,6 +78,8 @@ pub async fn serve_with(
     opts: ServeOptions,
 ) -> std::io::Result<()> {
     let slots = Arc::new(Semaphore::new(opts.max_connections.max(1)));
+    let tunnels = Arc::new(ident::IdentityCounters::default());
+    let upstream_counts = Arc::new(ident::IdentityCounters::default());
     loop {
         // Take the slot before accepting, so excess clients queue in the kernel backlog.
         let permit = slots
@@ -82,6 +101,11 @@ pub async fn serve_with(
             header_read_timeout: opts.header_read_timeout,
             tunnel_idle_timeout: opts.tunnel_idle_timeout,
             tunnel_max_lifetime: opts.tunnel_max_lifetime,
+            max_tunnels_per_identity: opts.max_tunnels_per_identity,
+            max_upstream_per_identity: opts.max_upstream_per_identity,
+            body_idle_timeout: opts.body_idle_timeout,
+            tunnels: tunnels.clone(),
+            upstream: upstream_counts.clone(),
         };
         // Shared with the tunnel tasks a CONNECT spawns: the slot is freed only when the last
         // of them ends.

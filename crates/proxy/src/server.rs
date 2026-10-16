@@ -1,4 +1,5 @@
 use crate::{
+    ident::IdentityCounters,
     upstream::{ProxyBody, UpstreamError},
     ProxyState,
 };
@@ -38,12 +39,18 @@ pub(crate) struct Session {
     pub token: Zeroizing<String>,
 }
 
-/// Time limits applied to a client connection and to the tunnels it opens.
-#[derive(Debug, Clone, Copy)]
+/// Limits applied to a client connection and to the tunnels and requests it carries.
+#[derive(Clone)]
 pub(crate) struct Limits {
     pub header_read_timeout: Duration,
     pub tunnel_idle_timeout: Duration,
     pub tunnel_max_lifetime: Duration,
+    pub max_tunnels_per_identity: usize,
+    pub max_upstream_per_identity: usize,
+    pub body_idle_timeout: Duration,
+    /// Live tunnels / upstream requests per token identity, shared by every connection.
+    pub tunnels: Arc<IdentityCounters>,
+    pub upstream: Arc<IdentityCounters>,
 }
 
 /// The connection-cap slot. Cloned into every task a CONNECT spawns, so it is released only
@@ -52,10 +59,16 @@ pub(crate) type Slot = Arc<OwnedSemaphorePermit>;
 
 /// Wraps a stream and fails reads/writes with `TimedOut` once nothing moved in either direction
 /// for `idle`.
+///
+/// Besides the shared idle timer (reset by progress in either direction), a write that stays
+/// pending for `idle` fails on its own: a peer that stopped reading is cut even while the other
+/// direction keeps moving.
 pub(crate) struct IdleIo<T> {
     inner: T,
     idle: Duration,
     sleep: Pin<Box<tokio::time::Sleep>>,
+    write_stall: Pin<Box<tokio::time::Sleep>>,
+    write_pending: bool,
 }
 
 impl<T> IdleIo<T> {
@@ -64,6 +77,8 @@ impl<T> IdleIo<T> {
             inner,
             idle,
             sleep: Box::pin(tokio::time::sleep(idle)),
+            write_stall: Box::pin(tokio::time::sleep(idle)),
+            write_pending: false,
         }
     }
 
@@ -108,12 +123,26 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleIo<T> {
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Ready(r) => {
                 self.progressed();
+                self.write_pending = false;
                 Poll::Ready(r)
             }
-            Poll::Pending => match self.check_idle(cx) {
-                Some(e) => Poll::Ready(Err(e)),
-                None => Poll::Pending,
-            },
+            Poll::Pending => {
+                if !self.write_pending {
+                    self.write_pending = true;
+                    let deadline = Instant::now() + self.idle;
+                    self.write_stall.as_mut().reset(deadline);
+                }
+                if self.write_stall.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tunnel write stalled",
+                    )));
+                }
+                match self.check_idle(cx) {
+                    Some(e) => Poll::Ready(Err(e)),
+                    None => Poll::Pending,
+                }
+            }
         }
     }
 
@@ -132,16 +161,22 @@ pub async fn handle_connection(
     limits: Limits,
     slot: Slot,
 ) -> Result<(), hyper::Error> {
+    let (lifetime, header_timeout) = (limits.tunnel_max_lifetime, limits.header_read_timeout);
     let svc = service_fn(move |req| {
-        let (state, slot) = (state.clone(), slot.clone());
+        let (state, slot, limits) = (state.clone(), slot.clone(), limits.clone());
         async move { Ok::<_, Infallible>(handle_request(req, state, limits, slot).await) }
     });
-    hyper::server::conn::http1::Builder::new()
+    let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout)
+        .header_read_timeout(header_timeout)
         .serve_connection(TokioIo::new(stream), svc)
-        .with_upgrades()
-        .await
+        .with_upgrades();
+    // A client connection (keep-alive plain requests included) lives at most as long as a
+    // tunnel. A CONNECT hands its socket off to the tunnel task, which has its own bound.
+    match tokio::time::timeout(lifetime, conn).await {
+        Ok(r) => r,
+        Err(_) => Ok(()),
+    }
 }
 
 pub(crate) fn text(status: StatusCode, msg: &str) -> Response<ProxyBody> {
@@ -157,6 +192,56 @@ pub(crate) fn text(status: StatusCode, msg: &str) -> Response<ProxyBody> {
 fn empty(status: StatusCode) -> Response<ProxyBody> {
     let mut r = Response::new(Empty::new().map_err(|never| match never {}).boxed());
     *r.status_mut() = status;
+    r
+}
+
+/// An authenticated request that is malformed: audited (decision `bad-request`) and answered
+/// 400. `host` is whatever the target declared (untrusted, truncated). Unauthenticated
+/// requests never reach this (they get 407 and write nothing).
+fn bad_request(
+    state: &ProxyState,
+    id: &Identity,
+    host: &str,
+    method: &str,
+    msg: &str,
+) -> Response<ProxyBody> {
+    let host: String = host.chars().take(255).collect();
+    audit(
+        state,
+        id,
+        &host,
+        method,
+        "/",
+        "bad-request",
+        Some(400),
+        None,
+    );
+    text(StatusCode::BAD_REQUEST, msg)
+}
+
+/// 429 with `Retry-After: 1`, audited as `identity-limit`.
+pub(crate) fn identity_limit(
+    state: &ProxyState,
+    id: &Identity,
+    host: &str,
+    method: &str,
+    path: &str,
+    rule_id: Option<i64>,
+    msg: &str,
+) -> Response<ProxyBody> {
+    audit(
+        state,
+        id,
+        host,
+        method,
+        path,
+        "identity-limit",
+        Some(429),
+        rule_id,
+    );
+    let mut r = text(StatusCode::TOO_MANY_REQUESTS, msg);
+    r.headers_mut()
+        .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
     r
 }
 
@@ -221,42 +306,47 @@ async fn handle_request(
     if req.method() == Method::CONNECT {
         connect(req, session, state, limits, slot).await
     } else {
-        plain(req, session, state).await
+        plain(req, session, state, limits).await
     }
 }
 
 /// An absolute-form `http://` request sent to the proxy port.
 ///
-/// Credentials are never injected into plain HTTP, except for the host `localhost` (see
-/// `forward`): a host with rules is refused by `forward` (`plaintext-refused`), while a host
-/// without rules is forwarded untouched under a `passthrough` role and denied under `deny`.
+/// Credentials are never injected into plain HTTP, without exception (see `forward`): a host
+/// with rules is refused by `forward` (`plaintext-refused`), while a host without rules is
+/// forwarded untouched under a `passthrough` role and denied under `deny`.
 async fn plain(
     req: Request<Incoming>,
     session: Session,
     state: Arc<ProxyState>,
+    limits: Limits,
 ) -> Response<ProxyBody> {
     let identity = &session.identity;
+    let method = req.method().to_string();
+    let hint = req.uri().host().unwrap_or("").to_string();
     if req.uri().scheme_str() != Some("http") {
-        return text(
-            StatusCode::BAD_REQUEST,
+        return bad_request(
+            &state,
+            identity,
+            &hint,
+            &method,
             "send absolute-form http:// requests, or CONNECT for https\n",
         );
     }
     let Some(authority) = req.uri().authority().cloned() else {
-        return text(StatusCode::BAD_REQUEST, "missing host\n");
+        return bad_request(&state, identity, &hint, &method, "missing host\n");
     };
     // `user:pw@host` is never legitimate.
     if authority.as_str().contains('@') {
-        return text(StatusCode::BAD_REQUEST, "bad request target\n");
+        return bad_request(&state, identity, &hint, &method, "bad request target\n");
     }
     let Some(host) = normalize_host(authority.host()) else {
-        return text(StatusCode::BAD_REQUEST, "bad host\n");
+        return bad_request(&state, identity, &hint, &method, "bad host\n");
     };
     let port = authority.port_u16().unwrap_or(80);
     if port == 0 {
-        return text(StatusCode::BAD_REQUEST, "bad port\n");
+        return bad_request(&state, identity, &host, &method, "bad port\n");
     }
-    let method = req.method().to_string();
     let target = req
         .uri()
         .path_and_query()
@@ -301,8 +391,9 @@ async fn plain(
         port,
         tls: false,
         allow_unruled: !has_rules,
+        limits,
     };
-    crate::forward::forward(req, &ctx).await
+    crate::forward::forward(req, &ctx, Vec::new()).await
 }
 
 async fn connect(
@@ -313,19 +404,20 @@ async fn connect(
     slot: Slot,
 ) -> Response<ProxyBody> {
     let identity = &session.identity;
+    let hint = req.uri().host().unwrap_or("").to_string();
     let Some(authority) = req.uri().authority().cloned() else {
-        return text(StatusCode::BAD_REQUEST, "bad CONNECT target\n");
+        return bad_request(&state, identity, &hint, "CONNECT", "bad CONNECT target\n");
     };
     // `user:pw@host` is never a legitimate CONNECT target.
     if authority.as_str().contains('@') {
-        return text(StatusCode::BAD_REQUEST, "bad CONNECT target\n");
+        return bad_request(&state, identity, &hint, "CONNECT", "bad CONNECT target\n");
     }
     let Some(host) = normalize_host(authority.host()) else {
-        return text(StatusCode::BAD_REQUEST, "bad CONNECT host\n");
+        return bad_request(&state, identity, &hint, "CONNECT", "bad CONNECT host\n");
     };
     let port = authority.port_u16().unwrap_or(443);
     if port == 0 {
-        return text(StatusCode::BAD_REQUEST, "bad CONNECT port\n");
+        return bad_request(&state, identity, &host, "CONNECT", "bad CONNECT port\n");
     }
 
     let role = match get_role(&state.vault, &identity.role) {
@@ -363,6 +455,20 @@ async fn connect(
                 &format!("the CA does not permit {host}; run `sg ca allow-domain <domain>` and reload the CA certificate\n"),
             );
         }
+        let Some(tunnel) = limits
+            .tunnels
+            .try_acquire(&identity.jti, limits.max_tunnels_per_identity)
+        else {
+            return identity_limit(
+                &state,
+                identity,
+                &host,
+                "CONNECT",
+                "/",
+                None,
+                "too many open tunnels for this token\n",
+            );
+        };
         audit(
             &state,
             identity,
@@ -374,7 +480,7 @@ async fn connect(
             None,
         );
         tokio::spawn(crate::mitm::serve(
-            req, host, port, session, state, limits, slot,
+            req, host, port, session, state, limits, slot, tunnel,
         ));
         return empty(StatusCode::OK);
     }
@@ -394,8 +500,22 @@ async fn connect(
             text(StatusCode::FORBIDDEN, "host not allowed for this role\n")
         }
         Unmatched::Passthrough => {
+            let Some(tunnel) = limits
+                .tunnels
+                .try_acquire(&identity.jti, limits.max_tunnels_per_identity)
+            else {
+                return identity_limit(
+                    &state,
+                    identity,
+                    &host,
+                    "CONNECT",
+                    "/",
+                    None,
+                    "too many open tunnels for this token\n",
+                );
+            };
             // Reach the destination first: only then answer 200.
-            let mut upstream = match state.upstream.connect_tcp(&host, port).await {
+            let upstream = match state.upstream.connect_tcp(&host, port).await {
                 Ok(s) => s,
                 Err(UpstreamError::TargetDenied) => {
                     audit(
@@ -435,15 +555,20 @@ async fn connect(
                 None,
             );
             tokio::spawn(async move {
-                let _slot = slot; // the tunnel keeps the connection-cap slot until it ends
-                let tunnel = async {
+                // The tunnel keeps the connection-cap slot and the identity's tunnel budget
+                // until it ends.
+                let _slot = slot;
+                let _tunnel = tunnel;
+                let copy = async {
                     if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                        // Both sides are bounded, so a stall on either one ends the tunnel.
                         let mut client =
                             IdleIo::new(TokioIo::new(upgraded), limits.tunnel_idle_timeout);
+                        let mut upstream = IdleIo::new(upstream, limits.tunnel_idle_timeout);
                         let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
                     }
                 };
-                let _ = tokio::time::timeout(limits.tunnel_max_lifetime, tunnel).await;
+                let _ = tokio::time::timeout(limits.tunnel_max_lifetime, copy).await;
             });
             empty(StatusCode::OK)
         }

@@ -1,28 +1,20 @@
 use crate::{
     forward::{forward, Ctx},
+    ident::IdentityGuard,
     server::{audit, text, Limits, Slot},
-    upstream::ProxyBody,
     ProxyState,
 };
-use bytes::Bytes;
-use http_body_util::BodyExt;
-use hyper::{
-    body::{Body, Frame, Incoming, SizeHint},
-    service::service_fn,
-    Request, StatusCode,
-};
+use hyper::{body::Incoming, service::service_fn, Request, StatusCode};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use std::{
     convert::Infallible,
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
@@ -83,37 +75,6 @@ impl Drop for Guard {
     }
 }
 
-/// A response body that keeps its request "in flight" until it is fully sent or dropped.
-struct Tracked {
-    inner: ProxyBody,
-    guard: Guard,
-}
-
-impl Body for Tracked {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
-        let this = self.get_mut();
-        let r = Pin::new(&mut this.inner).poll_frame(cx);
-        if r.is_ready() {
-            this.guard.0.touch();
-        }
-        r
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 /// Terminates TLS inside an upgraded CONNECT and serves the decrypted requests (HTTP/1.1 or
 /// HTTP/2 by ALPN) through `forward`.
 ///
@@ -123,6 +84,7 @@ impl Body for Tracked {
 /// The connection-cap `slot` is held until this function returns. The TLS handshake is bounded
 /// by `header_read_timeout`, an idle connection is closed after `tunnel_idle_timeout` and the
 /// whole tunnel after `tunnel_max_lifetime`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     req: Request<Incoming>,
     host: String,
@@ -131,10 +93,14 @@ pub(crate) async fn serve(
     state: Arc<ProxyState>,
     limits: Limits,
     slot: Slot,
+    tunnel: IdentityGuard,
 ) {
+    // The connection keeps its cap slot and the identity's tunnel budget until it ends.
     let _slot = slot;
+    let _tunnel = tunnel;
+    let lifetime = limits.tunnel_max_lifetime;
     let _ = tokio::time::timeout(
-        limits.tunnel_max_lifetime,
+        lifetime,
         serve_inner(req, host, port, session, state, limits),
     )
     .await;
@@ -170,6 +136,7 @@ async fn serve_inner(
         port,
         tls: true,
         allow_unruled: false,
+        limits: limits.clone(),
     });
     let close = Arc::new(Notify::new());
     let activity = Activity::new();
@@ -198,8 +165,9 @@ async fn serve_inner(
                         "proxy authentication required\n",
                     ));
                 }
-                let resp = forward(req, &ctx).await;
-                Ok(resp.map(|inner| Tracked { inner, guard }.boxed()))
+                // The guard keeps the request "in flight" until its response body is done,
+                // aborted or dropped.
+                Ok(forward(req, &ctx, vec![Box::new(guard)]).await)
             }
         })
     };

@@ -310,6 +310,16 @@ async fn bad_connect_targets_get_400() {
         let (line, _) = raw_connect(env.proxy_addr, target, Some(&basic(&t))).await;
         assert!(line.contains("400"), "{target} -> {line}");
     }
+    // Authenticated 400s are audited with the identity (a 407 would write nothing).
+    let rows = env.vault.list_audit(&Default::default()).unwrap();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r.decision, "bad-request");
+        assert_eq!(r.method, "CONNECT");
+        assert_eq!(r.status, Some(400));
+        assert_eq!(r.role.as_deref(), Some("developer"));
+        assert!(r.jti.is_some());
+    }
 }
 
 #[tokio::test]

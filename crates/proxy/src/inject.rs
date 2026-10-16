@@ -67,15 +67,35 @@ const ROUTING_HEADERS: &[&str] = &[
     "x-host",
     "via",
     "front-end-https",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-cluster-client-ip",
+    "x-original-uri",
 ];
 
-/// Removes routing-override and forwarding headers (every `X-Forwarded-*` included).
+/// Lowercases and maps `_` to `-`: many frameworks (CGI-style `HTTP_X_FOO`) treat both
+/// spellings of a header name as the same header.
+fn normalize_header_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+/// Removes routing-override and forwarding headers (every `X-Forwarded-*` included), whatever
+/// the mix of `_`/`-` and case in their names.
 pub(crate) fn strip_routing_headers(headers: &mut HeaderMap) {
     let doomed: Vec<HeaderName> = headers
         .keys()
         .filter(|k| {
-            let n = k.as_str();
-            ROUTING_HEADERS.contains(&n) || n.starts_with("x-forwarded-")
+            let n = normalize_header_name(k.as_str());
+            ROUTING_HEADERS.contains(&n.as_str()) || n.starts_with("x-forwarded-")
         })
         .cloned()
         .collect();

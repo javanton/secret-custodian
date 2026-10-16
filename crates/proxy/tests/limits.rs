@@ -239,3 +239,347 @@ async fn a_request_that_cannot_get_an_upstream_slot_in_time_is_502() {
         .iter()
         .any(|r| r.decision == "upstream-error" && r.status == Some(502)));
 }
+
+// ---- per-identity limits -----------------------------------------------------------------
+
+async fn h2_sender(
+    env: &Env,
+    token: &str,
+) -> hyper::client::conn::http2::SendRequest<http_body_util::Empty<bytes::Bytes>> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let tls = tunnel_tls(env, token, HOST, true).await.ok().unwrap();
+    let (sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    sender
+}
+
+fn h2_req(path: &str) -> hyper::Request<http_body_util::Empty<bytes::Bytes>> {
+    hyper::Request::builder()
+        .uri(format!("https://{HOST}{path}"))
+        .body(http_body_util::Empty::new())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn one_identity_cannot_hold_more_tunnels_than_its_cap_nor_starve_another() {
+    let opts = ServeOptions {
+        max_tunnels_per_identity: 2,
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |_| {}).await;
+    let a = add_header_rule(&env);
+    let b = env.token("other", "developer");
+    let echo = echo_server().await;
+    let tunnel1 = open_tunnel(&env, &a, HOST).await;
+    let (line, _tunnel2) = raw_connect(env.proxy_addr, &echo.to_string(), Some(&basic(&a))).await;
+    assert!(line.contains("200"), "{line}");
+
+    // Both kinds of tunnel count against the same cap.
+    let (head, _) =
+        raw_connect_head(env.proxy_addr, &format!("{HOST}:443"), Some(&basic(&a))).await;
+    assert!(head.contains(" 429"), "{head}");
+    assert!(head.to_lowercase().contains("retry-after: 1"), "{head}");
+    let (line, _) = raw_connect(env.proxy_addr, &echo.to_string(), Some(&basic(&a))).await;
+    assert!(line.contains("429"), "{line}");
+    let rows = env.vault.list_audit(&Default::default()).unwrap();
+    assert!(rows.iter().any(|r| r.decision == "identity-limit"
+        && r.status == Some(429)
+        && r.method == "CONNECT"
+        && r.jti.is_some()));
+
+    // Another identity is still served.
+    let (line, _s) = raw_connect(env.proxy_addr, &format!("{HOST}:443"), Some(&basic(&b))).await;
+    assert!(line.contains("200"), "{line}");
+
+    // Closing a tunnel frees a slot for the first identity.
+    drop(tunnel1);
+    let mut served = false;
+    for _ in 0..30 {
+        let (line, _s) =
+            raw_connect(env.proxy_addr, &format!("{HOST}:443"), Some(&basic(&a))).await;
+        if line.contains("200") {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "the slot was never released");
+}
+
+#[tokio::test]
+async fn one_identity_cannot_hold_more_upstream_requests_than_its_cap_nor_starve_another() {
+    let opts = ServeOptions {
+        max_upstream_per_identity: 2,
+        ..ServeOptions::default()
+    };
+    let (env, up) = env_with_upstream_opts(HOST, opts, |c| {
+        c.response_header_timeout = Duration::from_secs(60);
+    })
+    .await;
+    let a = add_header_rule(&env);
+    let b = env.token("other", "developer");
+    let mut sa = h2_sender(&env, &a).await;
+    for _ in 0..2 {
+        let mut s = sa.clone();
+        tokio::spawn(async move {
+            let _ = s.send_request(h2_req("/slow")).await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let r = sa.send_request(h2_req("/x")).await.unwrap();
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers().get("retry-after").unwrap(), "1");
+    let rows = env.vault.list_audit(&Default::default()).unwrap();
+    assert!(rows
+        .iter()
+        .any(|r| r.decision == "identity-limit" && r.status == Some(429)));
+    assert_eq!(up.count(), 2, "the refused request reached the upstream");
+
+    let mut sb = h2_sender(&env, &b).await;
+    let r = sb.send_request(h2_req("/x")).await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+// ---- body progress timeout -----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_client_that_never_reads_an_h1_response_body_is_cut_off_and_frees_the_slot() {
+    let opts = ServeOptions {
+        body_idle_timeout: Duration::from_millis(700),
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |c| {
+        c.max_upstream_connections = 1;
+        c.connect_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let t = add_header_rule(&env);
+    let mut tun = open_tunnel(&env, &t, HOST).await;
+    let stalled = tun.send_streaming("/endless").await;
+    assert_eq!(stalled.status(), 200);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // The only upstream slot is free again.
+    let r = proxy_request(&env, &t, HOST, "GET", "/x", &[], vec![], false).await;
+    assert_eq!(r.status, 200);
+    // And the stalled body ends in an error instead of streaming forever.
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_body_util::BodyExt::collect(stalled.into_body()),
+    )
+    .await
+    .expect("the stalled body was never aborted");
+    assert!(res.is_err(), "a truncated body must not look complete");
+}
+
+#[tokio::test]
+async fn a_client_that_never_reads_an_h2_response_body_is_cut_off_and_frees_the_slot() {
+    let opts = ServeOptions {
+        body_idle_timeout: Duration::from_millis(700),
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |c| {
+        c.max_upstream_connections = 1;
+        c.connect_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let t = add_header_rule(&env);
+    let mut s = h2_sender(&env, &t).await;
+    let stalled = s.send_request(h2_req("/endless")).await.unwrap();
+    assert_eq!(stalled.status(), 200);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mut other = h2_sender(&env, &t).await;
+    let r = other.send_request(h2_req("/x")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_body_util::BodyExt::collect(stalled.into_body()),
+    )
+    .await
+    .expect("the stalled body was never aborted");
+    assert!(res.is_err(), "a truncated body must not look complete");
+}
+
+#[tokio::test]
+async fn a_stalled_response_no_longer_keeps_the_mitm_connection_busy() {
+    let opts = ServeOptions {
+        body_idle_timeout: Duration::from_millis(500),
+        tunnel_idle_timeout: Duration::from_millis(800),
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |_| {}).await;
+    let t = add_header_rule(&env);
+    let mut s = h2_sender(&env, &t).await;
+    let _stalled = s.send_request(h2_req("/endless")).await.unwrap();
+    // After the body is aborted the in-flight counter drops and the idle timeout closes the
+    // connection (probing earlier would itself count as activity).
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert!(
+        s.send_request(h2_req("/x")).await.is_err(),
+        "the stalled response kept the connection busy forever"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_but_progressing_response_body_is_not_cut() {
+    let opts = ServeOptions {
+        body_idle_timeout: Duration::from_millis(1000),
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |_| {}).await;
+    let t = add_header_rule(&env);
+    let started = Instant::now();
+    let r = proxy_request(&env, &t, HOST, "GET", "/drip", &[], vec![], false).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, "chunk\n".repeat(6));
+    assert!(
+        started.elapsed() > Duration::from_millis(1500),
+        "the body must outlive the idle timeout"
+    );
+    let r = proxy_request(&env, &t, HOST, "GET", "/drip", &[], vec![], true).await;
+    assert_eq!(r.body, "chunk\n".repeat(6));
+}
+
+// ---- lifetimes -------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn max_lifetime_closes_a_busy_plain_http_connection() {
+    let opts = ServeOptions {
+        tunnel_max_lifetime: Duration::from_millis(800),
+        ..ServeOptions::default()
+    };
+    let env = Env::custom(no_extra_roots(), opts, None).await;
+    let mut s = tokio::net::TcpStream::connect(env.proxy_addr)
+        .await
+        .unwrap();
+    let (mut r, mut w) = s.split();
+    let started = Instant::now();
+    // Keep-alive requests (answered 407) arrive all the time: the connection is never idle.
+    let req = b"GET http://x.test/ HTTP/1.1\r\nHost: x.test\r\n\r\n";
+    let closed = tokio::time::timeout(Duration::from_secs(4), async {
+        let mut sink = [0u8; 1024];
+        loop {
+            if w.write_all(req).await.is_err() {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(100), r.read(&mut sink)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "busy plain connection outlived its max lifetime"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "closed too early"
+    );
+}
+
+#[tokio::test]
+async fn max_lifetime_closes_a_busy_h2_mitm_connection() {
+    let opts = ServeOptions {
+        tunnel_max_lifetime: Duration::from_millis(800),
+        ..ServeOptions::default()
+    };
+    let (env, _up) = env_with_upstream_opts(HOST, opts, |_| {}).await;
+    let t = add_header_rule(&env);
+    let mut s = h2_sender(&env, &t).await;
+    let started = Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match s.send_request(h2_req("/x")).await {
+                Ok(r) => {
+                    let _ = http_body_util::BodyExt::collect(r.into_body()).await;
+                }
+                Err(_) => break,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "busy h2 connection outlived its max lifetime"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "closed too early"
+    );
+}
+
+// ---- one-sided stalls in passthrough tunnels ------------------------------------------------
+
+async fn passthrough_env_with_idle() -> (Env, String) {
+    let opts = ServeOptions {
+        tunnel_idle_timeout: Duration::from_millis(500),
+        ..ServeOptions::default()
+    };
+    let env = Env::custom(no_extra_roots(), opts, None).await;
+    add_role(&env.vault, "developer", Unmatched::Passthrough).unwrap();
+    let t = env.token("m", "developer");
+    (env, t)
+}
+
+#[tokio::test]
+async fn a_passthrough_client_that_stops_reading_is_cut_even_if_it_keeps_sending() {
+    // The destination floods data; the client never reads but keeps sending a byte now and then.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flood = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let chunk = vec![b'f'; 64 * 1024];
+                while s.write_all(&chunk).await.is_ok() {}
+            });
+        }
+    });
+    let (env, t) = passthrough_env_with_idle().await;
+    let (line, s) = raw_connect(env.proxy_addr, &flood.to_string(), Some(&basic(&t))).await;
+    assert!(line.contains("200"), "{line}");
+    let (_r, mut w) = s.into_split();
+    let started = Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+        while w.write_all(b"x").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "a one-sided stall kept the tunnel open");
+    assert!(started.elapsed() < Duration::from_secs(8));
+}
+
+#[tokio::test]
+async fn a_passthrough_destination_that_stops_reading_is_cut_even_if_it_keeps_sending() {
+    // The destination never reads but trickles a byte; the client floods.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hole = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                while s.write_all(b".").await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
+    });
+    let (env, t) = passthrough_env_with_idle().await;
+    let (line, s) = raw_connect(env.proxy_addr, &hole.to_string(), Some(&basic(&t))).await;
+    assert!(line.contains("200"), "{line}");
+    let (mut r, mut w) = s.into_split();
+    tokio::spawn(async move {
+        let mut b = [0u8; 64];
+        while matches!(r.read(&mut b).await, Ok(n) if n > 0) {}
+    });
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+        let chunk = vec![b'u'; 64 * 1024];
+        while w.write_all(&chunk).await.is_ok() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "a one-sided stall kept the tunnel open");
+}

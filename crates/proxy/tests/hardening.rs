@@ -46,6 +46,11 @@ const ROUTING_HEADERS: &[&str] = &[
     "X-Host",
     "Via",
     "Front-End-Https",
+    "X-Client-IP",
+    "True-Client-IP",
+    "CF-Connecting-IP",
+    "X-Cluster-Client-IP",
+    "X-Original-URI",
 ];
 
 #[tokio::test]
@@ -60,6 +65,53 @@ async fn routing_override_headers_are_stripped_from_injected_requests() {
         assert!(up.header(0, h).is_empty(), "{h} reached the upstream");
     }
     assert_eq!(up.header(0, "x-keep"), vec!["yes".to_string()]);
+}
+
+#[tokio::test]
+async fn referer_and_origin_are_not_stripped() {
+    let (env, up) = env_with_upstream(HOST).await;
+    let t = add_header_rule(&env);
+    let headers = [("Referer", "https://a.test/"), ("Origin", "https://a.test")];
+    let r = proxy_request(&env, &t, HOST, "GET", "/x", &headers, vec![], false).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(up.header(0, "referer"), vec!["https://a.test/".to_string()]);
+    assert_eq!(up.header(0, "origin"), vec!["https://a.test".to_string()]);
+}
+
+#[tokio::test]
+async fn underscore_variants_of_routing_headers_are_stripped() {
+    let (env, up) = env_with_upstream(HOST).await;
+    let t = add_header_rule(&env);
+    let names = [
+        "X_HTTP_METHOD_OVERRIDE",
+        "x_forwarded_for",
+        "x_original_url",
+        "X_Real_IP",
+        "X_Client_IP",
+        "True_Client_IP",
+        "X_Forwarded_Host",
+        "Front_End_Https",
+    ];
+    let mut raw = format!("GET /x HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n");
+    for n in names {
+        raw.push_str(&format!("{n}: evil\r\n"));
+    }
+    raw.push_str("x_keep: yes\r\n\r\n");
+    let r = proxy_raw_request(&env, &t, HOST, raw.as_bytes()).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let got: Vec<String> = up.received.lock().unwrap()[0]
+        .headers
+        .iter()
+        .map(|(k, _)| k.to_lowercase())
+        .collect();
+    for n in names {
+        assert!(
+            !got.iter()
+                .any(|k| k.replace('_', "-") == n.to_lowercase().replace('_', "-")),
+            "{n} reached the upstream: {got:?}"
+        );
+    }
+    assert!(got.iter().any(|k| k == "x_keep"), "{got:?}");
 }
 
 #[tokio::test]
@@ -131,6 +183,80 @@ async fn trace_and_connect_are_refused_with_405_and_audited() {
         .iter()
         .any(|r| r.method == "CONNECT" && r.decision == "method-refused"));
     assert_eq!(up.count(), 0, "TRACE/CONNECT reached the upstream");
+}
+
+#[tokio::test]
+async fn trace_track_and_connect_refusal_is_case_insensitive() {
+    let (env, up) = env_with_upstream(HOST).await;
+    let t = add_header_rule(&env);
+    for m in ["trace", "Trace", "TRACK", "track", "connect"] {
+        let raw = format!("{m} /x HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+        let r = proxy_raw_request(&env, &t, HOST, raw.as_bytes()).await;
+        assert_eq!(r.status, 405, "{m}");
+    }
+    assert_eq!(up.count(), 0);
+    let rows = env.vault.list_audit(&Default::default()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.decision == "method-refused")
+            .count(),
+        5
+    );
+}
+
+fn add_rule_methods(env: &Env, methods: &[&str]) -> String {
+    add_role(&env.vault, "developer", Unmatched::Passthrough).unwrap();
+    let s = env.vault.add_secret("k", "REAL-SECRET").unwrap();
+    add_rule(
+        &env.vault,
+        NewRule {
+            role: "developer".into(),
+            host_pattern: HOST.into(),
+            path_pattern: "*".into(),
+            methods: methods.iter().map(|m| m.to_string()).collect(),
+            kind: InjectionKind::Header,
+            target_name: "Authorization".into(),
+            template: "Bearer {secret}".into(),
+            secret_id: s.id,
+        },
+    )
+    .unwrap();
+    env.token("laptop", "developer")
+}
+
+#[tokio::test]
+async fn copy_and_move_need_an_explicit_method_in_the_rule() {
+    for methods in [&[][..], &["GET", "POST"][..]] {
+        let (env, up) = env_with_upstream(HOST).await;
+        let t = add_rule_methods(&env, methods);
+        let mut tun = open_tunnel(&env, &t, HOST).await;
+        for m in ["COPY", "MOVE", "copy", "Move"] {
+            let r = tun
+                .request(m, "/a", &[("Destination", "https://api.example.test/b")])
+                .await;
+            assert_eq!(r.status, 403, "{m} with methods {methods:?}");
+        }
+        assert_eq!(up.count(), 0);
+        let rows = env.vault.list_audit(&Default::default()).unwrap();
+        assert_eq!(
+            rows.iter().filter(|r| r.decision == "forbidden").count(),
+            4,
+            "{methods:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_and_move_flow_when_the_rule_lists_them_explicitly() {
+    let (env, up) = env_with_upstream(HOST).await;
+    let t = add_rule_methods(&env, &["COPY", "move"]);
+    let mut tun = open_tunnel(&env, &t, HOST).await;
+    for m in ["COPY", "MOVE"] {
+        let r = tun.request(m, "/a", &[("Destination", "/b")]).await;
+        assert_eq!(r.status, 200, "{m}");
+    }
+    assert_eq!(up.count(), 2);
+    assert_eq!(up.header(0, "authorization"), vec!["Bearer REAL-SECRET"]);
 }
 
 #[tokio::test]

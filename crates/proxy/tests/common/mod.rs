@@ -260,6 +260,54 @@ impl hyper::body::Body for AbortBody {
     }
 }
 
+/// Never-ending response body (64 KiB chunks): a client that does not read it stalls the stream.
+struct EndlessBody;
+
+impl hyper::body::Body for EndlessBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(vec![
+            b'e';
+            64 * 1024
+        ])))))
+    }
+}
+
+/// Six 6-byte chunks, 300 ms apart: slow but steadily progressing.
+struct DripBody {
+    left: u8,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl hyper::body::Body for DripBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        if self.left == 0 {
+            return Poll::Ready(None);
+        }
+        match self.sleep.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                self.left -= 1;
+                let next = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+                self.sleep.as_mut().reset(next);
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                    b"chunk\n",
+                )))))
+            }
+        }
+    }
+}
+
 async fn serve_recording<IO>(io: IO, received: Arc<Mutex<Vec<Recorded>>>)
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -295,6 +343,14 @@ where
                 Full::new(Bytes::from(vec![b'b'; 8 * 1024 * 1024]))
                     .map_err(|never| match never {})
                     .boxed()
+            } else if parts.uri.path() == "/endless" {
+                EndlessBody.boxed()
+            } else if parts.uri.path() == "/drip" {
+                DripBody {
+                    left: 6,
+                    sleep: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(300))),
+                }
+                .boxed()
             } else if parts.uri.path() == "/abort" {
                 AbortBody {
                     sent: false,

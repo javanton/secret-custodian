@@ -143,9 +143,8 @@ async fn plain_http_with_a_rule_is_refused_even_for_other_methods_and_ports() {
 }
 
 #[tokio::test]
-async fn plain_http_to_localhost_with_a_rule_is_injected() {
+async fn plain_http_to_localhost_with_a_rule_is_refused_never_injected() {
     let up = spawn_plain_upstream().await;
-    // Strict policy: loopback is only reachable through the localhost-with-a-rule exception.
     let mut cfg = strict_upstream();
     cfg.resolve_override.insert("localhost".into(), up.addr);
     let env = Env::new(cfg).await;
@@ -159,20 +158,76 @@ async fn plain_http_to_localhost_with_a_rule_is_injected() {
         "LOCAL-SECRET",
     );
     let t = env.token("m", "developer");
-    let raw = plain_get(&env, &t, "http://localhost/ping", "localhost").await;
-    assert!(status(&raw).contains("200"), "{raw}");
-    assert_eq!(up.header(0, "x-api-key"), vec!["LOCAL-SECRET".to_string()]);
-    assert_eq!(decisions(&env), vec![("inject".into(), Some(200))]);
+    for (m, target, host) in [
+        (
+            "GET",
+            "http://localhost/ping".to_string(),
+            "localhost".to_string(),
+        ),
+        (
+            "POST",
+            "http://localhost/ping".to_string(),
+            "localhost".to_string(),
+        ),
+        (
+            "GET",
+            format!("http://localhost:{}/ping", up.addr.port()),
+            format!("localhost:{}", up.addr.port()),
+        ),
+        (
+            "GET",
+            "http://LOCALHOST/ping".to_string(),
+            "localhost".to_string(),
+        ),
+        (
+            "GET",
+            "http://localhost./ping".to_string(),
+            "localhost.".to_string(),
+        ),
+    ] {
+        let raw = plain_req(&env, Some(&t), m, &target, &host, &[]).await;
+        assert!(status(&raw).contains("403"), "{m} {target}: {raw}");
+        assert!(!raw.contains("LOCAL-SECRET"));
+    }
+    assert_eq!(up.count(), 0, "nothing may reach the local service");
+    assert!(decisions(&env)
+        .iter()
+        .all(|d| *d == ("plaintext-refused".to_string(), Some(403))));
+    assert_eq!(decisions(&env).len(), 5);
 }
 
 #[tokio::test]
-async fn plain_localhost_exception_never_overrides_denied() {
-    let up = spawn_plain_upstream().await;
+async fn an_agent_listener_on_an_arbitrary_port_receives_nothing_and_no_secret() {
+    // The agent opens its own loopback listener and asks for http://localhost:PORT/.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let (received, accepted) = (received.clone(), accepted.clone());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let received = received.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        received.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                });
+            }
+        });
+    }
+    // The override supplies only the IP (port 0): the requested port is kept, so without the
+    // refusal the secret WOULD reach the listener.
     let mut cfg = strict_upstream();
-    cfg.resolve_override.insert("localhost".into(), up.addr);
-    cfg.net_policy.denied = vec![up.addr];
+    cfg.resolve_override
+        .insert("localhost".into(), "127.0.0.1:0".parse().unwrap());
     let env = Env::new(cfg).await;
-    add_role(&env.vault, "developer", Unmatched::Deny).unwrap();
+    add_role(&env.vault, "developer", Unmatched::Passthrough).unwrap();
     header_rule(
         &env,
         "developer",
@@ -182,10 +237,44 @@ async fn plain_localhost_exception_never_overrides_denied() {
         "LOCAL-SECRET",
     );
     let t = env.token("m", "developer");
-    let raw = plain_get(&env, &t, "http://localhost/ping", "localhost").await;
+    let raw = plain_get(
+        &env,
+        &t,
+        &format!("http://localhost:{port}/"),
+        &format!("localhost:{port}"),
+    )
+    .await;
     assert!(status(&raw).contains("403"), "{raw}");
-    assert_eq!(up.count(), 0);
-    assert_eq!(decisions(&env), vec![("target-denied".into(), Some(403))]);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(received.lock().unwrap().is_empty());
+    assert_eq!(
+        decisions(&env),
+        vec![("plaintext-refused".into(), Some(403))]
+    );
+}
+
+#[tokio::test]
+async fn resolve_override_with_port_zero_keeps_the_requested_port() {
+    // Sanity check of the test helper behaviour used above: a role with no rules for the host
+    // and allow_loopback reaches the listener on the REQUESTED port.
+    let up = spawn_plain_upstream().await;
+    let mut cfg = no_extra_roots();
+    cfg.resolve_override
+        .insert("free.example.test".into(), "127.0.0.1:0".parse().unwrap());
+    let env = Env::new(cfg).await;
+    add_role(&env.vault, "open", Unmatched::Passthrough).unwrap();
+    let t = env.token("m", "open");
+    let port = up.addr.port();
+    let raw = plain_get(
+        &env,
+        &t,
+        &format!("http://free.example.test:{port}/a"),
+        &format!("free.example.test:{port}"),
+    )
+    .await;
+    assert!(status(&raw).contains("200"), "{raw}");
+    assert_eq!(up.count(), 1);
 }
 
 #[tokio::test]
@@ -260,6 +349,16 @@ async fn non_absolute_form_and_non_http_schemes_get_400() {
     .await;
     assert!(status(&raw).contains("400"), "{raw}");
     assert_eq!(up.count(), 0);
+    // Authenticated 400s are audited with the identity.
+    let rows = env.vault.list_audit(&Default::default()).unwrap();
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r.decision, "bad-request");
+        assert_eq!(r.status, Some(400));
+        assert_eq!(r.machine.as_deref(), Some("m"));
+        assert_eq!(r.role.as_deref(), Some("open"));
+        assert!(r.jti.is_some());
+    }
 }
 
 #[tokio::test]
@@ -761,4 +860,129 @@ async fn plain_and_mitm_paths_produce_the_same_decisions() {
             "method-refused",    // TRACE
         ]
     );
+}
+
+// --- body progress timeout on plain requests -----------------------------------------------
+
+async fn plain_env_opts(
+    host: &str,
+    opts: sg_proxy::ServeOptions,
+    tweak: impl FnOnce(&mut sg_proxy::UpstreamConfig),
+) -> (Env, TestUpstream) {
+    let up = spawn_plain_upstream().await;
+    let mut cfg = no_extra_roots();
+    cfg.resolve_override.insert(host.into(), up.addr);
+    tweak(&mut cfg);
+    (Env::custom(cfg, opts, None).await, up)
+}
+
+/// Writes `raw` and reads only until the end of the response head.
+async fn send_and_read_head(env: &Env, raw: &[u8]) -> (String, TcpStream) {
+    raw_head(env.proxy_addr, raw).await
+}
+
+#[tokio::test]
+async fn a_plain_client_that_never_reads_the_body_is_cut_off_and_frees_the_slot() {
+    let opts = sg_proxy::ServeOptions {
+        body_idle_timeout: std::time::Duration::from_millis(700),
+        ..Default::default()
+    };
+    let (env, _up) = plain_env_opts("free.example.test", opts, |c| {
+        c.max_upstream_connections = 1;
+        c.connect_timeout = std::time::Duration::from_millis(500);
+    })
+    .await;
+    add_role(&env.vault, "open", Unmatched::Passthrough).unwrap();
+    let t = env.token("m", "open");
+    let raw = format!(
+        "GET http://free.example.test/endless HTTP/1.1\r\nHost: free.example.test\r\nProxy-Authorization: {}\r\n\r\n",
+        basic(&t)
+    );
+    let (head, mut stalled) = send_and_read_head(&env, raw.as_bytes()).await;
+    assert!(head.contains("200"), "{head}");
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let r = plain_get(&env, &t, "http://free.example.test/x", "free.example.test").await;
+    assert!(status(&r).contains("200"), "{r}");
+    // Draining what is buffered ends with the connection closed, not with an endless body.
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match stalled.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "the stalled plain body was never aborted");
+}
+
+#[tokio::test]
+async fn a_slow_but_progressing_plain_body_is_not_cut() {
+    let opts = sg_proxy::ServeOptions {
+        body_idle_timeout: std::time::Duration::from_millis(1000),
+        ..Default::default()
+    };
+    let (env, _up) = plain_env_opts("free.example.test", opts, |_| {}).await;
+    add_role(&env.vault, "open", Unmatched::Passthrough).unwrap();
+    let t = env.token("m", "open");
+    let started = std::time::Instant::now();
+    let raw = plain_get(
+        &env,
+        &t,
+        "http://free.example.test/drip",
+        "free.example.test",
+    )
+    .await;
+    assert!(status(&raw).contains("200"), "{raw}");
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(1500),
+        "the body must outlive the idle timeout"
+    );
+    assert_eq!(raw.matches("chunk\n").count(), 6, "{raw}");
+}
+
+#[tokio::test]
+async fn a_request_body_that_stops_moving_is_aborted_with_502() {
+    let opts = sg_proxy::ServeOptions {
+        body_idle_timeout: std::time::Duration::from_millis(700),
+        ..Default::default()
+    };
+    let (env, up) = plain_env_opts("free.example.test", opts, |_| {}).await;
+    add_role(&env.vault, "open", Unmatched::Passthrough).unwrap();
+    let t = env.token("m", "open");
+    let raw = format!(
+        "POST http://free.example.test/up HTTP/1.1\r\nHost: free.example.test\r\nProxy-Authorization: {}\r\nContent-Length: 1000\r\n\r\nabc",
+        basic(&t)
+    );
+    let mut s = TcpStream::connect(env.proxy_addr).await.unwrap();
+    s.write_all(raw.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    if out.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        res.is_ok(),
+        "the stalled request body held the request forever"
+    );
+    let head = text_of(&out);
+    assert!(status(&head).contains("502"), "{head}");
+    assert_eq!(
+        up.count(),
+        0,
+        "an incomplete body must never complete upstream"
+    );
+    assert!(decisions(&env).contains(&("upstream-error".into(), Some(502))));
 }

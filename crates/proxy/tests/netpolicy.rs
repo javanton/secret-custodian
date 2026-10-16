@@ -183,6 +183,22 @@ async fn host_localhost_with_a_rule_may_reach_loopback() {
     let r = proxy_request(&env, &t, "localhost", "GET", "/", &[], vec![], false).await;
     assert_eq!(r.status, 200);
     assert_eq!(up.count(), 1);
+    // TLS to localhost with a rule still gets the credential injected.
+    assert_eq!(
+        up.header(0, "authorization"),
+        vec!["Bearer REAL-SECRET".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn subdomains_of_localhost_are_not_covered_by_the_exception() {
+    let (env, up) =
+        env_with_upstream_cfg("foo.localhost", |c| c.net_policy.allow_loopback = false).await;
+    let t = add_rule_for(&env, "foo.localhost");
+    let r = proxy_request(&env, &t, "foo.localhost", "GET", "/", &[], vec![], false).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(up.count(), 0);
+    assert_eq!(last_decision(&env), "target-denied");
 }
 
 #[tokio::test]
@@ -197,4 +213,87 @@ async fn the_localhost_exception_never_overrides_denied() {
     let r = proxy_request(&env, &t, "localhost", "GET", "/", &[], vec![], false).await;
     assert_eq!(r.status, 403);
     assert_eq!(up.count(), 0);
+}
+
+#[test]
+fn cloud_metadata_and_reserved_ranges_are_refused() {
+    let p = NetPolicy::default();
+    for a in [
+        "[fd00:ec2::254]:80",
+        "100.100.100.200:80",
+        "0.0.0.1:80",
+        "0.255.255.255:80",
+        "240.0.0.1:80",
+        "255.255.255.254:80",
+        "169.254.169.254:80",
+    ] {
+        assert!(!p.permits(a.parse().unwrap(), false), "{a}");
+        // Not even allow_* flags or the local-service exception revive them (except link-local).
+        let lax = NetPolicy::default().with_allow_loopback(true);
+        if !a.starts_with("169.254") {
+            assert!(!lax.permits(a.parse().unwrap(), true), "{a}");
+        }
+    }
+    // Tailscale CGNAT space and neighbours stay reachable.
+    for a in ["100.64.0.1:80", "100.100.100.201:80", "[fd00:ec2::255]:80"] {
+        assert!(p.permits(a.parse().unwrap(), false), "{a}");
+    }
+}
+
+#[test]
+fn nat64_and_6to4_embedded_ipv4_is_judged_as_the_ipv4() {
+    let p = NetPolicy::default();
+    for a in [
+        "[64:ff9b::7f00:1]:80",    // NAT64 -> 127.0.0.1
+        "[64:ff9b::a9fe:a9fe]:80", // NAT64 -> 169.254.169.254
+        "[64:ff9b::6464:64c8]:80", // NAT64 -> 100.100.100.200
+        "[64:ff9b::7f00:1]:80",
+        "[64:ff9b:1:7f00:0:100:0:0]:80", // 64:ff9b:1::/48 -> 127.0.0.1
+        "[64:ff9b:1:a9fe:0:a9fe:0:0]:80", // -> 169.254.169.254
+        "[2002:7f00:1::1]:80",           // 6to4 -> 127.0.0.1
+        "[2002:a9fe:a9fe::1]:80",        // 6to4 -> 169.254.169.254
+        "[2002:0:1::1]:80",              // 6to4 -> 0.0.0.0
+    ] {
+        assert!(!p.permits(a.parse().unwrap(), false), "{a}");
+    }
+    for a in [
+        "[64:ff9b::808:808]:80",
+        "[64:ff9b:1:808:0:808:0:0]:80",
+        "[2002:808:808::1]:80",
+    ] {
+        assert!(p.permits(a.parse().unwrap(), false), "{a}");
+    }
+    // `denied` entries are matched through the same unwrapping.
+    let denied: SocketAddr = "10.0.0.5:9090".parse().unwrap();
+    let p = NetPolicy::default().with_denied(vec![denied]);
+    assert!(!p.permits("[64:ff9b::a00:5]:9090".parse().unwrap(), false));
+    assert!(p.permits("[64:ff9b::a00:5]:9091".parse().unwrap(), false));
+}
+
+#[test]
+fn denied_for_binds_keeps_specific_binds_and_expands_wildcards() {
+    let specific: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+    assert_eq!(NetPolicy::denied_for_binds(&[specific]), vec![specific]);
+
+    let wildcard: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+    let out = NetPolicy::denied_for_binds(&[wildcard]);
+    assert!(out.contains(&wildcard));
+    assert!(out.contains(&"127.0.0.1:9090".parse().unwrap()), "{out:?}");
+    assert!(out.iter().all(|a| a.port() == 9090));
+    let has_non_loopback = if_addrs::get_if_addrs()
+        .unwrap()
+        .iter()
+        .any(|i| !i.ip().is_loopback());
+    if has_non_loopback {
+        assert!(out.iter().any(|a| !a.ip().is_loopback()), "{out:?}");
+    }
+    // Without duplicates.
+    let mut sorted = out.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), out.len());
+
+    let v6: SocketAddr = "[::]:8081".parse().unwrap();
+    let out = NetPolicy::denied_for_binds(&[v6, specific]);
+    assert!(out.contains(&v6) && out.contains(&specific));
 }
