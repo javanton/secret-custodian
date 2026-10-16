@@ -2285,18 +2285,27 @@ fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "Secret Guardian CA");
     p.distinguished_name = dn;
+    // serial aleatorio positivo de 16 bytes (las reemisiones no deben repetir emisor+serie)
+    let mut serial: [u8; 16] = sg_core::crypto::random_bytes();
+    serial[0] &= 0x7f;
+    p.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let names: Vec<String> = if domains.is_empty() { vec![PLACEHOLDER_TLD.into()] } else { domains.to_vec() };
     p.name_constraints = Some(NameConstraints {
         permitted_subtrees: names.into_iter().map(GeneralSubtree::DnsName).collect(),
-        excluded_subtrees: vec![],
+        // las restricciones DNS no limitan los SAN IP: se excluyen todas las IP
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(rcgen::CidrSubnet::V4([0; 4], [0; 4])),
+            GeneralSubtree::IpAddress(rcgen::CidrSubnet::V6([0; 16], [0; 16])),
+        ],
     });
     p.not_before = OffsetDateTime::now_utc() - TDuration::days(1);
     p.not_after = OffsetDateTime::now_utc() + TDuration::days(3650);
     Ok(p)
 }
 
+// Además de lo siguiente: etiquetas de 1..=63 sin `-` inicial/final, longitud <= 253 y última etiqueta no numérica (reglas de webpki).
 fn validate_domain(d: &str) -> Result<(), CaError> {
     let ok_chars = d.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
     if d.is_empty() || !ok_chars || d.starts_with('.') || d.ends_with('.') || d.contains("..") {
@@ -2356,7 +2365,11 @@ impl CaService {
     }
 
     /// Re-issues the CA certificate with the same key and a wider permitted set. Agents must reload the certificate.
+    /// Recorta y pasa a minúsculas; no consulta la Public Suffix List. Antes de persistir, una sonda
+    /// (hoja `probe.<dominio>` verificada contra el nuevo certificado) debe pasar para todos los dominios.
     pub fn allow_domain(&self, domain: &str) -> Result<(), CaError> {
+        let domain = domain.trim().to_ascii_lowercase();
+        let domain = domain.as_str();
         validate_domain(domain)?;
         let mut st = self.state.lock().unwrap();
         if st.domains.iter().any(|d| d == domain) {

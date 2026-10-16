@@ -1,12 +1,17 @@
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
+    SerialNumber,
 };
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use sg_core::{CoreError, Vault};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use sg_core::{crypto, CoreError, Vault};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::{Duration, Instant},
 };
 use time::{Duration as TDuration, OffsetDateTime};
@@ -14,6 +19,9 @@ use time::{Duration as TDuration, OffsetDateTime};
 const KEY_AAD: &[u8] = b"sg:ca-key";
 const PLACEHOLDER_TLD: &str = "invalid";
 const DEFAULT_LEAF_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
+const MAX_LEAF_CACHE_TTL: Duration = Duration::from_secs(20 * 3600);
+const MAX_LEAF_CACHE_ENTRIES: usize = 1024;
+const MAX_DNS_NAME_LEN: usize = 253;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaError {
@@ -40,6 +48,12 @@ pub fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 struct State {
     cert_pem: String,
     domains: Vec<String>,
+    /// The CA certificate object used as issuer for leaves; built once per load / `allow_domain`.
+    signer: Arc<rcgen::Certificate>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub struct CaService {
@@ -48,6 +62,7 @@ pub struct CaService {
     state: Mutex<State>,
     cache: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
     cache_ttl: Mutex<Duration>,
+    ca_cert_builds: AtomicUsize,
 }
 
 fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
@@ -55,6 +70,11 @@ fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "Secret Guardian CA");
     p.distinguished_name = dn;
+    // Random positive 16-byte serial, stored only inside the certificate: re-issued CA certificates
+    // (same key, same subject) must not share issuer+serial.
+    let mut serial: [u8; 16] = crypto::random_bytes();
+    serial[0] &= 0x7f;
+    p.serial_number = Some(SerialNumber::from_slice(&serial));
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let names: Vec<String> = if domains.is_empty() {
@@ -64,7 +84,11 @@ fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     };
     p.name_constraints = Some(NameConstraints {
         permitted_subtrees: names.into_iter().map(GeneralSubtree::DnsName).collect(),
-        excluded_subtrees: vec![],
+        // DNS constraints do not restrict IP SANs, so exclude every IP address explicitly.
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])),
+            GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])),
+        ],
     });
     p.not_before = OffsetDateTime::now_utc() - TDuration::days(1);
     p.not_after = OffsetDateTime::now_utc() + TDuration::days(3650);
@@ -79,6 +103,21 @@ fn validate_domain(d: &str) -> Result<(), CaError> {
         return Err(CaError::DomainRejected(
             "use a plain lowercase domain such as github.com",
         ));
+    }
+    // Same DNS rules as rustls-webpki, so a name we accept can never invalidate the whole CA.
+    if d.len() > MAX_DNS_NAME_LEN {
+        return Err(CaError::DomainRejected("name longer than 253 characters"));
+    }
+    if d.split('.')
+        .any(|l| l.is_empty() || l.len() > 63 || l.starts_with('-') || l.ends_with('-'))
+    {
+        return Err(CaError::DomainRejected("invalid DNS label"));
+    }
+    if d.rsplit('.')
+        .next()
+        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(CaError::DomainRejected("last label must not be all digits"));
     }
     if d.parse::<std::net::IpAddr>().is_ok() {
         return Err(CaError::DomainRejected("IP addresses are not supported"));
@@ -113,7 +152,16 @@ impl CaService {
                 let key =
                     KeyPair::from_pem(std::str::from_utf8(&key_pem).map_err(tls)?).map_err(tls)?;
                 let domains: Vec<String> = serde_json::from_str(&domains).map_err(tls)?;
-                Ok(Self::build(vault, key, State { cert_pem, domains }))
+                let signer = Arc::new(ca_params(&domains)?.self_signed(&key).map_err(tls)?);
+                Ok(Self::build(
+                    vault,
+                    key,
+                    State {
+                        cert_pem,
+                        domains,
+                        signer,
+                    },
+                ))
             }
             None => {
                 let key = KeyPair::generate().map_err(tls)?;
@@ -123,12 +171,14 @@ impl CaService {
                     "INSERT INTO ca (id, cert_pem, key_enc, domains) VALUES (1, ?1, ?2, '[]')",
                     rusqlite::params![cert.pem(), key_enc],
                 )?;
+                let cert_pem = cert.pem();
                 Ok(Self::build(
                     vault,
                     key,
                     State {
-                        cert_pem: cert.pem(),
+                        cert_pem,
                         domains: vec![],
+                        signer: Arc::new(cert),
                     },
                 ))
             }
@@ -142,33 +192,57 @@ impl CaService {
             state: Mutex::new(state),
             cache: Mutex::new(HashMap::new()),
             cache_ttl: Mutex::new(DEFAULT_LEAF_CACHE_TTL),
+            // the certificate in `state` was built by the caller
+            ca_cert_builds: AtomicUsize::new(1),
         }
     }
 
-    /// Overrides how long issued leaf configs stay cached (default 12 h). Mainly for tests.
+    /// Overrides how long issued leaf configs stay cached (default 12 h, clamped to 20 h). For tests.
+    #[doc(hidden)]
     pub fn set_leaf_cache_ttl(&self, ttl: Duration) {
-        *self.cache_ttl.lock().unwrap() = ttl;
+        *lock(&self.cache_ttl) = ttl.min(MAX_LEAF_CACHE_TTL);
+    }
+
+    #[doc(hidden)]
+    pub fn leaf_cache_len(&self) -> usize {
+        lock(&self.cache).len()
+    }
+
+    /// How many times the signing CA certificate object has been built (test hook).
+    #[doc(hidden)]
+    pub fn ca_cert_builds(&self) -> usize {
+        self.ca_cert_builds.load(Ordering::SeqCst)
     }
 
     pub fn cert_pem(&self) -> String {
-        self.state.lock().unwrap().cert_pem.clone()
+        lock(&self.state).cert_pem.clone()
     }
 
     pub fn domains(&self) -> Vec<String> {
-        self.state.lock().unwrap().domains.clone()
+        lock(&self.state).domains.clone()
     }
 
     /// Re-issues the CA certificate with the same key and a wider permitted set. Agents must reload the certificate.
+    ///
+    /// The input is trimmed and lowercased first. There is deliberately no Public Suffix List
+    /// dependency: multi-label public suffixes such as `co.uk`, `github.io`, `amazonaws.com` or
+    /// `com.au` are accepted, so the operator is responsible for not allowing them.
+    ///
+    /// Before anything is persisted, a throw-away leaf for the new domain and for every already
+    /// allowed domain is verified against the new certificate; if any fails the call is rejected.
     pub fn allow_domain(&self, domain: &str) -> Result<(), CaError> {
-        validate_domain(domain)?;
-        let mut st = self.state.lock().unwrap();
-        if st.domains.iter().any(|d| d == domain) {
+        let domain = domain.trim().to_ascii_lowercase();
+        validate_domain(&domain)?;
+        let mut st = lock(&self.state);
+        if st.domains.contains(&domain) {
             return Ok(());
         }
         let mut domains = st.domains.clone();
-        domains.push(domain.to_string());
+        domains.push(domain);
         domains.sort();
         let cert = ca_params(&domains)?.self_signed(&self.key).map_err(tls)?;
+        self.ca_cert_builds.fetch_add(1, Ordering::SeqCst);
+        self.probe(&cert, &domains)?;
         self.vault.conn().execute(
             "UPDATE ca SET cert_pem = ?1, domains = ?2 WHERE id = 1",
             rusqlite::params![cert.pem(), serde_json::to_string(&domains).map_err(tls)?],
@@ -176,16 +250,56 @@ impl CaService {
         *st = State {
             cert_pem: cert.pem(),
             domains,
+            signer: Arc::new(cert),
         };
-        self.cache.lock().unwrap().clear();
+        lock(&self.cache).clear();
         Ok(())
+    }
+
+    /// Verifies a throw-away leaf for every domain against `cert` as the only trust anchor.
+    fn probe(&self, cert: &rcgen::Certificate, domains: &[String]) -> Result<(), CaError> {
+        const REJECT: CaError = CaError::DomainRejected("would invalidate the CA name constraints");
+        let mut store = rustls::RootCertStore::empty();
+        store.add(cert.der().clone()).map_err(|_| REJECT)?;
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(store),
+            crypto_provider(),
+        )
+        .build()
+        .map_err(|_| REJECT)?;
+        for d in domains {
+            let name = format!("probe.{d}");
+            let name = if name.len() > MAX_DNS_NAME_LEN {
+                d.clone()
+            } else {
+                name
+            };
+            let leaf = self.issue_leaf(&name, cert, &KeyPair::generate().map_err(tls)?)?;
+            let sni = ServerName::try_from(name).map_err(|_| REJECT)?;
+            verifier
+                .verify_server_cert(&leaf, &[], &sni, &[], UnixTime::now())
+                .map_err(|_| REJECT)?;
+        }
+        Ok(())
+    }
+
+    fn issue_leaf(
+        &self,
+        host: &str,
+        signer: &rcgen::Certificate,
+        leaf_key: &KeyPair,
+    ) -> Result<CertificateDer<'static>, CaError> {
+        let mut params = CertificateParams::new(vec![host.to_string()]).map_err(tls)?;
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = OffsetDateTime::now_utc() - TDuration::hours(1);
+        params.not_after = OffsetDateTime::now_utc() + TDuration::hours(24);
+        let leaf = params.signed_by(leaf_key, signer, &self.key).map_err(tls)?;
+        Ok(leaf.der().clone())
     }
 
     pub fn is_host_permitted(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
-        self.state
-            .lock()
-            .unwrap()
+        lock(&self.state)
             .domains
             .iter()
             .any(|d| host == *d || host.ends_with(&format!(".{d}")))
@@ -197,33 +311,38 @@ impl CaService {
             return Err(CaError::NotPermitted);
         }
         // Read the state before taking the cache lock (allow_domain locks state, then cache).
-        let domains = self.domains();
-        let ttl = *self.cache_ttl.lock().unwrap();
+        let signer = lock(&self.state).signer.clone();
+        let ttl = *lock(&self.cache_ttl);
         // The cache lock is held while issuing so concurrent callers for one host share a single leaf.
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = lock(&self.cache);
         if let Some((at, cfg)) = cache.get(&host) {
             if at.elapsed() < ttl {
                 return Ok(cfg.clone());
             }
         }
-        let ca_cert = ca_params(&domains)?.self_signed(&self.key).map_err(tls)?;
         let leaf_key = KeyPair::generate().map_err(tls)?;
-        let mut params = CertificateParams::new(vec![host.clone()]).map_err(tls)?;
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = OffsetDateTime::now_utc() - TDuration::hours(1);
-        params.not_after = OffsetDateTime::now_utc() + TDuration::hours(24);
-        let leaf = params
-            .signed_by(&leaf_key, &ca_cert, &self.key)
-            .map_err(tls)?;
+        let leaf_der = self.issue_leaf(&host, &signer, &leaf_key)?;
         let der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         let mut cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()
             .map_err(tls)?
             .with_no_client_auth()
-            .with_single_cert(vec![leaf.der().clone()], der)
+            .with_single_cert(vec![leaf_der], der)
             .map_err(tls)?;
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
+        if cache.len() >= MAX_LEAF_CACHE_ENTRIES && !cache.contains_key(&host) {
+            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+            if cache.len() >= MAX_LEAF_CACHE_ENTRIES {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+        }
         cache.insert(host, (Instant::now(), cfg.clone()));
         Ok(cfg)
     }

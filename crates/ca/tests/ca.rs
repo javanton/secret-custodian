@@ -237,7 +237,16 @@ fn permitted_dns(pem: &str) -> Vec<String> {
     assert!(ext.critical, "NameConstraints must be critical");
     match ext.parsed_extension() {
         ParsedExtension::NameConstraints(nc) => {
-            assert!(nc.excluded_subtrees.is_none());
+            let excluded = nc.excluded_subtrees.as_ref().expect("no excluded subtrees");
+            let ips: Vec<Vec<u8>> = excluded
+                .iter()
+                .map(|s| match s.base {
+                    GeneralName::IPAddress(b) => b.to_vec(),
+                    ref other => panic!("unexpected excluded subtree {other:?}"),
+                })
+                .collect();
+            assert!(ips.contains(&vec![0u8; 8]), "0.0.0.0/0 not excluded");
+            assert!(ips.contains(&vec![0u8; 32]), "::/0 not excluded");
             nc.permitted_subtrees
                 .as_ref()
                 .expect("no permitted subtrees")
@@ -514,7 +523,6 @@ fn concurrent_allow_domain_and_issuance_do_not_deadlock() {
 fn more_invalid_domains_are_rejected() {
     let (_d, _v, ca) = ca();
     for bad in [
-        "GitHub.com",
         ".github.com",
         "github.com.",
         "a..b.com",
@@ -559,4 +567,132 @@ fn reload_after_allow_domain_still_signs_valid_leaves() {
     ca.allow_domain("github.com").unwrap();
     let reloaded = CaService::init_or_load(v).unwrap();
     assert!(reloaded.server_config_for("api.github.com").is_ok());
+}
+
+// ---------- review fixes ----------
+
+fn real_signer(v: &Vault) -> (rcgen::Certificate, KeyPair) {
+    let key_enc: Vec<u8> = v
+        .conn()
+        .query_row("SELECT key_enc FROM ca WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    let key_pem = v.open_value(b"sg:ca-key", &key_enc).unwrap();
+    let key = KeyPair::from_pem(std::str::from_utf8(&key_pem).unwrap()).unwrap();
+    let mut p = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "Secret Guardian CA");
+    p.distinguished_name = dn;
+    p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    (p.self_signed(&key).unwrap(), key)
+}
+
+#[tokio::test]
+async fn forged_ip_leaves_are_refused_by_the_real_ca_constraints() {
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let (signer, key) = real_signer(&v);
+    for ip in ["192.168.1.1", "::1"] {
+        let err = handshake_raw(forged_server_config(ip, &signer, &key), &ca.cert_pem(), ip)
+            .await
+            .unwrap_err();
+        assert!(err.contains("NameConstraint"), "{ip}: wrong reason: {err}");
+    }
+}
+
+#[test]
+fn ca_key_usage_is_exactly_cert_sign_and_crl_sign_with_pathlen_zero() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let der = pem_to_der(&ca.cert_pem());
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    let ku = cert.key_usage().unwrap().unwrap().value;
+    assert!(ku.key_cert_sign() && ku.crl_sign());
+    assert!(
+        !ku.digital_signature()
+            && !ku.non_repudiation()
+            && !ku.key_encipherment()
+            && !ku.data_encipherment()
+            && !ku.key_agreement()
+            && !ku.encipher_only()
+            && !ku.decipher_only()
+    );
+    let bc = cert.basic_constraints().unwrap().unwrap().value;
+    assert_eq!(bc.path_len_constraint, Some(0));
+}
+
+#[tokio::test]
+async fn webpki_incompatible_domains_are_rejected_and_the_ca_keeps_working() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let before = ca.cert_pem();
+    let long_label = format!("{}.com", "a".repeat(64));
+    let too_long = format!("{}.com", vec!["a".repeat(60); 5].join(".") + ".bbbbbbbbbbb");
+    assert!(too_long.len() > 253);
+    for bad in [
+        "example.123",
+        "0.1",
+        "1.2.3",
+        "-a.com",
+        "a-.com",
+        long_label.as_str(),
+        too_long.as_str(),
+    ] {
+        assert!(ca.allow_domain(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(ca.domains(), vec!["github.com".to_string()]);
+    assert_eq!(ca.cert_pem(), before);
+    handshake(&ca, "api.github.com").await.unwrap();
+    for ok in ["a-b.example.co", "localhost"] {
+        ca.allow_domain(ok).unwrap();
+        handshake(&ca, ok).await.unwrap();
+    }
+    handshake(&ca, "github.com").await.unwrap();
+}
+
+#[test]
+fn leaf_cache_is_bounded_and_the_ca_certificate_is_built_once_per_change() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let builds = ca.ca_cert_builds();
+    for i in 0..1100 {
+        ca.server_config_for(&format!("h{i}.github.com")).unwrap();
+        assert!(ca.leaf_cache_len() <= 1024);
+    }
+    assert_eq!(ca.leaf_cache_len(), 1024);
+    assert_eq!(ca.ca_cert_builds(), builds, "misses must reuse the CA cert");
+    ca.allow_domain("gitlab.com").unwrap();
+    assert_eq!(ca.ca_cert_builds(), builds + 1);
+}
+
+#[tokio::test]
+async fn reissued_ca_certificates_have_distinct_serials_and_the_same_key() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let old_cfg = ca.server_config_for("api.github.com").unwrap();
+    let first = ca.cert_pem();
+    ca.allow_domain("gitlab.com").unwrap();
+    let second = ca.cert_pem();
+    let serial = |pem: &str| {
+        let der = pem_to_der(pem);
+        let (_, c) = X509Certificate::from_der(&der).unwrap();
+        c.tbs_certificate.raw_serial().to_vec()
+    };
+    let (s1, s2) = (serial(&first), serial(&second));
+    assert_ne!(s1, s2);
+    assert_eq!(s2.len(), 16);
+    assert_eq!(s2[0] & 0x80, 0, "serial must be positive");
+    assert_eq!(spki_of(&first), spki_of(&second));
+    handshake_raw(old_cfg, &second, "api.github.com")
+        .await
+        .unwrap();
+}
+
+#[test]
+fn allow_domain_trims_and_lowercases() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain(" GitHub.com ").unwrap();
+    assert_eq!(ca.domains(), vec!["github.com".to_string()]);
+    assert!(ca.allow_domain("git hub.com").is_err());
+    assert!(ca.allow_domain("git\thub.com").is_err());
 }

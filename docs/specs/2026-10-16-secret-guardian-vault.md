@@ -202,6 +202,11 @@ El argumento de cierre descansa en estas suposiciones:
   subdominios.
 - Sin dominios permitidos la CA se restringe al TLD reservado `invalid`, de modo que nunca queda
   sin restricciones. `allow-domain` rechaza TLDs y dominios de una sola etiqueta (salvo `localhost`).
+  También excluye todas las direcciones IP (`0.0.0.0/0` y `::/0`), porque las restricciones DNS no
+  limitan los SAN de tipo IP. `allow-domain` valida el nombre con las reglas DNS de webpki y comprueba
+  con una hoja de prueba que el nuevo certificado sigue siendo válido para todos los dominios.
+  `allow-domain` no consulta la Public Suffix List: el operador es responsable de no permitir sufijos
+  públicos como `github.io`.
 - Añadir un dominio fuera de lo permitido reemite el certificado de la CA **con la misma clave**
   y requiere que los agentes recarguen el certificado público. La UI y la CLI avisan.
 - El certificado público se descarga con `sg ca export` o desde la web; la clave privada
