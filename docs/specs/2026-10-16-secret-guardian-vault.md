@@ -153,17 +153,23 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
   reservados decodificados, `//` colapsado) y **se reenvía el path normalizado**: lo autorizado es
   lo enviado. Además, para reglas con path distinto de `*`, el
   juicio está **cerrado por construcción**: se leen todas las profundidades de decodificación
-  porcentual (0 a 8 capas) y en ninguna puede haber un segmento punto (`.`, `..`, `...`, `.. `: solo
-  puntos, espacios o tabs) separando a la vez por `/`, `\`, `;`, `?` y `#`. Sin nada que resolver,
+  porcentual (0 a 8 capas) y en ninguna puede haber un segmento punto (`.`, `..`, `...`, `.. `, `..+`: solo
+  puntos, espacios, tabs o `+`) separando a la vez por `/`, `\`, `;`, `?` y `#`. Sin nada que resolver,
   ningún orden de operaciones del origen (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como
   `/`, resolver puntos) puede salir del prefijo. Además, cada lectura debe empezar por el prefijo del
   patrón decodificado el mismo número de veces (igualdad exacta si el patrón no termina en `*`).
   No se puede juzgar, y las reglas con path responden `403` (solo `*` lo admite), un path con `%` mal
   formado, `%uXXXX`, UTF-8 inválido, NUL u otro carácter de control (C0, DEL), confusables Unicode
-  de `.`, `/` o `\` (p. ej. U+2025, U+FF0E, U+2215), más de 8 capas de codificación o más de 8 KiB.
-  Consecuencia: un path con `..` u otros segmentos punto recibe `403` con reglas de path. Al crear la
-  regla se rechazan los patrones que se ensanchan a sí mismos (segmentos punto, `;`, `\`, `?`, `#`,
-  NUL, controles o confusables en cualquier profundidad de decodificación).
+  de `.`, `/`, `\`, `?` o espacio, y espacios o caracteres invisibles no ASCII (p. ej. U+2025,
+  U+FF0E, U+2215, U+FF1F, U+00A0, U+200B), más de 8 capas de codificación o más de 8 KiB.
+  Consecuencia: `normalize_path` resuelve antes de juzgar los `..`/`%2e%2e` simples, así que
+  `/repos/a/../b` pasa a `/repos/b` y se acepta, y `/repos/x/.` pasa a `/repos/x`; solo reciben `403`
+  con reglas de path los segmentos punto que sobreviven a la normalización (`..;`, `..%2F`, `.. `,
+  `...`, `..+`, formas doblemente codificadas) y los bytes no juzgables. Al crear la regla se
+  rechazan los patrones que se ensanchan a sí mismos (segmentos punto, `;`, `\`, `?`, `#`, NUL,
+  controles o confusables en cualquier profundidad de decodificación) y los que tienen un segmento
+  terminado en `.` o espacio (un origen estilo Windows lo recortaría). Un prefijo que no termina en
+  `/` (p. ej. `/v1*`) también casa con `/v1beta`, por diseño.
   Un `/` codificado solo se admite mientras permanezca dentro del prefijo de la regla.
 - Por cada destino de inyección gana la regla más específica (host exacto; entre wildcards, el sufijo
   más largo, p. ej. `*.prod.corp.com` sobre `*.corp.com`; path exacto; patrón más largo). Si su
@@ -171,6 +177,23 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
   es **por destino** (un destino distinto, p. ej. un parámetro de query, sí puede seguir aportando).
 - Los valores de secreto no pueden contener CR, LF ni NUL; en inyección `query` el valor se codifica
   en porcentaje.
+
+#### Suposiciones sobre el origen
+
+El argumento de cierre descansa en estas suposiciones:
+
+- **A1**: el origen decodifica en porcentaje solo `%HH` con hex ASCII, byte a byte, y luego lee
+  UTF-8, cualquier número de rondas y en cualquier punto.
+- **A2**: los separadores del origen son un subconjunto de `/ \ ; ? #`, y quitar `;params` elimina
+  desde `;` hasta el siguiente `/` o el final.
+- **A3**: los orígenes solo eliminan sufijos que empiezan en `?`/`#`, tramos desde `;` hasta el
+  siguiente `/`, una `/` de `//`, y los puntos/espacios finales de un segmento.
+- **A4**: las transformaciones de caracteres son solo ASCII (`\` a `/`, plegado de mayúsculas ASCII);
+  la normalización Unicode y el `+` como espacio quedan cubiertos por la lista de caracteres
+  prohibidos y por el conjunto de segmentos punto.
+- **A5**: los segmentos punto solo se reconocen si están hechos de puntos, espacios, tabs y `+`.
+- **A6**: el origen recibe exactamente la cadena que se juzgó (el proxy reenvía
+  `normalize_path(raw)`; la query no interviene en el enrutado).
 
 ### 6.3 CA acotada
 

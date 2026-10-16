@@ -318,6 +318,13 @@ fn path_pattern_validation_is_strict() {
         "/a%0Ab",
         "/a%7Fb",
         "/a/\u{FF3C}b",
+        "/repos/%EF%BC%9F/*",
+        "/repos/..+/*",
+        "/v1./*",
+        "/a /*",
+        "/v1.",
+        "/a%20/*",
+        "/a%2E/*",
     ] {
         bad(p);
     }
@@ -332,6 +339,10 @@ fn path_pattern_validation_is_strict() {
         "/repos/",
         "/api/v4/projects/a%2Fb",
         "/api/v4/*",
+        "/repos/caf%C3%A9/*",
+        "/v1*",
+        "/repos/.github/*",
+        "/a.b/*",
     ] {
         ok(p);
     }

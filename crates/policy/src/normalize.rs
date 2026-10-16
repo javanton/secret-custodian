@@ -146,27 +146,47 @@ pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
 /// Longest path (bytes) a restricted rule will judge; anything longer is unjudgeable.
 pub(crate) const MAX_JUDGED_PATH_LEN: usize = 8192;
 
-/// Look-alikes of `.` and `/` that some origins fold to the ASCII character.
-const CONFUSABLES: [char; 12] = [
-    '\u{2024}', '\u{2025}', '\u{2026}', '\u{FE52}', '\u{FF0E}', '\u{FF61}', '\u{2044}', '\u{2215}',
-    '\u{2216}', '\u{29F8}', '\u{FF0F}', '\u{FF3C}',
-];
-
-/// Control characters (C0, DEL) and confusables: never judgeable.
-fn has_forbidden_char(s: &str) -> bool {
-    s.chars()
-        .any(|c| c.is_ascii_control() || CONFUSABLES.contains(&c))
+/// Code points that some origin may fold, normalize or trim into `.`, `/`, `\`, `?`, `#`, a
+/// space, or nothing (NFKC/NFKD look-alikes, invisible and format characters).
+fn is_forbidden_unicode(c: char) -> bool {
+    matches!(c,
+        '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{037E}' | '\u{1680}' | '\u{180E}'
+        | '\u{2000}'..='\u{200F}'
+        | '\u{2024}'..='\u{2026}'
+        | '\u{2028}'..='\u{202F}'
+        | '\u{2044}'
+        | '\u{2047}'..='\u{2049}'
+        | '\u{205F}'..='\u{2064}'
+        | '\u{2215}' | '\u{2216}' | '\u{29F8}' | '\u{3000}'
+        | '\u{FE50}'..='\u{FE6B}'
+        | '\u{FEFF}'
+        | '\u{FF01}'..='\u{FF65}')
 }
 
-/// A segment such as `.`, `..`, `...`, `.. `: non-empty, has a `.`, only dots, spaces and tabs.
+/// Control characters (C0, DEL), separator/dot look-alikes and non-ASCII whitespace: never
+/// judgeable. Ordinary non-ASCII letters (accents, CJK, emoji) are fine.
+fn has_forbidden_char(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_ascii_control() || is_forbidden_unicode(c) || (!c.is_ascii() && c.is_whitespace())
+    })
+}
+
+/// A segment such as `.`, `..`, `...`, `.. `, `..+`: non-empty, has a `.`, only dots, spaces,
+/// tabs and `+` (form-style space).
 fn is_dot_like(seg: &str) -> bool {
-    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t'))
+    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t' | '+'))
 }
 
 /// True when any segment is dot-like under EVERY separator model at once (`/ \ ; ? #`), so that
 /// resolving dot segments is the identity however an origin splits the path.
 fn has_dot_segment(s: &str) -> bool {
     s.split(['/', '\\', ';', '?', '#']).any(is_dot_like)
+}
+
+/// True when any segment ends with `.` or a space (Windows-style trimming drops them).
+fn has_trimmable_segment(s: &str) -> bool {
+    s.split(['/', '\\', ';', '?', '#'])
+        .any(|seg| seg.ends_with(['.', ' ']))
 }
 
 /// Every reading `R_0..R_n` (percent-decoded 0..n times, until stable) of a path, used ONLY for
@@ -195,8 +215,9 @@ pub(crate) fn pattern_readings(body: &str) -> Option<Vec<String>> {
 }
 
 /// True when a path PATTERN could widen itself: at any decoding depth its text contains `;`,
-/// `\`, `?`, `#`, NUL or any control character, a confusable, or a dot segment (under any
-/// separator model), or it cannot be decoded safely or is too long.
+/// `\`, `?`, `#`, NUL or any control character, a forbidden Unicode character, a dot segment
+/// (under any separator model), a segment ending in `.` or a space (origins that trim those
+/// would reinterpret the prefix), or it cannot be decoded safely or is too long.
 pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
     if body.len() > MAX_JUDGED_PATH_LEN {
         return true;
@@ -204,9 +225,12 @@ pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
     let Some(chain) = decode_chain(body) else {
         return true;
     };
-    chain
-        .iter()
-        .any(|c| c.contains([';', '\\', '?', '#']) || has_forbidden_char(c) || has_dot_segment(c))
+    chain.iter().any(|c| {
+        c.contains([';', '\\', '?', '#'])
+            || has_forbidden_char(c)
+            || has_dot_segment(c)
+            || has_trimmable_segment(c)
+    })
 }
 
 #[cfg(test)]

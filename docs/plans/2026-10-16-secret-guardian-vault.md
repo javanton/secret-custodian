@@ -36,7 +36,7 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 1. Secreto o plantilla con CR/LF/NUL (inyección de cabeceras): rechazado al guardar y al renderizar. Tareas 2 y 3.
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
-4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, solo puntos/espacios/tab) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb`, pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
+4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, `..+`, solo puntos/espacios/tab/`+`) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, espacios y caracteres invisibles no ASCII (NBSP, U+200B, U+FF1F, U+FE68...), más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb` (los `..`/`%2e%2e` simples los resuelve `normalize_path` antes de juzgar), pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
 5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
 
 ---
@@ -1335,21 +1335,35 @@ pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
 /// Longest path (bytes) a restricted rule will judge; anything longer is unjudgeable.
 pub(crate) const MAX_JUDGED_PATH_LEN: usize = 8192;
 
-/// Look-alikes of `.` and `/` that some origins fold to the ASCII character.
-const CONFUSABLES: [char; 12] = [
-    '\u{2024}', '\u{2025}', '\u{2026}', '\u{FE52}', '\u{FF0E}', '\u{FF61}', '\u{2044}', '\u{2215}',
-    '\u{2216}', '\u{29F8}', '\u{FF0F}', '\u{FF3C}',
-];
-
-/// Control characters (C0, DEL) and confusables: never judgeable.
-fn has_forbidden_char(s: &str) -> bool {
-    s.chars()
-        .any(|c| c.is_ascii_control() || CONFUSABLES.contains(&c))
+/// Code points that some origin may fold, normalize or trim into `.`, `/`, `\`, `?`, `#`, a
+/// space, or nothing (NFKC/NFKD look-alikes, invisible and format characters).
+fn is_forbidden_unicode(c: char) -> bool {
+    matches!(c,
+        '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{037E}' | '\u{1680}' | '\u{180E}'
+        | '\u{2000}'..='\u{200F}'
+        | '\u{2024}'..='\u{2026}'
+        | '\u{2028}'..='\u{202F}'
+        | '\u{2044}'
+        | '\u{2047}'..='\u{2049}'
+        | '\u{205F}'..='\u{2064}'
+        | '\u{2215}' | '\u{2216}' | '\u{29F8}' | '\u{3000}'
+        | '\u{FE50}'..='\u{FE6B}'
+        | '\u{FEFF}'
+        | '\u{FF01}'..='\u{FF65}')
 }
 
-/// A segment such as `.`, `..`, `...`, `.. `: non-empty, has a `.`, only dots, spaces and tabs.
+/// Control characters (C0, DEL), separator/dot look-alikes and non-ASCII whitespace: never
+/// judgeable. Ordinary non-ASCII letters (accents, CJK, emoji) are fine.
+fn has_forbidden_char(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_ascii_control() || is_forbidden_unicode(c) || (!c.is_ascii() && c.is_whitespace())
+    })
+}
+
+/// A segment such as `.`, `..`, `...`, `.. `, `..+`: non-empty, has a `.`, only dots, spaces,
+/// tabs and `+` (form-style space).
 fn is_dot_like(seg: &str) -> bool {
-    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t'))
+    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t' | '+'))
 }
 
 /// True when any segment is dot-like under EVERY separator model at once (`/ \ ; ? #`), so that
@@ -1378,14 +1392,21 @@ pub(crate) fn judge_readings(p: &str) -> Option<Vec<String>> {
     Some(chain)
 }
 
+/// True when any segment ends with `.` or a space (Windows-style trimming drops them).
+fn has_trimmable_segment(s: &str) -> bool {
+    s.split(['/', '\\', ';', '?', '#'])
+        .any(|seg| seg.ends_with(['.', ' ']))
+}
+
 /// Pattern prefix/body readings: decoded until stable (same cap as paths).
 pub(crate) fn pattern_readings(body: &str) -> Option<Vec<String>> {
     decode_chain(body)
 }
 
 /// True when a path PATTERN could widen itself: at any decoding depth its text contains `;`,
-/// `\`, `?`, `#`, NUL or any control character, a confusable, or a dot segment (under any
-/// separator model), or it cannot be decoded safely or is too long.
+/// `\`, `?`, `#`, NUL or any control character, a forbidden Unicode character, a dot segment
+/// (under any separator model), a segment ending in `.` or a space (origins that trim those
+/// would reinterpret the prefix), or it cannot be decoded safely or is too long.
 pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
     if body.len() > MAX_JUDGED_PATH_LEN {
         return true;
@@ -1393,9 +1414,12 @@ pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
     let Some(chain) = decode_chain(body) else {
         return true;
     };
-    chain
-        .iter()
-        .any(|c| c.contains([';', '\\', '?', '#']) || has_forbidden_char(c) || has_dot_segment(c))
+    chain.iter().any(|c| {
+        c.contains([';', '\\', '?', '#'])
+            || has_forbidden_char(c)
+            || has_dot_segment(c)
+            || has_trimmable_segment(c)
+    })
 }
 ```
 `matcher.rs` (encima de los tests):
@@ -1558,7 +1582,7 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
     if !valid_host_pattern(&r.host_pattern) {
         return Err(PolicyError::Invalid("host_pattern must be a lowercase hostname or *.hostname (no IPs)"));
     }
-    // `*`, o path normalizado con `*` final opcional que no pueda ensancharse a sí mismo (ver `valid_path_pattern` en el código: hex en mayúsculas, sin `;?#\`, sin segmentos punto ni confusables en ninguna profundidad).
+    // `*`, o path normalizado con `*` final opcional que no pueda ensancharse a sí mismo (ver `valid_path_pattern` en el código: hex en mayúsculas, sin `;?#\`, sin segmentos punto ni confusables ni segmentos que terminen en `.` o espacio en ninguna profundidad).
     if !(r.path_pattern == "*" || (r.path_pattern.starts_with('/') && !pattern_is_self_widening(r.path_pattern.strip_suffix('*').unwrap_or(&r.path_pattern)))) {
         return Err(PolicyError::Invalid("path_pattern must be * or a normalized path starting with / (optional trailing *)"));
     }

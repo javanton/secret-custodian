@@ -737,6 +737,48 @@ mod tests {
     }
 
     #[test]
+    fn unicode_separator_lookalikes_and_plus_as_space_are_forbidden() {
+        let rules = [rule(
+            1,
+            "api.github.com",
+            "/repos/*",
+            &["GET"],
+            Header,
+            "Authorization",
+        )];
+        for raw in [
+            "/repos/..%CD%BE/admin",
+            "/repos/..%EF%BC%9F/admin",
+            "/repos/..%EF%B9%A8admin",
+            "/repos/..%C2%A0/admin",
+            "/repos/%EF%BC%852e%EF%BC%852e/admin",
+            "/repos/a%E2%80%8Bb",
+            "/repos/..+/admin",
+            "/repos/..%2B/admin",
+        ] {
+            assert_eq!(
+                ids(evaluate_raw(&rules, "api.github.com", "GET", raw)),
+                vec![-1],
+                "{raw}"
+            );
+        }
+        for raw in [
+            "/repos/caf%C3%A9",
+            "/repos/%E6%97%A5%E6%9C%AC",
+            "/repos/%F0%9F%98%80",
+            "/repos/a+b",
+            "/repos/c++",
+            "/repos/.github",
+        ] {
+            assert_eq!(
+                ids(evaluate_raw(&rules, "api.github.com", "GET", raw)),
+                vec![1],
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
     fn the_oracle_finds_an_escape_in_each_witness() {
         for raw in [
             "/repos/a\\..%3B\\k/../admin",
