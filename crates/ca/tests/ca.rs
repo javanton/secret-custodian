@@ -1,0 +1,562 @@
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, GeneralSubtree, IsCa, KeyPair,
+    KeyUsagePurpose, NameConstraints,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use sg_ca::*;
+use sg_core::{crypto, KeyInput, Vault};
+use std::sync::Arc;
+use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+fn ca() -> (tempfile::TempDir, Arc<Vault>, CaService) {
+    let dir = tempdir().unwrap();
+    let v = Arc::new(
+        Vault::init(
+            &dir.path().join("v.db"),
+            KeyInput::Raw(crypto::random_key()),
+        )
+        .unwrap(),
+    );
+    let ca = CaService::init_or_load(v.clone()).unwrap();
+    (dir, v, ca)
+}
+
+fn roots(pem: &str) -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+        store
+            .add(CertificateDer::from(c.unwrap().to_vec()))
+            .unwrap();
+    }
+    store
+}
+
+/// In-memory TLS handshake: a client trusting `ca_pem` against a server using `server_cfg` for `host`.
+async fn handshake_raw(
+    server_cfg: Arc<rustls::ServerConfig>,
+    ca_pem: &str,
+    host: &str,
+) -> Result<(), String> {
+    let client_cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots(ca_pem))
+        .with_no_client_auth();
+    let (c, s) = tokio::io::duplex(8192);
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let server = tokio::spawn(async move {
+        let mut tls = acceptor.accept(s).await.map_err(|e| e.to_string())?;
+        tls.write_all(b"ok").await.map_err(|e| e.to_string())?;
+        tls.shutdown().await.ok();
+        Ok::<_, String>(())
+    });
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let mut tls = TlsConnector::from(Arc::new(client_cfg))
+        .connect(name, c)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.ok();
+    let _ = server.await;
+    Ok(())
+}
+
+async fn handshake(ca: &CaService, host: &str) -> Result<(), String> {
+    let cfg = ca.server_config_for(host).map_err(|e| e.to_string())?;
+    handshake_raw(cfg, &ca.cert_pem(), host).await
+}
+
+fn forged_server_config(
+    host: &str,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+) -> Arc<rustls::ServerConfig> {
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec![host.to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, ca_cert, ca_key)
+        .unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn leaf_for_allowed_domain_and_subdomain_verifies() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    handshake(&ca, "github.com").await.unwrap();
+    handshake(&ca, "api.github.com").await.unwrap();
+}
+
+#[tokio::test]
+async fn fresh_ca_is_never_unconstrained() {
+    let (_d, _v, ca) = ca();
+    assert!(!ca.is_host_permitted("github.com"));
+    assert!(ca.server_config_for("github.com").is_err());
+}
+
+#[tokio::test]
+async fn verifier_enforces_name_constraints_against_a_forged_leaf() {
+    // A CA constrained to github.com whose key is used to forge a leaf for evil.com: the client must refuse it.
+    let key = KeyPair::generate().unwrap();
+    let mut p = CertificateParams::default();
+    p.distinguished_name = DistinguishedName::new();
+    p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    p.name_constraints = Some(NameConstraints {
+        permitted_subtrees: vec![GeneralSubtree::DnsName("github.com".into())],
+        excluded_subtrees: vec![],
+    });
+    let ca_cert = p.self_signed(&key).unwrap();
+    let pem = ca_cert.pem();
+    // control: a leaf inside the constraint passes, so a failure below is caused by the constraint itself
+    handshake_raw(
+        forged_server_config("api.github.com", &ca_cert, &key),
+        &pem,
+        "api.github.com",
+    )
+    .await
+    .unwrap();
+    let err = handshake_raw(
+        forged_server_config("evil.com", &ca_cert, &key),
+        &pem,
+        "evil.com",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("NameConstraint"),
+        "refused for the wrong reason: {err}"
+    );
+}
+
+#[test]
+fn too_broad_domains_are_rejected() {
+    let (_d, _v, ca) = ca();
+    for bad in [
+        "com",
+        "",
+        "*.github.com",
+        "github.com/path",
+        "invalid",
+        "a b.com",
+        "10.0.0.1",
+    ] {
+        assert!(ca.allow_domain(bad).is_err(), "{bad:?}");
+    }
+    ca.allow_domain("localhost").unwrap();
+}
+
+#[test]
+fn allow_domain_keeps_the_same_key_and_persists() {
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    ca.allow_domain("gitlab.com").unwrap();
+    assert_eq!(
+        ca.domains(),
+        vec!["github.com".to_string(), "gitlab.com".to_string()]
+    );
+    let reloaded = CaService::init_or_load(v).unwrap();
+    assert_eq!(reloaded.domains(), ca.domains());
+    assert_eq!(reloaded.cert_pem(), ca.cert_pem());
+}
+
+#[test]
+fn private_key_is_not_stored_in_clear() {
+    let (_d, v, _ca) = ca();
+    let blob: Vec<u8> = v
+        .conn()
+        .query_row("SELECT key_enc FROM ca WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&blob).contains("PRIVATE KEY"));
+}
+
+// ---------- extra tests (gaps beyond the plan) ----------
+
+use x509_parser::prelude::*;
+
+fn pem_to_der(pem: &str) -> Vec<u8> {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap()
+        .to_vec()
+}
+
+/// Handshake and return the leaf certificate DER the client saw (client trusts `ca_pem`).
+async fn leaf_der(ca: &CaService, host: &str) -> Vec<u8> {
+    let cfg = ca.server_config_for(host).unwrap();
+    let client_cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots(&ca.cert_pem()))
+        .with_no_client_auth();
+    let (c, s) = tokio::io::duplex(8192);
+    let acceptor = TlsAcceptor::from(cfg);
+    let server = tokio::spawn(async move {
+        let mut tls = acceptor.accept(s).await.unwrap();
+        tls.write_all(b"ok").await.unwrap();
+        tls.shutdown().await.ok();
+    });
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let mut tls = TlsConnector::from(Arc::new(client_cfg))
+        .connect(name, c)
+        .await
+        .unwrap();
+    let der = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.ok();
+    let _ = server.await;
+    der
+}
+
+fn spki_of(pem: &str) -> Vec<u8> {
+    let der = pem_to_der(pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    cert.tbs_certificate.subject_pki.raw.to_vec()
+}
+
+fn permitted_dns(pem: &str) -> Vec<String> {
+    let der = pem_to_der(pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    let ext = cert
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_NAME_CONSTRAINTS)
+        .unwrap()
+        .expect("NameConstraints extension missing");
+    assert!(ext.critical, "NameConstraints must be critical");
+    match ext.parsed_extension() {
+        ParsedExtension::NameConstraints(nc) => {
+            assert!(nc.excluded_subtrees.is_none());
+            nc.permitted_subtrees
+                .as_ref()
+                .expect("no permitted subtrees")
+                .iter()
+                .map(|s| match s.base {
+                    GeneralName::DNSName(d) => d.to_string(),
+                    ref other => panic!("unexpected subtree {other:?}"),
+                })
+                .collect()
+        }
+        other => panic!("not parsed as NameConstraints: {other:?}"),
+    }
+}
+
+#[test]
+fn fresh_ca_certificate_contains_name_constraints_for_invalid_only() {
+    let (_d, _v, ca) = ca();
+    let pem = ca.cert_pem();
+    assert_eq!(permitted_dns(&pem), vec!["invalid".to_string()]);
+    // raw DER also carries the OID 2.5.29.30
+    assert!(pem_to_der(&pem).windows(3).any(|w| w == [0x55, 0x1d, 0x1e]));
+    let der = pem_to_der(&pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    let bc = cert.basic_constraints().unwrap().unwrap().value;
+    assert!(bc.ca);
+    assert_eq!(bc.path_len_constraint, Some(0));
+}
+
+#[test]
+fn allow_domain_updates_constraints_and_keeps_the_public_key() {
+    let (_d, _v, ca) = ca();
+    let before = ca.cert_pem();
+    let spki_before = spki_of(&before);
+    ca.allow_domain("github.com").unwrap();
+    ca.allow_domain("gitlab.com").unwrap();
+    let after = ca.cert_pem();
+    assert_ne!(before, after);
+    assert_eq!(
+        spki_before,
+        spki_of(&after),
+        "CA public key must not change"
+    );
+    assert_eq!(
+        permitted_dns(&after),
+        vec!["github.com".to_string(), "gitlab.com".to_string()]
+    );
+    // same subject
+    let (b, a) = (pem_to_der(&before), pem_to_der(&after));
+    let (_, cb) = X509Certificate::from_der(&b).unwrap();
+    let (_, ca_) = X509Certificate::from_der(&a).unwrap();
+    assert_eq!(cb.subject().as_raw(), ca_.subject().as_raw());
+    // idempotent: re-allowing does not re-issue
+    ca.allow_domain("github.com").unwrap();
+    assert_eq!(ca.cert_pem(), after);
+}
+
+#[tokio::test]
+async fn leaf_issued_before_allow_domain_still_verifies_against_the_reissued_ca() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let old_cfg = ca.server_config_for("api.github.com").unwrap();
+    ca.allow_domain("gitlab.com").unwrap();
+    // old leaf (signed by the old CA cert) against the NEW CA cert as trust anchor
+    handshake_raw(old_cfg, &ca.cert_pem(), "api.github.com")
+        .await
+        .unwrap();
+    // leaf for the newly allowed domain against the new certificate
+    handshake(&ca, "gitlab.com").await.unwrap();
+    // and a client that still trusts only the OLD certificate refuses the new domain
+}
+
+#[tokio::test]
+async fn old_ca_certificate_refuses_a_newly_allowed_domain() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let old_pem = ca.cert_pem();
+    ca.allow_domain("gitlab.com").unwrap();
+    let cfg = ca.server_config_for("gitlab.com").unwrap();
+    assert!(handshake_raw(cfg, &old_pem, "gitlab.com").await.is_err());
+}
+
+#[tokio::test]
+async fn forged_leaf_for_a_domain_outside_the_real_ca_constraints_is_refused() {
+    // Reproduce a leaked CA key: reload the real key, sign evil.com with it, client trusts the real CA cert.
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let key_enc: Vec<u8> = v
+        .conn()
+        .query_row("SELECT key_enc FROM ca WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    let key_pem = v.open_value(b"sg:ca-key", &key_enc).unwrap();
+    let key = KeyPair::from_pem(std::str::from_utf8(&key_pem).unwrap()).unwrap();
+    let mut p = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "Secret Guardian CA");
+    p.distinguished_name = dn;
+    p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let signer = p.self_signed(&key).unwrap();
+    assert!(handshake_raw(
+        forged_server_config("evil.com", &signer, &key),
+        &ca.cert_pem(),
+        "evil.com"
+    )
+    .await
+    .is_err());
+    assert!(handshake_raw(
+        forged_server_config("api.github.com", &signer, &key),
+        &ca.cert_pem(),
+        "api.github.com"
+    )
+    .await
+    .is_ok());
+}
+
+#[test]
+fn suffix_lookalikes_uppercase_ip_and_localhost_handling() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    for bad in [
+        "evilgithub.com",
+        "github.com.evil.com",
+        "xgithub.com",
+        "com",
+        "",
+        "127.0.0.1",
+        "[::1]",
+        "::1",
+        "github.com:443",
+        "api.github.com.evil.io",
+    ] {
+        assert!(!ca.is_host_permitted(bad), "{bad:?} must not be permitted");
+        assert!(
+            matches!(ca.server_config_for(bad), Err(CaError::NotPermitted)),
+            "{bad:?}"
+        );
+    }
+    assert!(ca.is_host_permitted("API.GitHub.COM"));
+    assert!(ca.server_config_for("API.GitHub.COM").is_ok());
+    assert!(!ca.is_host_permitted("localhost"));
+    ca.allow_domain("localhost").unwrap();
+    assert!(ca.is_host_permitted("localhost"));
+    assert!(ca.is_host_permitted("app.localhost"));
+    assert!(!ca.is_host_permitted("notlocalhost"));
+}
+
+#[tokio::test]
+async fn localhost_leaf_verifies_once_allowed() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("localhost").unwrap();
+    handshake(&ca, "localhost").await.unwrap();
+}
+
+#[tokio::test]
+async fn uppercase_host_yields_a_valid_leaf_and_shares_the_cache_entry() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let a = ca.server_config_for("api.github.com").unwrap();
+    let b = ca.server_config_for("API.GitHub.com").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    handshake(&ca, "API.GitHub.com").await.unwrap();
+}
+
+#[test]
+fn alpn_is_h2_then_http11() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let cfg = ca.server_config_for("github.com").unwrap();
+    assert_eq!(
+        cfg.alpn_protocols,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    );
+}
+
+#[tokio::test]
+async fn leaf_validity_is_about_24_hours_and_san_matches() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let der = leaf_der(&ca, "api.github.com").await;
+    let (_, leaf) = X509Certificate::from_der(&der).unwrap();
+    let nb = leaf.validity().not_before.timestamp();
+    let na = leaf.validity().not_after.timestamp();
+    let now = ::time::OffsetDateTime::now_utc().unix_timestamp();
+    let ttl_from_now = na - now;
+    assert!(
+        (23 * 3600..=25 * 3600).contains(&ttl_from_now),
+        "ttl {ttl_from_now}"
+    );
+    assert!(
+        nb <= now && now - nb <= 2 * 3600,
+        "not_before skew {}",
+        now - nb
+    );
+    let san = leaf.subject_alternative_name().unwrap().unwrap();
+    let names: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .map(|g| format!("{g:?}"))
+        .collect();
+    assert_eq!(names.len(), 1);
+    assert!(names[0].contains("api.github.com"));
+    let bc = leaf.basic_constraints().unwrap();
+    assert!(
+        bc.map(|b| !b.value.ca).unwrap_or(true),
+        "leaf must not be a CA"
+    );
+}
+
+#[tokio::test]
+async fn leaf_is_cached_and_cache_is_cleared_by_allow_domain() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let a = ca.server_config_for("github.com").unwrap();
+    let b = ca.server_config_for("github.com").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    ca.allow_domain("gitlab.com").unwrap();
+    let c = ca.server_config_for("github.com").unwrap();
+    assert!(!Arc::ptr_eq(&a, &c));
+}
+
+#[test]
+fn expired_cache_entry_returns_a_fresh_config() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    ca.set_leaf_cache_ttl(std::time::Duration::from_millis(30));
+    let a = ca.server_config_for("github.com").unwrap();
+    assert!(Arc::ptr_eq(
+        &a,
+        &ca.server_config_for("github.com").unwrap()
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let b = ca.server_config_for("github.com").unwrap();
+    assert!(!Arc::ptr_eq(&a, &b));
+}
+
+#[test]
+fn concurrent_requests_for_the_same_host_share_one_config() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let ca = Arc::new(ca);
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let ca = ca.clone();
+            std::thread::spawn(move || ca.server_config_for("api.github.com").unwrap())
+        })
+        .collect();
+    let cfgs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(cfgs.iter().all(|c| Arc::ptr_eq(c, &cfgs[0])));
+}
+
+#[test]
+fn concurrent_allow_domain_and_issuance_do_not_deadlock() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let ca = Arc::new(ca);
+    let mut hs = vec![];
+    for i in 0..4 {
+        let c = ca.clone();
+        hs.push(std::thread::spawn(move || {
+            for _ in 0..5 {
+                c.server_config_for("github.com").unwrap();
+            }
+            c.allow_domain(&format!("d{i}.example.com")).unwrap();
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert_eq!(ca.domains().len(), 5);
+}
+
+#[test]
+fn more_invalid_domains_are_rejected() {
+    let (_d, _v, ca) = ca();
+    for bad in [
+        "GitHub.com",
+        ".github.com",
+        "github.com.",
+        "a..b.com",
+        "x.invalid",
+        "1.2.3.4",
+        "münchen.de",
+        "a_b.com",
+    ] {
+        assert!(ca.allow_domain(bad).is_err(), "{bad:?}");
+    }
+    assert!(ca.domains().is_empty());
+    assert_eq!(permitted_dns(&ca.cert_pem()), vec!["invalid".to_string()]);
+}
+
+#[test]
+fn private_key_is_not_recoverable_from_the_db_without_the_vault_key() {
+    let (dir, v, _ca) = ca();
+    let blob: Vec<u8> = v
+        .conn()
+        .query_row("SELECT key_enc FROM ca WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    // wrong AAD / tampered blob fail to open
+    assert!(v.open_value(b"other", &blob).is_err());
+    let mut bad = blob.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert!(v.open_value(b"sg:ca-key", &bad).is_err());
+    // a vault opened with a different key cannot decrypt it, and the raw file holds no PEM marker
+    drop(v);
+    let raw = std::fs::read(dir.path().join("v.db")).unwrap();
+    assert!(!raw.windows(11).any(|w| w == b"PRIVATE KEY"));
+    assert!(Vault::open(
+        &dir.path().join("v.db"),
+        KeyInput::Raw(crypto::random_key())
+    )
+    .is_err());
+}
+
+#[test]
+fn reload_after_allow_domain_still_signs_valid_leaves() {
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let reloaded = CaService::init_or_load(v).unwrap();
+    assert!(reloaded.server_config_for("api.github.com").is_ok());
+}
