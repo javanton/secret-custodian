@@ -232,3 +232,78 @@ fn wal_and_shm_files_are_private_while_open() {
     assert!(seen > 0, "expected WAL side files while vault is open");
     drop(v);
 }
+
+#[test]
+fn open_missing_path_errors_and_creates_nothing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("missing.db");
+    let err = Vault::open(&path, raw(&crypto::random_key()))
+        .err()
+        .unwrap();
+    match err {
+        CoreError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn open_or_init_still_creates_missing_vault() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("new.db");
+    let key = crypto::random_key();
+    Vault::open_or_init(&path, raw(&key)).unwrap();
+    Vault::open_or_init(&path, raw(&key)).unwrap();
+}
+
+fn set_schema_version(path: &std::path::Path, value: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        [value.as_bytes()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn unsupported_schema_version_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let key = crypto::random_key();
+    Vault::init(&path, raw(&key)).unwrap();
+    set_schema_version(&path, "2");
+    let err = Vault::open(&path, raw(&key)).err().unwrap();
+    assert!(matches!(
+        err,
+        CoreError::UnsupportedSchema {
+            found: 2,
+            supported: 1
+        }
+    ));
+    assert_eq!(
+        err.to_string(),
+        "database schema version 2 is not supported by this build (supports 1)"
+    );
+}
+
+#[test]
+fn non_numeric_schema_version_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let key = crypto::random_key();
+    Vault::init(&path, raw(&key)).unwrap();
+    set_schema_version(&path, "abc");
+    assert!(Vault::open(&path, raw(&key)).is_err());
+}
+
+#[test]
+fn wrong_key_on_unsupported_schema_still_reports_wrong_key() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    set_schema_version(&path, "2");
+    let err = Vault::open(&path, raw(&crypto::random_key()))
+        .err()
+        .unwrap();
+    assert!(matches!(err, CoreError::WrongKey));
+}

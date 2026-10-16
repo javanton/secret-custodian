@@ -1,7 +1,7 @@
 use crate::crypto::{self, Key32};
 use crate::error::CoreError;
 use crate::schema::{SCHEMA, SCHEMA_VERSION};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -96,7 +96,11 @@ impl Vault {
     }
 
     pub fn open(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
-        let conn = Connection::open(path)?;
+        if !path.try_exists()? {
+            return Err(CoreError::Io(std::io::ErrorKind::NotFound.into()));
+        }
+        // No CREATE flag: opening must never create a file.
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let kdf = meta_get(&conn, "kdf")?;
         let kek = match (kdf.as_slice(), key) {
@@ -115,6 +119,20 @@ impl Vault {
             .as_slice()
             .try_into()
             .map_err(|_| CoreError::WrongKey)?;
+        // Checked only after the key is verified, so a wrong key never learns the version.
+        let found: i64 = std::str::from_utf8(&meta_get(&conn, "schema_version")?)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or(CoreError::UnsupportedSchema {
+                found: -1,
+                supported: SCHEMA_VERSION,
+            })?;
+        if found != SCHEMA_VERSION {
+            return Err(CoreError::UnsupportedSchema {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             dek: Zeroizing::new(dek),

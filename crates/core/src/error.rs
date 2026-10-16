@@ -4,6 +4,10 @@ pub enum CoreError {
     WrongKey,
     #[error("the vault was created with a different key source")]
     KeySourceMismatch,
+    #[error(
+        "database schema version {found} is not supported by this build (supports {supported})"
+    )]
+    UnsupportedSchema { found: i64, supported: i64 },
     #[error("invalid key material")]
     InvalidKey,
     #[error("invalid secret value: {0}")]
