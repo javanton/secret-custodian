@@ -84,66 +84,6 @@ pub fn normalize_path(path: &str) -> String {
     out
 }
 
-fn decode_all_once(input: &[u8]) -> Vec<u8> {
-    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(input[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Strict view of a path, used ONLY for matching (the proxy forwards `normalize_path`).
-/// Repeatedly percent-decodes everything (cap 8 rounds), maps `\` to `/`, strips `;params`
-/// from each segment, then resolves `.`/`..` and collapses `//`. `None` means the path cannot
-/// be judged safely (NUL, invalid UTF-8, or encoding that never stabilises).
-pub fn strict_path(p: &str) -> Option<String> {
-    let mut cur = p.as_bytes().to_vec();
-    let mut stable = false;
-    for _ in 0..8 {
-        let next = decode_all_once(&cur);
-        if next == cur {
-            stable = true;
-            break;
-        }
-        cur = next;
-    }
-    if !stable {
-        return None;
-    }
-    let text = String::from_utf8(cur).ok()?;
-    if text.contains('\0') {
-        return None;
-    }
-    let text = text.replace('\\', "/");
-    let mut segs: Vec<&str> = Vec::new();
-    for raw in text.split('/') {
-        let seg = raw.split(';').next().unwrap_or("");
-        match seg {
-            "" | "." => {}
-            ".." => {
-                segs.pop();
-            }
-            _ => segs.push(seg),
-        }
-    }
-    let mut out = String::from("/");
-    out.push_str(&segs.join("/"));
-    if text.ends_with('/') && out != "/" {
-        out.push('/');
-    }
-    Some(out)
-}
-
 const MAX_DECODE_ROUNDS: usize = 8;
 
 /// One percent-decoding round. `first` is the round applied to the raw path: there a `%` that is
@@ -203,110 +143,70 @@ pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
     None
 }
 
-fn strip_params(s: &str) -> String {
-    s.split('/')
-        .map(|seg| seg.split(';').next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("/")
+/// Longest path (bytes) a restricted rule will judge; anything longer is unjudgeable.
+pub(crate) const MAX_JUDGED_PATH_LEN: usize = 8192;
+
+/// Look-alikes of `.` and `/` that some origins fold to the ASCII character.
+const CONFUSABLES: [char; 12] = [
+    '\u{2024}', '\u{2025}', '\u{2026}', '\u{FE52}', '\u{FF0E}', '\u{FF61}', '\u{2044}', '\u{2215}',
+    '\u{2216}', '\u{29F8}', '\u{FF0F}', '\u{FF3C}',
+];
+
+/// Control characters (C0, DEL) and confusables: never judgeable.
+fn has_forbidden_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_ascii_control() || CONFUSABLES.contains(&c))
 }
 
-fn cut_query(s: &str) -> &str {
-    s.find(['?', '#']).map_or(s, |i| &s[..i])
+/// A segment such as `.`, `..`, `...`, `.. `: non-empty, has a `.`, only dots, spaces and tabs.
+fn is_dot_like(seg: &str) -> bool {
+    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t'))
 }
 
-/// Resolves `.`/`..` and collapses `//` (trailing slash kept), without any decoding.
-fn resolve(s: &str) -> String {
-    let mut segs: Vec<&str> = Vec::new();
-    for seg in s.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                segs.pop();
-            }
-            x => segs.push(x),
-        }
-    }
-    let mut out = String::from("/");
-    out.push_str(&segs.join("/"));
-    if s.ends_with('/') && out != "/" {
-        out.push('/');
-    }
-    out
+/// True when any segment is dot-like under EVERY separator model at once (`/ \ ; ? #`), so that
+/// resolving dot segments is the identity however an origin splits the path.
+fn has_dot_segment(s: &str) -> bool {
+    s.split(['/', '\\', ';', '?', '#']).any(is_dot_like)
 }
 
-fn is_special(s: &str) -> bool {
-    s.contains(['?', '#', ';', '\\'])
+/// Every reading `R_0..R_n` (percent-decoded 0..n times, until stable) of a path, used ONLY for
+/// matching a restricted rule (the proxy forwards `normalize_path`). `None` means the path
+/// cannot be judged: too long, undecodable, or some reading holds a control character, a
+/// confusable, or a dot segment under any separator model. When this returns `Some`, there is
+/// nothing to resolve, so no ordering of origin operations (decode, `;` strip, `?`/`#` cut,
+/// `\` mapping, dot resolution) can move the request out of a prefix.
+pub(crate) fn judge_readings(p: &str) -> Option<Vec<String>> {
+    if p.len() > MAX_JUDGED_PATH_LEN {
+        return None;
+    }
+    let chain = decode_chain(p)?;
+    if chain
+        .iter()
+        .any(|c| has_forbidden_char(c) || has_dot_segment(c))
+    {
+        return None;
+    }
+    Some(chain)
 }
 
-/// Every plausible reading of a path (or path pattern), used ONLY for matching.
-pub(crate) struct PathView {
-    chain: Vec<String>,
-    /// Chain of the path with `;params` stripped BEFORE decoding; `None` when that is a no-op.
-    pre: Option<Vec<String>>,
+/// Pattern prefix/body readings: decoded until stable (same cap as paths).
+pub(crate) fn pattern_readings(body: &str) -> Option<Vec<String>> {
+    decode_chain(body)
 }
 
-impl PathView {
-    pub(crate) fn new(s: &str) -> Option<Self> {
-        let chain = decode_chain(s)?;
-        let stripped = strip_params(s);
-        let pre = if stripped == s {
-            None
-        } else {
-            Some(decode_chain(&stripped)?)
-        };
-        Some(PathView { chain, pre })
-    }
-
-    pub(crate) fn depths(&self) -> usize {
-        self.chain.len().max(self.pre.as_ref().map_or(0, Vec::len))
-    }
-
-    /// True when the parsing variants (query cut, `;` strip, `\` mapping) can differ from the plain reading.
-    pub(crate) fn needs_variants(&self) -> bool {
-        self.pre.is_some() || self.chain.iter().any(|c| is_special(c))
-    }
-
-    /// Readings at one decoding depth, in a fixed order. Two views produce aligned lists when asked
-    /// for the same `depth`/`full`: reading N of a path is compared with reading N of the pattern.
-    pub(crate) fn readings_at(&self, depth: usize, full: bool) -> Vec<String> {
-        let at = |c: &Vec<String>| c[depth.min(c.len() - 1)].clone();
-        let r = at(&self.chain);
-        if !full {
-            return vec![resolve(&r)];
-        }
-        let pre = at(self.pre.as_ref().unwrap_or(&self.chain));
-        let mut out = Vec::with_capacity(14);
-        for slash in [false, true] {
-            let map = |x: &str| {
-                if slash {
-                    x.replace('\\', "/")
-                } else {
-                    x.to_string()
-                }
-            };
-            let t = map(&r);
-            out.push(resolve(&t));
-            out.push(resolve(cut_query(&t)));
-            out.push(resolve(&strip_params(&t)));
-            out.push(resolve(&strip_params(cut_query(&t))));
-            out.push(resolve(cut_query(&strip_params(&t))));
-            let u = map(&pre);
-            out.push(resolve(&u));
-            out.push(resolve(cut_query(&u)));
-        }
-        out
-    }
-}
-
-/// True when a path PATTERN could widen itself: at any decoding depth its text contains a `.`/`..`
-/// segment, `;`, `\`, `?`, `#` or NUL, or it cannot be decoded safely.
+/// True when a path PATTERN could widen itself: at any decoding depth its text contains `;`,
+/// `\`, `?`, `#`, NUL or any control character, a confusable, or a dot segment (under any
+/// separator model), or it cannot be decoded safely or is too long.
 pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
+    if body.len() > MAX_JUDGED_PATH_LEN {
+        return true;
+    }
     let Some(chain) = decode_chain(body) else {
         return true;
     };
-    chain.iter().any(|c| {
-        c.contains([';', '\\', '?', '#', '\0']) || c.split('/').any(|s| s == "." || s == "..")
-    })
+    chain
+        .iter()
+        .any(|c| c.contains([';', '\\', '?', '#']) || has_forbidden_char(c) || has_dot_segment(c))
 }
 
 #[cfg(test)]
@@ -433,47 +333,5 @@ mod tests {
             let once = normalize_path(p);
             assert_eq!(normalize_path(&once), once, "not idempotent for {p:?}");
         }
-    }
-
-    #[test]
-    fn strict_path_decodes_everything_and_resolves_dots() {
-        assert_eq!(strict_path("/repos/..%2fadmin").as_deref(), Some("/admin"));
-        assert_eq!(strict_path("/repos/..%2Fadmin").as_deref(), Some("/admin"));
-        assert_eq!(
-            strict_path("/repos/%2e%2e%2fadmin").as_deref(),
-            Some("/admin")
-        );
-        assert_eq!(strict_path("/repos/..%5cadmin").as_deref(), Some("/admin"));
-        assert_eq!(strict_path("/repos/..\\admin").as_deref(), Some("/admin"));
-        assert_eq!(strict_path("/repos/..;/admin").as_deref(), Some("/admin"));
-        assert_eq!(
-            strict_path("/repos/%2e%2e;x/admin").as_deref(),
-            Some("/admin")
-        );
-        assert_eq!(
-            strict_path("/repos/%252e%252e%252fadmin").as_deref(),
-            Some("/admin")
-        );
-        assert_eq!(
-            strict_path("/repos/..%252fadmin").as_deref(),
-            Some("/admin")
-        );
-        assert_eq!(strict_path("/a%2Fb").as_deref(), Some("/a/b"));
-        assert_eq!(strict_path("/a;x=1/b/").as_deref(), Some("/a/b/"));
-        assert_eq!(strict_path("//a///b").as_deref(), Some("/a/b"));
-        assert_eq!(strict_path("").as_deref(), Some("/"));
-    }
-
-    #[test]
-    fn strict_path_gives_up_on_nul_bad_utf8_and_deep_encoding() {
-        assert_eq!(strict_path("/repos/%00"), None);
-        assert_eq!(strict_path("/repos/%2500"), None);
-        assert_eq!(strict_path("/repos/%ff"), None);
-        // 9 layers of encoding never stabilise within the cap.
-        let mut s = String::from("/a/%2e");
-        for _ in 0..9 {
-            s = s.replace('%', "%25");
-        }
-        assert_eq!(strict_path(&s), None);
     }
 }

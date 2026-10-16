@@ -308,6 +308,16 @@ fn path_pattern_validation_is_strict() {
         "/a/%252e%252e/b/*",
         "/a%3Bx",
         "/a%255Cb",
+        "/a/%E2%80%A5/b",
+        "/a/%EF%BC%8E/b",
+        "/a/\u{2025}/b",
+        "/a/\u{2215}b/*",
+        "/a/%20../b",
+        "/a/.../b",
+        "/a/.%20/b",
+        "/a%0Ab",
+        "/a%7Fb",
+        "/a/\u{FF3C}b",
     ] {
         bad(p);
     }

@@ -1,5 +1,6 @@
 use crate::model::{InjectionKind, Rule};
-use crate::normalize::PathView;
+use crate::normalize::{judge_readings, pattern_readings};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 pub enum Decision<'a> {
@@ -22,33 +23,35 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// Path matching on ALL readings: every percent-decoding depth (0..=8) crossed with every parsing
-/// variant (query cut, `;` strip, `\` as `/`). EVERY reading of the path must match the reading of
-/// the pattern at the same position. `*` matches everything. An unjudgeable path (`view` is
-/// `None`) or pattern matches no other pattern.
-fn path_matches(pattern: &str, path: &PathView) -> bool {
+/// Path matching, closed by construction. `readings` are the judged readings `R_0..R_n` of the
+/// request path (`judge_readings`; `None` = unjudgeable, never matches a restricted rule). They
+/// contain no dot segment under any separator model, so there is nothing for an origin to
+/// resolve. A prefix pattern then needs `R_d` to start with the pattern prefix decoded `d` times
+/// (its fixed point past its own chain), an exact pattern needs equality at every depth. `*`
+/// matches everything.
+fn path_matches(pattern: &str, readings: Option<&[String]>) -> bool {
     if pattern == "*" {
         return true;
     }
+    let Some(readings) = readings else {
+        return false;
+    };
     let (body, prefix) = match pattern.strip_suffix('*') {
         Some(p) => (p, true),
         None => (pattern, false),
     };
-    let Some(pat) = PathView::new(body) else {
+    let Some(pat) = pattern_readings(body) else {
         return false;
     };
-    let depths = path.depths().max(pat.depths());
-    let full = path.needs_variants() || pat.needs_variants();
+    let depths = readings.len().max(pat.len());
     (0..depths).all(|d| {
-        let want = pat.readings_at(d, full);
-        let got = path.readings_at(d, full);
-        got.iter().zip(&want).all(|(g, w)| {
-            if prefix {
-                g.starts_with(w.as_str())
-            } else {
-                g == w
-            }
-        })
+        let got = &readings[d.min(readings.len() - 1)];
+        let want = &pat[d.min(pat.len() - 1)];
+        if prefix {
+            got.starts_with(want.as_str())
+        } else {
+            got == want
+        }
     })
 }
 
@@ -74,16 +77,18 @@ pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> 
     if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
     }
-    let view = PathView::new(path);
+    // Judged lazily and once per call, only if a host-matching rule is path-restricted.
+    let judged: OnceCell<Option<Vec<String>>> = OnceCell::new();
     // Candidates match host and path (both views); methods are applied only AFTER the
     // specificity comparison so a narrower rule is never shadowed by a broader one.
     let mut groups: HashMap<(InjectionKind, String), Vec<&Rule>> = HashMap::new();
     for r in rules {
         if host_matches(&r.host_pattern, host)
             && (r.path_pattern == "*"
-                || view
-                    .as_ref()
-                    .is_some_and(|v| path_matches(&r.path_pattern, v)))
+                || path_matches(
+                    &r.path_pattern,
+                    judged.get_or_init(|| judge_readings(path)).as_deref(),
+                ))
         {
             groups
                 .entry((r.kind, r.target_name.to_ascii_lowercase()))
@@ -577,52 +582,43 @@ mod tests {
         }
     }
 
-    /// Every way an origin might read `p`; returns the resolved paths.
-    fn oracle_views(p: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for depth in 0..=3 {
-            for strip_mode in 0..3 {
-                for cut in [false, true] {
-                    for slash in [false, true] {
-                        let mut s = p.to_string();
-                        if strip_mode == 1 {
-                            s = oracle_strip(&s);
-                        }
-                        let mut ok = true;
-                        for _ in 0..depth {
-                            match oracle_decode(&s) {
-                                Some(d) => s = d,
-                                None => ok = false,
-                            }
-                        }
-                        if !ok {
-                            continue;
-                        }
-                        if strip_mode == 2 {
-                            s = oracle_strip(&s);
-                        }
-                        if cut {
-                            if let Some(i) = s.find(['?', '#']) {
-                                s.truncate(i);
-                            }
-                        }
-                        if slash {
-                            s = s.replace('\\', "/");
-                        }
-                        out.push(oracle_resolve(&s));
-                    }
+    /// Applies EVERY sequence of up to `ops_left` operations (decode once, strip `;` params per
+    /// segment, cut at the first `?`/`#`, map `\` to `/`; any order, repetition allowed, at most 3
+    /// decodings) to `cur`, resolves dot segments after each prefix of the sequence, and returns
+    /// the first resolved reading that leaves `/repos/`.
+    fn oracle_escape(cur: &str, ops_left: usize, decodes: usize) -> Option<String> {
+        let resolved = oracle_resolve(cur);
+        if !resolved.starts_with("/repos/") {
+            return Some(resolved);
+        }
+        if ops_left == 0 {
+            return None;
+        }
+        if decodes < 3 {
+            if let Some(d) = oracle_decode(cur) {
+                if let Some(e) = oracle_escape(&d, ops_left - 1, decodes + 1) {
+                    return Some(e);
                 }
             }
         }
-        out
+        let stripped = oracle_strip(cur);
+        if let Some(e) = oracle_escape(&stripped, ops_left - 1, decodes) {
+            return Some(e);
+        }
+        let cut = cur.find(['?', '#']).map_or(cur, |i| &cur[..i]);
+        if let Some(e) = oracle_escape(cut, ops_left - 1, decodes) {
+            return Some(e);
+        }
+        oracle_escape(&cur.replace('\\', "/"), ops_left - 1, decodes)
     }
 
     #[test]
     fn oracle_sanity() {
-        assert!(oracle_views("/repos/..%2Fadmin")
-            .iter()
-            .any(|v| v == "/admin"));
-        assert!(oracle_views("/repos/x").iter().all(|v| v == "/repos/x"));
+        assert!(oracle_escape("/repos/..%2Fadmin", 5, 0).is_some());
+        assert!(oracle_escape("/repos/..%252Fadmin", 5, 0).is_some());
+        assert!(oracle_escape("/repos/a;%2Fk/..%3B/..%3B/admin", 5, 0).is_some());
+        assert!(oracle_escape("/repos/x", 5, 0).is_none());
+        assert!(oracle_escape("/repos/a%2Fb", 5, 0).is_none());
     }
 
     fn walk(
@@ -639,10 +635,8 @@ mod tests {
                 Decision::Inject(_)
             ) {
                 count.1 += 1;
-                for v in oracle_views(cur) {
-                    if !v.starts_with("/repos/") {
-                        return Some(format!("{cur:?} injects but an origin reads {v:?}"));
-                    }
+                if let Some(v) = oracle_escape(cur, 5, 0) {
+                    return Some(format!("{cur:?} injects but an origin reads {v:?}"));
                 }
             }
         }
@@ -661,7 +655,7 @@ mod tests {
         None
     }
 
-    fn run_exhaustive(max_len: usize, min_paths: u64) {
+    fn run_exhaustive(toks: &[&str], max_len: usize, min_paths: u64) {
         let rules = [rule(
             1,
             "api.github.com",
@@ -670,11 +664,8 @@ mod tests {
             Header,
             "Authorization",
         )];
-        let toks = [
-            "/repos/", "x", "..", ".", "%2F", "%252F", ";", "\\", "%3F", "/",
-        ];
         let mut count = (0, 0);
-        let r = walk(&rules, &toks, max_len, &mut String::new(), &mut count);
+        let r = walk(&rules, toks, max_len, &mut String::new(), &mut count);
         assert!(r.is_none(), "{}", r.unwrap());
         assert!(count.0 >= min_paths, "enumerated only {}", count.0);
         assert!(
@@ -684,17 +675,96 @@ mod tests {
         );
     }
 
-    /// Quick run (about 11k paths), part of the normal suite.
+    const TOKENS: [&str; 17] = [
+        "/repos/", "x", "..", ".", "%2F", "%2f", "%252F", ";", "%3B", "\\", "%5C", "%3F", "%23",
+        "%2e", "%252e", "%20", "/",
+    ];
+
+    /// Quick run (token length 3, about 5k paths), part of the normal suite.
     #[test]
     fn exhaustive_prefix_rule_never_authorizes_an_escaping_path() {
-        run_exhaustive(4, 10_000);
+        run_exhaustive(&TOKENS, 3, 4_000);
     }
 
-    /// Full run (about 1.1M paths). Run in /ship: `cargo test -p sg-policy --release -- --include-ignored`.
+    /// Full run (token length 5, about 1.5M paths). Run in /ship:
+    /// `cargo test -p sg-policy --release -- --include-ignored`.
     #[test]
     #[ignore = "slow: run with --release -- --include-ignored"]
     fn exhaustive_prefix_rule_never_authorizes_an_escaping_path_full() {
-        run_exhaustive(6, 1_000_000);
+        run_exhaustive(&TOKENS, 5, 1_000_000);
+    }
+
+    #[test]
+    fn closed_by_construction_regressions_are_forbidden() {
+        let mut bypasses: Vec<&str> = Vec::new();
+        let rules = [rule(
+            1,
+            "api.github.com",
+            "/repos/*",
+            &["GET"],
+            Header,
+            "Authorization",
+        )];
+        for raw in [
+            "/repos/a\\..%3B\\k/../admin",
+            "/repos/a;%2Fk/..%3B/..%3B/admin",
+            "/repos/..%2f",
+            "/repos/%2e%2e%2f",
+            "/repos/..%5c",
+            "/repos/..\\",
+            "/repos/..;/",
+            "/repos/%252e%252e%252f",
+            "/repos/%00",
+            "/repos/x%252F..%252F..%252Frepos%252Fz%252Fw%2F..%2F..%2Fadmin",
+            "/repos/..;%2Frepos%2Fx/..;/admin",
+            "/repos/..%2F..%2Fadmin%3F%2F..%2F..%2Frepos%2Fy",
+            "/repos/%u002e%u002e",
+            "/repos/..%20/admin",
+            "/repos/.../admin",
+            "/repos/%E2%80%A5/admin",
+            "/repos/%EF%BC%8E%EF%BC%8E/admin",
+            "/repos/a%09b",
+            "/repos/a%0Ab",
+            "/repos/a%7Fb",
+            "/repos/a%2F..%2Fb",
+            "/repos/%2e%2e",
+        ] {
+            if ids(evaluate(&rules, "api.github.com", "GET", raw)) != vec![-1] {
+                bypasses.push(raw);
+            }
+        }
+        assert!(bypasses.is_empty(), "bypasses: {bypasses:?}");
+    }
+
+    #[test]
+    fn the_oracle_finds_an_escape_in_each_witness() {
+        for raw in [
+            "/repos/a\\..%3B\\k/../admin",
+            "/repos/a;%2Fk/..%3B/..%3B/admin",
+        ] {
+            assert!(oracle_escape(raw, 5, 0).is_some(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn oversized_paths_are_forbidden_quickly_and_the_cap_is_inclusive() {
+        let rules = [
+            rule(1, "a.com", "/repos/*", &[], Header, "A"),
+            rule(2, "a.com", "/repos/a/*", &[], Header, "B"),
+        ];
+        let huge = format!("/repos/{}", "a%2F".repeat(16 * 1024));
+        assert!(huge.len() > 64 * 1024);
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", &huge)), vec![-1]);
+        let mut ok = String::from("/repos/");
+        while ok.len() < 8192 {
+            ok.push('a');
+        }
+        assert_eq!(ok.len(), 8192);
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", &ok)), vec![1]);
+        ok.push('a');
+        assert_eq!(ids(evaluate(&rules, "a.com", "GET", &ok)), vec![-1]);
+        let star = [rule(1, "a.com", "*", &[], Header, "A")];
+        assert_eq!(ids(evaluate(&star, "a.com", "GET", &huge)), vec![1]);
     }
 
     #[test]
