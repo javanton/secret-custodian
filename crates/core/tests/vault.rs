@@ -167,3 +167,68 @@ fn too_long_value_is_rejected_and_secret_cannot_move_between_rows() {
     }
     assert!(v.reveal_for_injection(b.id).is_err());
 }
+
+#[test]
+fn rotate_rejects_bad_values() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    v.add_secret("s", "ok").unwrap();
+    for bad in ["a\r\nX-Evil: 1", "a\nb", "a\rb", "a\0b", ""] {
+        assert!(
+            matches!(
+                v.rotate_secret("s", bad),
+                Err(CoreError::InvalidSecretValue(_))
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_key_vault_rejects_passphrase() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("r.db");
+    Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    assert!(matches!(
+        Vault::open(&path, KeyInput::Passphrase("pw".into()))
+            .err()
+            .unwrap(),
+        CoreError::KeySourceMismatch
+    ));
+}
+
+#[test]
+fn value_length_boundary_is_8192() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    v.add_secret("ok", &"a".repeat(8192)).unwrap();
+    assert!(matches!(
+        v.add_secret("big", &"a".repeat(8193)),
+        Err(CoreError::InvalidSecretValue(_))
+    ));
+    v.rotate_secret("ok", &"b".repeat(8192)).unwrap();
+    assert!(matches!(
+        v.rotate_secret("ok", &"b".repeat(8193)),
+        Err(CoreError::InvalidSecretValue(_))
+    ));
+}
+
+#[test]
+fn wal_and_shm_files_are_private_while_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let v = Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    v.add_secret("tok", "x").unwrap();
+    let mut seen = 0;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.clone().into_os_string();
+        name.push(suffix);
+        if let Ok(m) = std::fs::metadata(&name) {
+            seen += 1;
+            assert_eq!(m.permissions().mode() & 0o777, 0o600, "{suffix}");
+        }
+    }
+    assert!(seen > 0, "expected WAL side files while vault is open");
+    drop(v);
+}

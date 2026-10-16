@@ -1,5 +1,5 @@
 use crate::{error::CoreError, now, vault::Vault};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -52,6 +52,35 @@ fn row_meta(r: &rusqlite::Row) -> rusqlite::Result<SecretMeta> {
     })
 }
 
+fn lookup(conn: &Connection, name: &str) -> Result<SecretMeta, CoreError> {
+    conn.query_row(
+        "SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1",
+        [name],
+        row_meta,
+    )
+    .optional()?
+    .ok_or(CoreError::NotFound)
+}
+
+fn update_value(conn: &Connection, id: i64, blob: &[u8], ts: i64) -> Result<(), CoreError> {
+    let n = conn.execute(
+        "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
+        params![blob, ts, id],
+    )?;
+    if n == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
+fn delete_by_id(conn: &Connection, id: i64) -> Result<(), CoreError> {
+    let n = conn.execute("DELETE FROM secrets WHERE id = ?1", [id])?;
+    if n == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
 impl Vault {
     pub fn add_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_name(name)?;
@@ -87,15 +116,15 @@ impl Vault {
 
     pub fn rotate_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_secret_value(value)?;
-        let meta = self.get_secret_meta(name)?;
+        // One guard for lookup and write so the row cannot vanish in between.
+        let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let ts = now();
-        self.conn().execute(
-            "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
-            params![
-                self.seal_value(&aad(meta.id), value.as_bytes()),
-                ts,
-                meta.id
-            ],
+        update_value(
+            &conn,
+            meta.id,
+            &self.seal_value(&aad(meta.id), value.as_bytes()),
+            ts,
         )?;
         Ok(SecretMeta {
             rotated_at: Some(ts),
@@ -104,8 +133,8 @@ impl Vault {
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<(), CoreError> {
-        let meta = self.get_secret_meta(name)?;
         let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let used: i64 = conn.query_row(
             "SELECT COUNT(*) FROM rules WHERE secret_id = ?1",
             [meta.id],
@@ -114,8 +143,7 @@ impl Vault {
         if used > 0 {
             return Err(CoreError::InUse);
         }
-        conn.execute("DELETE FROM secrets WHERE id = ?1", [meta.id])?;
-        Ok(())
+        delete_by_id(&conn, meta.id)
     }
 
     pub fn list_secrets(&self) -> Result<Vec<SecretMeta>, CoreError> {
@@ -127,14 +155,7 @@ impl Vault {
     }
 
     pub fn get_secret_meta(&self, name: &str) -> Result<SecretMeta, CoreError> {
-        self.conn()
-            .query_row(
-                "SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1",
-                [name],
-                row_meta,
-            )
-            .optional()?
-            .ok_or(CoreError::NotFound)
+        lookup(&self.conn(), name)
     }
 
     /// Decrypts a secret for injection. ONLY the proxy may call this; no admin API, CLI or web path may.
@@ -149,5 +170,35 @@ impl Vault {
         let bytes = self.open_value(&aad(id), &blob)?;
         let s = String::from_utf8(bytes.to_vec()).map_err(|_| CoreError::Crypto)?;
         Ok(Zeroizing::new(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{crypto, vault::KeyInput};
+
+    fn vault() -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crypto::random_key();
+        let v = Vault::init(&dir.path().join("v.db"), KeyInput::Raw(key)).unwrap();
+        (dir, v)
+    }
+
+    #[test]
+    fn update_and_delete_by_id_report_not_found_when_row_vanished() {
+        let (_d, v) = vault();
+        let meta = v.add_secret("a", "x").unwrap();
+        let conn = v.conn();
+        conn.execute("DELETE FROM secrets WHERE id = ?1", [meta.id])
+            .unwrap();
+        assert!(matches!(
+            update_value(&conn, meta.id, b"blob", 1),
+            Err(CoreError::NotFound)
+        ));
+        assert!(matches!(
+            delete_by_id(&conn, meta.id),
+            Err(CoreError::NotFound)
+        ));
     }
 }

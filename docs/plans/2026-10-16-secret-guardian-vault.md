@@ -584,6 +584,14 @@ use zeroize::Zeroizing;
 
 const DEK_AAD: &[u8] = b"sg:dek";
 
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 fn meta_get(conn: &Connection, key: &str) -> Result<Vec<u8>, CoreError> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
         .optional()?
@@ -602,7 +610,25 @@ pub struct Vault {
 
 impl Vault {
     pub fn init(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
+        Self::init_with(path, key, |_| Ok(()))
+    }
+
+    /// `before_commit` runs inside the init transaction; tests use it to inject a failure.
+    fn init_with(
+        path: &Path,
+        key: KeyInput,
+        before_commit: impl FnOnce(&Connection) -> Result<(), CoreError>,
+    ) -> Result<Self, CoreError> {
         std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        // Any failure after the file exists removes path, path-wal and path-shm.
+        Self::init_created(path, key, before_commit).inspect_err(|_| remove_db_files(path))
+    }
+
+    fn init_created(
+        path: &Path,
+        key: KeyInput,
+        before_commit: impl FnOnce(&Connection) -> Result<(), CoreError>,
+    ) -> Result<Self, CoreError> {
         let (kdf, salt, kek) = match key {
             KeyInput::Raw(k) => ("raw", Vec::new(), k),
             KeyInput::Passphrase(p) => {
@@ -612,16 +638,21 @@ impl Vault {
         };
         let dek = crypto::random_key();
         let wrapped = crypto::seal(&kek, DEK_AAD, &*dek);
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        let mut put = conn.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
-        put.execute(params!["schema_version", SCHEMA_VERSION.to_string().into_bytes()])?;
-        put.execute(params!["kdf", kdf.as_bytes()])?;
-        put.execute(params!["salt", salt])?;
-        put.execute(params!["dek_wrapped", wrapped])?;
-        drop(put);
+        // Schema and meta rows land atomically.
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        {
+            let mut put = tx.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
+            put.execute(params!["schema_version", SCHEMA_VERSION.to_string().into_bytes()])?;
+            put.execute(params!["kdf", kdf.as_bytes()])?;
+            put.execute(params!["salt", salt])?;
+            put.execute(params!["dek_wrapped", wrapped])?;
+        }
+        before_commit(&tx)?;
+        tx.commit()?;
         Ok(Self { conn: Mutex::new(conn), dek })
     }
 
@@ -648,7 +679,9 @@ impl Vault {
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("vault mutex poisoned")
+        // Recover from poisoning: rusqlite rolls back any open transaction when it is dropped
+        // during unwinding, so a panic cannot leave a half-applied write behind.
+        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn seal_value(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -705,6 +738,31 @@ fn row_meta(r: &rusqlite::Row) -> rusqlite::Result<SecretMeta> {
     Ok(SecretMeta { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, rotated_at: r.get(3)? })
 }
 
+fn lookup(conn: &Connection, name: &str) -> Result<SecretMeta, CoreError> {
+    conn.query_row("SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1", [name], row_meta)
+        .optional()?
+        .ok_or(CoreError::NotFound)
+}
+
+/// UPDATE/DELETE by id map "0 rows affected" to `NotFound`.
+fn update_value(conn: &Connection, id: i64, blob: &[u8], ts: i64) -> Result<(), CoreError> {
+    let n = conn.execute(
+        "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
+        params![blob, ts, id],
+    )?;
+    if n == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
+fn delete_by_id(conn: &Connection, id: i64) -> Result<(), CoreError> {
+    if conn.execute("DELETE FROM secrets WHERE id = ?1", [id])? == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
 impl Vault {
     pub fn add_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_name(name)?;
@@ -725,24 +783,22 @@ impl Vault {
 
     pub fn rotate_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_secret_value(value)?;
-        let meta = self.get_secret_meta(name)?;
+        // One guard for lookup and write so the row cannot vanish in between.
+        let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let ts = now();
-        self.conn().execute(
-            "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
-            params![self.seal_value(&aad(meta.id), value.as_bytes()), ts, meta.id],
-        )?;
+        update_value(&conn, meta.id, &self.seal_value(&aad(meta.id), value.as_bytes()), ts)?;
         Ok(SecretMeta { rotated_at: Some(ts), ..meta })
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<(), CoreError> {
-        let meta = self.get_secret_meta(name)?;
         let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let used: i64 = conn.query_row("SELECT COUNT(*) FROM rules WHERE secret_id = ?1", [meta.id], |r| r.get(0))?;
         if used > 0 {
             return Err(CoreError::InUse);
         }
-        conn.execute("DELETE FROM secrets WHERE id = ?1", [meta.id])?;
-        Ok(())
+        delete_by_id(&conn, meta.id)
     }
 
     pub fn list_secrets(&self) -> Result<Vec<SecretMeta>, CoreError> {
@@ -753,10 +809,7 @@ impl Vault {
     }
 
     pub fn get_secret_meta(&self, name: &str) -> Result<SecretMeta, CoreError> {
-        self.conn()
-            .query_row("SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1", [name], row_meta)
-            .optional()?
-            .ok_or(CoreError::NotFound)
+        lookup(&self.conn(), name)
     }
 
     /// Decrypts a secret for injection. ONLY the proxy may call this; no admin API, CLI or web path may.
@@ -773,22 +826,44 @@ impl Vault {
 }
 ```
 
+Tests añadidos tras la revisión (en el código): `init` fallido limpia ficheros y permite reintento (`vault::tests`), 0-filas => `NotFound` (`secrets::tests`), `paths::tests` con variables vacías, y en `tests/vault.rs` rotate con CR/LF/NUL/vacío, raw-vault con passphrase, límite 8192/8193 y modo 0600 de `-wal`/`-shm`.
+
 `paths.rs`:
 ```rust
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn default_data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(d).join("secret-guardian");
+/// Absolute fallback when neither XDG_DATA_HOME nor HOME gives an absolute path.
+const FALLBACK_DIR: &str = "/tmp/secret-guardian";
+
+fn absolute(v: Option<OsString>) -> Option<PathBuf> {
+    v.map(PathBuf::from).filter(|p| p.is_absolute())
+}
+
+fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(d) = absolute(xdg_data_home) {
+        return d.join("secret-guardian");
     }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/secret-guardian")
+    if let Some(h) = absolute(home) {
+        return h.join(".local/share/secret-guardian");
+    }
+    PathBuf::from(FALLBACK_DIR)
+}
+
+fn socket_from(xdg_runtime_dir: Option<OsString>, data_dir: PathBuf) -> PathBuf {
+    match absolute(xdg_runtime_dir) {
+        Some(d) => d.join("secret-guardian.sock"),
+        None => data_dir.join("sg.sock"),
+    }
+}
+
+/// Always absolute: empty/relative env vars are ignored.
+pub fn default_data_dir() -> PathBuf {
+    data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
 pub fn default_socket() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) => PathBuf::from(d).join("secret-guardian.sock"),
-        None => default_data_dir().join("sg.sock"),
-    }
+    socket_from(std::env::var_os("XDG_RUNTIME_DIR"), default_data_dir())
 }
 ```
 
