@@ -4,7 +4,7 @@ mod mitm;
 mod server;
 mod upstream;
 
-pub use upstream::UpstreamConfig;
+pub use upstream::{NetPolicy, UpstreamConfig};
 
 use sg_auth::TokenVerifier;
 use sg_ca::CaService;
@@ -22,13 +22,22 @@ pub struct ProxyState {
 /// Connection-level limits of the proxy listener.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
-    /// Maximum number of simultaneously open client connections (a CONNECT tunnel counts as one
-    /// for its whole life). When the cap is reached the accept loop stops accepting: further
-    /// clients wait in the kernel listen backlog (they are neither refused nor dropped) until a
-    /// slot frees up.
+    /// Maximum number of simultaneously open client connections. A CONNECT tunnel (passthrough
+    /// or MITM) keeps its slot until the tunnel itself ends, not just until the CONNECT is
+    /// answered. When the cap is reached the accept loop stops accepting: further clients wait
+    /// in the kernel listen backlog (they are neither refused nor dropped) until a slot frees up.
     pub max_connections: usize,
-    /// Maximum time a client may take to send a complete request head.
+    /// Maximum time a client may take to send a complete request head. It also bounds the TLS
+    /// handshake inside a MITM tunnel and the wait for the first request after it.
     pub header_read_timeout: Duration,
+    /// A tunnel with no traffic for this long is closed: for a passthrough tunnel, no bytes in
+    /// either direction; for a MITM connection, no request in flight and none started (default
+    /// 10 min).
+    pub tunnel_idle_timeout: Duration,
+    /// Absolute lifetime of a tunnel, busy or not (default 8 h). Together with the idle timeout
+    /// this bounds how long a revoked token can keep using a passthrough tunnel (MITM requests
+    /// re-verify the token each time).
+    pub tunnel_max_lifetime: Duration,
 }
 
 impl Default for ServeOptions {
@@ -36,6 +45,8 @@ impl Default for ServeOptions {
         Self {
             max_connections: 1024,
             header_read_timeout: Duration::from_secs(30),
+            tunnel_idle_timeout: Duration::from_secs(10 * 60),
+            tunnel_max_lifetime: Duration::from_secs(8 * 60 * 60),
         }
     }
 }
@@ -67,10 +78,16 @@ pub async fn serve_with(
             }
         };
         let state = state.clone();
-        let timeout = opts.header_read_timeout;
+        let limits = server::Limits {
+            header_read_timeout: opts.header_read_timeout,
+            tunnel_idle_timeout: opts.tunnel_idle_timeout,
+            tunnel_max_lifetime: opts.tunnel_max_lifetime,
+        };
+        // Shared with the tunnel tasks a CONNECT spawns: the slot is freed only when the last
+        // of them ends.
+        let permit = Arc::new(permit);
         tokio::spawn(async move {
-            let _permit = permit; // held for the life of the connection
-            if let Err(e) = server::handle_connection(stream, state, timeout).await {
+            if let Err(e) = server::handle_connection(stream, state, limits, permit).await {
                 tracing::debug!(%peer, error = %e, "connection ended");
             }
         });

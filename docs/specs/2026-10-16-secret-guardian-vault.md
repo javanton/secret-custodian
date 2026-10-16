@@ -90,7 +90,7 @@ se confirma en el plan.
 - AES-256-GCM, nonce aleatorio de 96 bits por valor, AAD = id del registro (evita mover
   valores entre filas).
 - Si la KEK es incorrecta, el servidor no arranca y no revela cuál era el fallo concreto.
-- Los valores descifrados solo existen en memoria durante la inyección y se limpian con `zeroize`.
+- Los valores descifrados solo existen en memoria durante la inyección y se limpian con `zeroize` en la medida de lo posible (*best effort*: las copias dentro de `hyper`/`http` no se borran).
 
 ### Esquema (resumen)
 
@@ -194,6 +194,10 @@ El argumento de cierre descansa en estas suposiciones:
 - **A5**: los segmentos punto solo se reconocen si están hechos de puntos, espacios, tabs y `+`.
 - **A6**: el origen recibe exactamente la cadena que se juzgó (el proxy reenvía
   `normalize_path(raw)`; la query no interviene en el enrutado).
+- **A7**: el proxy elimina las cabeceras de override de enrutado y de reenvío (`X-HTTP-Method-Override`,
+  `X-Original-URL`, `X-Forwarded-*`, `Forwarded`, `Via`...) y rechaza `TRACE`/`CONNECT` dentro del
+  túnel (`405`). **No** defiende contra overrides de método o ruta transportados en la query o el
+  cuerpo (parámetros `_method` de algunos frameworks).
 
 ### 6.3 CA acotada
 
@@ -215,6 +219,22 @@ El argumento de cierre descansa en estas suposiciones:
 - Distribución a los agentes por variable de entorno (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
   `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`), no por el almacén del sistema.
 
+### Red y túneles
+
+- Política de red del proxy: el destino se resuelve una sola vez y se conecta a la dirección ya
+  validada. Se rechazan (`403`, decisión `target-denied`) las direcciones sin especificar
+  (`0.0.0.0`, `::`), link-local (169.254.0.0/16 y fe80::/10, que incluye los metadatos de la nube),
+  multicast, broadcast y las direcciones de escucha del propio proxy y de la administración
+  (`denied`; un puerto denegado lo está en todas las direcciones locales). Loopback se rechaza salvo
+  `--allow-loopback-targets` o, en peticiones reenviadas, el host exacto `localhost` con regla
+  aplicable (nunca sobre `denied`). RFC 1918 y ULA se permiten (homelab). El puerto no forma parte de
+  la autorización: una regla para un host vale para cualquier puerto de ese host.
+- Límites de túnel: el permiso del tope de conexiones vive lo que vive el túnel; el handshake TLS
+  del MITM, la inactividad (`tunnel_idle_timeout`, 10 min) y la vida máxima (`tunnel_max_lifetime`,
+  8 h) están acotados, y hay un tope global de conexiones salientes (`max_upstream_connections`, 256).
+  En túneles *passthrough* no hay verificación por petición: la revocación de un token solo surte
+  efecto cuando el túnel termina, así que queda acotada por la inactividad y la vida máxima.
+
 ### 6.4 Hosts sin regla
 
 Por rol: `passthrough` (túnel TCP opaco, sin MITM ni inyección) o `deny` (`403`). Valor por
@@ -222,6 +242,17 @@ defecto propuesto: **`passthrough`**, para que los agentes sigan funcionando con
 necesitan credenciales. **Decisión a confirmar en la revisión.**
 
 ### 6.5 Limitaciones conocidas
+
+- Las APIs que autentican por parámetros de query suelen reflejar la URL (`Link`, `Location`,
+  `Content-Location`), así que el agente puede ver ahí el valor inyectado. Preferir la inyección
+  por cabecera.
+- La política de tiempo de respuesta (`response_header_timeout`, 120 s por defecto, configurable en
+  `UpstreamConfig`) también cubre subidas lentas cuando el origen espera el cuerpo completo.
+- Si la escritura del audit falla, la petición ya reenviada no se deshace (*fail-open* para lo ya
+  enviado); se registra un error en el log.
+- Las llamadas SQLite son síncronas y corren en los hilos del runtime async; una mejora futura es
+  moverlas a `spawn_blocking`.
+- Solo se audita el id de la primera regla coincidente.
 
 - Herramientas con certificate pinning, Java (almacén propio) o binarios Go que ignoran las
   variables de entorno no funcionarán con el MITM.

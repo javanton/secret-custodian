@@ -1,7 +1,7 @@
 use crate::{
     inject,
     server::{audit, text},
-    upstream::ProxyBody,
+    upstream::{ProxyBody, UpstreamError},
     ProxyState,
 };
 use http_body_util::BodyExt;
@@ -77,6 +77,19 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".into());
     let st = &ctx.state;
+
+    // Never legitimate for an API client, and TRACE would reflect the injected credentials.
+    if matches!(parts.method.as_str(), "TRACE" | "CONNECT") {
+        return fail(
+            ctx,
+            &method,
+            &raw_target,
+            "method-refused",
+            StatusCode::METHOD_NOT_ALLOWED,
+            None,
+            "method not allowed\n",
+        );
+    }
 
     if !host_is_consistent(&parts, &ctx.host) {
         return fail(
@@ -215,9 +228,11 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
     parts.version = hyper::Version::HTTP_11;
 
     let outgoing = Request::from_parts(parts, body.boxed());
+    // Local services: a rule for the host `localhost` is the one case where loopback is allowed.
+    let local_service = ctx.host == "localhost" && rule_id.is_some();
     let result = st
         .upstream
-        .send(&ctx.host, ctx.port, ctx.tls, outgoing)
+        .send_to(&ctx.host, ctx.port, ctx.tls, outgoing, local_service)
         .await;
     drop(resolved); // wipe the decrypted values as soon as the request is on its way
     match result {
@@ -241,6 +256,15 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<Proxy
             inject::strip_hop_by_hop(&mut rparts.headers);
             Response::from_parts(rparts, rbody.boxed())
         }
+        Err(UpstreamError::TargetDenied) => fail(
+            ctx,
+            &method,
+            &raw_target,
+            "target-denied",
+            StatusCode::FORBIDDEN,
+            rule_id,
+            "destination not allowed\n",
+        ),
         Err(e) => {
             // `e` carries no request data: only connect/TLS/IO descriptions.
             tracing::warn!(error = %e, host = %ctx.host, "upstream failure");

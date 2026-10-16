@@ -36,7 +36,7 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 1. Secreto o plantilla con CR/LF/NUL (inyección de cabeceras): rechazado al guardar y al renderizar. Tareas 2 y 3.
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
-4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, `..+`, solo puntos/espacios/tab/`+`) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, espacios y caracteres invisibles no ASCII (NBSP, U+200B, U+FF1F, U+FE68...), más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb` (los `..`/`%2e%2e` simples los resuelve `normalize_path` antes de juzgar), pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
+4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, `..+`, solo puntos/espacios/tab/`+`) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, espacios y caracteres invisibles no ASCII (NBSP, U+200B, U+FF1F, U+FE68...), más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb` (los `..`/`%2e%2e` simples los resuelve `normalize_path` antes de juzgar), pero sí `/repos/a%2Fb`. `/repos/a\..%3B\k/../admin` NO es un `403`: `normalize_path` lo reduce a `/repos/admin`, que cae dentro del prefijo y se reenvía normalizado. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
 5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
 
 ---
@@ -2597,8 +2597,8 @@ git add -A && git commit -m "feat(core): add audit log without query strings"
 - Consumes: `sg_core::{Vault, audit::AuditEntry}`, `sg_policy::{get_role, list_rules, has_rules_for_host, normalize_host, Unmatched}`, `sg_auth::{TokenVerifier, extract_proxy_token, Identity}`, `sg_ca::CaService`.
 - Produces:
   - `struct ProxyState { vault: Arc<Vault>, verifier: Arc<dyn TokenVerifier>, ca: Arc<CaService>, upstream: UpstreamConfig }`
-  - `struct UpstreamConfig { tls: Arc<rustls::ClientConfig>, resolve_override: HashMap<String, SocketAddr> }` con `UpstreamConfig::new(extra_roots: Vec<CertificateDer<'static>>) -> Self`
-  - `async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> std::io::Result<()>`
+  - `struct UpstreamConfig { tls, resolve_override: HashMap<String, SocketAddr>, connect_timeout, response_header_timeout (120 s por defecto; cubre también subidas lentas si el origen espera el cuerpo completo), net_policy: NetPolicy, max_upstream_connections (256) }`; se construye con `UpstreamConfig::new(extra_roots: Vec<CertificateDer<'static>>) -> Self` y se ajusta por campos. `NetPolicy { allow_loopback, allow_link_local, allow_unspecified, denied: Vec<SocketAddr> }` (por defecto todo `false`/vacío; multicast, broadcast y `denied` siempre se rechazan; el destino se resuelve una vez y se conecta a la dirección ya validada)
+  - `async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> std::io::Result<()>` y `serve_with(listener, state, ServeOptions)`, con `ServeOptions { max_connections, header_read_timeout, tunnel_idle_timeout (10 min), tunnel_max_lifetime (8 h) }`. El permiso de conexión vive mientras viva el túnel.
   - Helpers de test en `tests/common`: `Env::new(upstream_host) -> Env`, `Env::token(role) -> String`, `Env::proxy_addr`, `raw_connect(addr, authority, proxy_auth: Option<&str>) -> String` (devuelve la línea de estado).
 
 - [ ] **Step 1: Escribir `tests/common/mod.rs` y los tests que fallan**
@@ -3343,7 +3343,7 @@ async fn disallowed_method_is_403_and_never_reaches_upstream() {
 async fn path_traversal_cannot_escape_a_restricted_rule() {
     let (env, up, t) = setup(&["GET"], "/repos/*").await;
     assert_eq!(proxy_request(&env, &t, HOST, "GET", "/repos/ok", &[], vec![], false).await.status, 200);
-    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/repos/x%252F..%252F..%252Frepos%252Fz%252Fw%2F..%2F..%2Fadmin", "/repos/..;%2Frepos%2Fx/..;/admin", "/repos/..%2F..%2Fadmin%3F%2F..%2F..%2Frepos%2Fy", "/repos/%u002e%u002e/admin", "/repos/a\\..%3B\\k/../admin", "/repos/a;%2Fk/..%3B/..%3B/admin", "/repos/..%20/admin", "/repos/.../admin", "/repos/%E2%80%A5/admin", "/repos/%EF%BC%8E%EF%BC%8E/admin", "/repos/a%09b", "/repos/a%0Ab", "/other"] {
+    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/repos/x%252F..%252F..%252Frepos%252Fz%252Fw%2F..%2F..%2Fadmin", "/repos/..;%2Frepos%2Fx/..;/admin", "/repos/..%2F..%2Fadmin%3F%2F..%2F..%2Frepos%2Fy", "/repos/%u002e%u002e/admin", "/repos/a;%2Fk/..%3B/..%3B/admin", "/repos/..%20/admin", "/repos/.../admin", "/repos/%E2%80%A5/admin", "/repos/%EF%BC%8E%EF%BC%8E/admin", "/repos/a%09b", "/repos/a%0Ab", "/other"] {
         assert_eq!(proxy_request(&env, &t, HOST, "GET", p, &[], vec![], false).await.status, 403, "{p}");
     }
     assert_eq!(up.received.lock().unwrap().len(), 1);
@@ -4983,7 +4983,7 @@ git add -A && git commit -m "feat(web): add embedded admin UI without dom inject
 **Interfaces:**
 - Consumes: todos los crates.
 - Produces:
-  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>]` (variable `SG_MASTER_KEY` como tercera fuente)
+  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>] [--allow-loopback-targets]` (variable `SG_MASTER_KEY` como tercera fuente)
   - `sg keygen [--out <fichero>]`
   - Subcomandos de cliente aplanados (`sg secret ...`, `sg --socket <ruta> ...`)
   - `keys::resolve_key(args: &KeySource, interactive_confirm: bool) -> anyhow::Result<KeyInput>`
@@ -5152,7 +5152,7 @@ use sg_admin::{allowed_hosts_for, serve_unix, serve_web, AppState, Sessions};
 use sg_auth::TokenService;
 use sg_ca::CaService;
 use sg_core::{paths, Vault};
-use sg_proxy::{ProxyState, UpstreamConfig};
+use sg_proxy::{NetPolicy, ProxyState, UpstreamConfig};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
 
@@ -5166,6 +5166,8 @@ pub struct ServeArgs {
     #[arg(long)] passphrase: bool,
     /// Extra PEM CA bundle trusted for upstream TLS (internal services with a private CA)
     #[arg(long, env = "SG_UPSTREAM_CA")] upstream_ca: Vec<PathBuf>,
+    /// Allow the proxy to tunnel/forward to loopback addresses (off by default: SSRF defence)
+    #[arg(long)] allow_loopback_targets: bool,
 }
 
 pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
@@ -5185,12 +5187,14 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
             roots.push(CertificateDer::from(c?.to_vec()));
         }
     }
-    let proxy_state = Arc::new(ProxyState { vault: vault.clone(), verifier: tokens.clone(), ca: ca.clone(), upstream: UpstreamConfig::new(roots) });
-
     let proxy_listener = TcpListener::bind(args.proxy_bind).await.context("cannot bind the proxy address")?;
     let admin_listener = TcpListener::bind(args.admin_bind).await.context("cannot bind the admin address")?;
     let proxy_addr = proxy_listener.local_addr()?;
     let admin_addr = admin_listener.local_addr()?;
+    // The proxy and admin bind addresses are never valid tunnel/forward targets.
+    let mut upstream = UpstreamConfig::new(roots);
+    upstream.net_policy = NetPolicy::new(vec![proxy_addr, admin_addr]).with_allow_loopback(args.allow_loopback_targets);
+    let proxy_state = Arc::new(ProxyState { vault: vault.clone(), verifier: tokens.clone(), ca: ca.clone(), upstream });
     if !admin_addr.ip().is_loopback() {
         eprintln!("WARNING: the admin interface is bound to {admin_addr}, which is not loopback. Publish it only to 127.0.0.1 of the host; there is no remote login in this version.");
     }

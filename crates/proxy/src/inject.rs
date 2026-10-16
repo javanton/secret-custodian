@@ -53,12 +53,44 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Headers that tell the origin (or a fronting framework) to route, rewrite or re-attribute the
+/// request. The agent must not be able to steer the injected request with them.
+const ROUTING_HEADERS: &[&str] = &[
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+    "x-original-url",
+    "x-rewrite-url",
+    "x-real-ip",
+    "forwarded",
+    "x-original-host",
+    "x-host",
+    "via",
+    "front-end-https",
+];
+
+/// Removes routing-override and forwarding headers (every `X-Forwarded-*` included).
+pub(crate) fn strip_routing_headers(headers: &mut HeaderMap) {
+    let doomed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| {
+            let n = k.as_str();
+            ROUTING_HEADERS.contains(&n) || n.starts_with("x-forwarded-")
+        })
+        .cloned()
+        .collect();
+    for h in doomed {
+        headers.remove(h);
+    }
+}
+
 pub fn apply(
     parts: &mut Parts,
     path: &str,
     injections: &[ResolvedInjection],
 ) -> Result<(), InjectError> {
     strip_hop_by_hop(&mut parts.headers);
+    strip_routing_headers(&mut parts.headers);
     let mut query: Vec<String> = parts
         .uri
         .query()
@@ -82,12 +114,23 @@ pub fn apply(
                 parts.headers.insert(name, v);
             }
             InjectionKind::Query => {
-                query.retain(|pair| {
-                    let key = pair.split('=').next().unwrap_or("");
-                    !percent_decode_str(key)
-                        .decode_utf8_lossy()
-                        .eq_ignore_ascii_case(&inj.name)
-                });
+                // Some origins also split parameters on `;`: judge every sub-parameter, but keep
+                // the text of the surviving ones untouched.
+                query = query
+                    .into_iter()
+                    .filter_map(|pair| {
+                        let kept: Vec<&str> = pair
+                            .split(';')
+                            .filter(|sub| {
+                                let key = sub.split('=').next().unwrap_or("");
+                                !percent_decode_str(key)
+                                    .decode_utf8_lossy()
+                                    .eq_ignore_ascii_case(&inj.name)
+                            })
+                            .collect();
+                        (!kept.is_empty()).then(|| kept.join(";"))
+                    })
+                    .collect();
                 // Names are validated as [A-Za-z0-9_.-] at rule creation.
                 query.push(format!("{}={}", inj.name, *inj.value));
             }

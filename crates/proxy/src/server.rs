@@ -1,4 +1,7 @@
-use crate::{upstream::ProxyBody, ProxyState};
+use crate::{
+    upstream::{ProxyBody, UpstreamError},
+    ProxyState,
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::{body::Incoming, service::service_fn, Method, Request, Response, StatusCode};
@@ -6,8 +9,21 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use sg_auth::{extract_proxy_token, Identity};
 use sg_core::audit::AuditEntry;
 use sg_policy::{get_role, has_rules_for_host, list_rules, normalize_host, Unmatched};
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::net::TcpStream;
+use std::{
+    convert::Infallible,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    sync::OwnedSemaphorePermit,
+    time::Instant,
+};
 use zeroize::Zeroizing;
 
 /// Longest `Proxy-Authorization` value we are willing to parse (longer means 407).
@@ -22,18 +38,107 @@ pub(crate) struct Session {
     pub token: Zeroizing<String>,
 }
 
+/// Time limits applied to a client connection and to the tunnels it opens.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    pub header_read_timeout: Duration,
+    pub tunnel_idle_timeout: Duration,
+    pub tunnel_max_lifetime: Duration,
+}
+
+/// The connection-cap slot. Cloned into every task a CONNECT spawns, so it is released only
+/// when the connection AND its tunnel are gone.
+pub(crate) type Slot = Arc<OwnedSemaphorePermit>;
+
+/// Wraps a stream and fails reads/writes with `TimedOut` once nothing moved in either direction
+/// for `idle`.
+pub(crate) struct IdleIo<T> {
+    inner: T,
+    idle: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<T> IdleIo<T> {
+    pub fn new(inner: T, idle: Duration) -> Self {
+        Self {
+            inner,
+            idle,
+            sleep: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+
+    fn progressed(&mut self) {
+        self.sleep.as_mut().reset(Instant::now() + self.idle);
+    }
+
+    fn check_idle(&mut self, cx: &mut Context<'_>) -> Option<io::Error> {
+        self.sleep
+            .as_mut()
+            .poll(cx)
+            .is_ready()
+            .then(|| io::Error::new(io::ErrorKind::TimedOut, "tunnel idle timeout"))
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for IdleIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(r) => {
+                self.progressed();
+                Poll::Ready(r)
+            }
+            Poll::Pending => match self.check_idle(cx) {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Pending,
+            },
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for IdleIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(r) => {
+                self.progressed();
+                Poll::Ready(r)
+            }
+            Poll::Pending => match self.check_idle(cx) {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Pending,
+            },
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub async fn handle_connection(
     stream: TcpStream,
     state: Arc<ProxyState>,
-    header_read_timeout: Duration,
+    limits: Limits,
+    slot: Slot,
 ) -> Result<(), hyper::Error> {
     let svc = service_fn(move |req| {
-        let state = state.clone();
-        async move { Ok::<_, Infallible>(handle_request(req, state).await) }
+        let (state, slot) = (state.clone(), slot.clone());
+        async move { Ok::<_, Infallible>(handle_request(req, state, limits, slot).await) }
     });
     hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(header_read_timeout)
+        .header_read_timeout(limits.header_read_timeout)
         .serve_connection(TokioIo::new(stream), svc)
         .with_upgrades()
         .await
@@ -104,12 +209,17 @@ pub(crate) fn audit(
     }
 }
 
-async fn handle_request(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<ProxyBody> {
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    limits: Limits,
+    slot: Slot,
+) -> Response<ProxyBody> {
     let Some(session) = authenticate(&req, &state) else {
         return proxy_auth_required();
     };
     if req.method() == Method::CONNECT {
-        connect(req, session, state).await
+        connect(req, session, state, limits, slot).await
     } else {
         text(
             StatusCode::NOT_IMPLEMENTED,
@@ -122,6 +232,8 @@ async fn connect(
     req: Request<Incoming>,
     session: Session,
     state: Arc<ProxyState>,
+    limits: Limits,
+    slot: Slot,
 ) -> Response<ProxyBody> {
     let identity = &session.identity;
     let Some(authority) = req.uri().authority().cloned() else {
@@ -184,7 +296,9 @@ async fn connect(
             Some(200),
             None,
         );
-        tokio::spawn(crate::mitm::serve(req, host, port, session, state));
+        tokio::spawn(crate::mitm::serve(
+            req, host, port, session, state, limits, slot,
+        ));
         return empty(StatusCode::OK);
     }
 
@@ -204,18 +318,34 @@ async fn connect(
         }
         Unmatched::Passthrough => {
             // Reach the destination first: only then answer 200.
-            let Ok(mut upstream) = state.upstream.connect_tcp(&host, port).await else {
-                audit(
-                    &state,
-                    identity,
-                    &host,
-                    "CONNECT",
-                    "/",
-                    "tunnel-connect-failed",
-                    Some(502),
-                    None,
-                );
-                return text(StatusCode::BAD_GATEWAY, "could not reach the destination\n");
+            let mut upstream = match state.upstream.connect_tcp(&host, port).await {
+                Ok(s) => s,
+                Err(UpstreamError::TargetDenied) => {
+                    audit(
+                        &state,
+                        identity,
+                        &host,
+                        "CONNECT",
+                        "/",
+                        "target-denied",
+                        Some(403),
+                        None,
+                    );
+                    return text(StatusCode::FORBIDDEN, "destination not allowed\n");
+                }
+                Err(_) => {
+                    audit(
+                        &state,
+                        identity,
+                        &host,
+                        "CONNECT",
+                        "/",
+                        "tunnel-connect-failed",
+                        Some(502),
+                        None,
+                    );
+                    return text(StatusCode::BAD_GATEWAY, "could not reach the destination\n");
+                }
             };
             audit(
                 &state,
@@ -228,10 +358,15 @@ async fn connect(
                 None,
             );
             tokio::spawn(async move {
-                if let Ok(upgraded) = hyper::upgrade::on(req).await {
-                    let mut client = TokioIo::new(upgraded);
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-                }
+                let _slot = slot; // the tunnel keeps the connection-cap slot until it ends
+                let tunnel = async {
+                    if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                        let mut client =
+                            IdleIo::new(TokioIo::new(upgraded), limits.tunnel_idle_timeout);
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    }
+                };
+                let _ = tokio::time::timeout(limits.tunnel_max_lifetime, tunnel).await;
             });
             empty(StatusCode::OK)
         }

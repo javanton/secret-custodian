@@ -133,8 +133,32 @@ pub async fn echo_server() -> SocketAddr {
     addr
 }
 
+/// Default config for tests whose fake destinations live on loopback.
 pub fn no_extra_roots() -> UpstreamConfig {
+    let mut cfg = strict_upstream();
+    cfg.net_policy.allow_loopback = true;
+    cfg
+}
+
+/// Config with the DEFAULT network policy (loopback, link-local, unspecified refused).
+pub fn strict_upstream() -> UpstreamConfig {
     UpstreamConfig::new(Vec::<CertificateDer<'static>>::new())
+}
+
+/// A TCP listener that only counts accepted connections.
+pub async fn counting_listener() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = l.accept().await else { break };
+            n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::mem::forget(s);
+        }
+    });
+    (addr, n)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -234,6 +258,9 @@ where
             if parts.uri.path() == "/slow" {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
+            if parts.uri.path() == "/delay" {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
             let body: UpBody = if parts.uri.path() == "/stream" {
                 SlowBody {
                     step: 0,
@@ -332,11 +359,21 @@ pub async fn env_with_upstream_cfg(
     host: &str,
     tweak: impl FnOnce(&mut UpstreamConfig),
 ) -> (Env, TestUpstream) {
+    env_with_upstream_opts(host, ServeOptions::default(), tweak).await
+}
+
+/// Like `env_with_upstream_cfg`, also choosing the proxy's serve options.
+pub async fn env_with_upstream_opts(
+    host: &str,
+    opts: ServeOptions,
+    tweak: impl FnOnce(&mut UpstreamConfig),
+) -> (Env, TestUpstream) {
     let up = spawn_tls_upstream(host).await;
     let mut cfg = UpstreamConfig::new(vec![up.ca_der.clone()]);
+    cfg.net_policy.allow_loopback = true;
     cfg.resolve_override.insert(host.to_string(), up.addr);
     tweak(&mut cfg);
-    let env = Env::new(cfg).await;
+    let env = Env::custom(cfg, opts, None).await;
     env.ca.allow_domain(host).unwrap();
     (env, up)
 }
