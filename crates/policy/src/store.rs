@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::normalize::{is_ip_literal, normalize_path};
+use crate::normalize::{is_ip_literal, normalize_path, pattern_is_self_widening};
 use rusqlite::{params, OptionalExtension};
 use sg_core::Vault;
 
@@ -12,9 +12,6 @@ const FORBIDDEN_TARGET_HEADERS: &[&str] = &[
     "te",
     "trailer",
     "upgrade",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "proxy-connection",
 ];
 
 /// `*` only as the single last character, no `?`/`#`, and already in normalized form
@@ -36,6 +33,7 @@ fn valid_path_pattern(p: &str) -> bool {
         && !body.contains(['*', '?', '#'])
         && escapes_ok
         && normalize_path(body) == body
+        && !pattern_is_self_widening(body)
 }
 
 fn valid_host_pattern(p: &str) -> bool {
@@ -85,6 +83,7 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
                 && !FORBIDDEN_TARGET_HEADERS
                     .iter()
                     .any(|h| r.target_name.eq_ignore_ascii_case(h))
+                && !r.target_name.to_ascii_lowercase().starts_with("proxy-")
         }
         InjectionKind::Query => {
             !r.target_name.is_empty()

@@ -144,6 +144,171 @@ pub fn strict_path(p: &str) -> Option<String> {
     Some(out)
 }
 
+const MAX_DECODE_ROUNDS: usize = 8;
+
+/// One percent-decoding round. `first` is the round applied to the raw path: there a `%` that is
+/// not followed by two hex digits makes the path unjudgeable. Later rounds only see `%` that
+/// earlier decoding produced (e.g. `%25` -> `%`), which stay literal, except `%u`/`%U` (the
+/// IIS-style `%uXXXX` escape some origins honour), which is never judgeable.
+fn decode_round(input: &str, first: bool) -> Option<String> {
+    let b = input.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            match (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+                _ => {
+                    if first || matches!(b.get(i + 1), Some(b'u' | b'U')) {
+                        return None;
+                    }
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    let text = String::from_utf8(out).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text)
+}
+
+/// `[P, decode(P), decode(decode(P)), ...]` until the string stops changing. `None` when the path
+/// cannot be judged safely: malformed `%`, NUL, invalid UTF-8, or more than 8 decoding layers.
+pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
+    if p.contains('\0') {
+        return None;
+    }
+    let mut chain = vec![p.to_string()];
+    for round in 0..=MAX_DECODE_ROUNDS {
+        let next = decode_round(chain.last().expect("chain is never empty"), round == 0)?;
+        if &next == chain.last().expect("chain is never empty") {
+            return Some(chain);
+        }
+        if round == MAX_DECODE_ROUNDS {
+            return None;
+        }
+        chain.push(next);
+    }
+    None
+}
+
+fn strip_params(s: &str) -> String {
+    s.split('/')
+        .map(|seg| seg.split(';').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn cut_query(s: &str) -> &str {
+    s.find(['?', '#']).map_or(s, |i| &s[..i])
+}
+
+/// Resolves `.`/`..` and collapses `//` (trailing slash kept), without any decoding.
+fn resolve(s: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in s.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            x => segs.push(x),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if s.ends_with('/') && out != "/" {
+        out.push('/');
+    }
+    out
+}
+
+fn is_special(s: &str) -> bool {
+    s.contains(['?', '#', ';', '\\'])
+}
+
+/// Every plausible reading of a path (or path pattern), used ONLY for matching.
+pub(crate) struct PathView {
+    chain: Vec<String>,
+    /// Chain of the path with `;params` stripped BEFORE decoding; `None` when that is a no-op.
+    pre: Option<Vec<String>>,
+}
+
+impl PathView {
+    pub(crate) fn new(s: &str) -> Option<Self> {
+        let chain = decode_chain(s)?;
+        let stripped = strip_params(s);
+        let pre = if stripped == s {
+            None
+        } else {
+            Some(decode_chain(&stripped)?)
+        };
+        Some(PathView { chain, pre })
+    }
+
+    pub(crate) fn depths(&self) -> usize {
+        self.chain.len().max(self.pre.as_ref().map_or(0, Vec::len))
+    }
+
+    /// True when the parsing variants (query cut, `;` strip, `\` mapping) can differ from the plain reading.
+    pub(crate) fn needs_variants(&self) -> bool {
+        self.pre.is_some() || self.chain.iter().any(|c| is_special(c))
+    }
+
+    /// Readings at one decoding depth, in a fixed order. Two views produce aligned lists when asked
+    /// for the same `depth`/`full`: reading N of a path is compared with reading N of the pattern.
+    pub(crate) fn readings_at(&self, depth: usize, full: bool) -> Vec<String> {
+        let at = |c: &Vec<String>| c[depth.min(c.len() - 1)].clone();
+        let r = at(&self.chain);
+        if !full {
+            return vec![resolve(&r)];
+        }
+        let pre = at(self.pre.as_ref().unwrap_or(&self.chain));
+        let mut out = Vec::with_capacity(14);
+        for slash in [false, true] {
+            let map = |x: &str| {
+                if slash {
+                    x.replace('\\', "/")
+                } else {
+                    x.to_string()
+                }
+            };
+            let t = map(&r);
+            out.push(resolve(&t));
+            out.push(resolve(cut_query(&t)));
+            out.push(resolve(&strip_params(&t)));
+            out.push(resolve(&strip_params(cut_query(&t))));
+            out.push(resolve(cut_query(&strip_params(&t))));
+            let u = map(&pre);
+            out.push(resolve(&u));
+            out.push(resolve(cut_query(&u)));
+        }
+        out
+    }
+}
+
+/// True when a path PATTERN could widen itself: at any decoding depth its text contains a `.`/`..`
+/// segment, `;`, `\`, `?`, `#` or NUL, or it cannot be decoded safely.
+pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
+    let Some(chain) = decode_chain(body) else {
+        return true;
+    };
+    chain.iter().any(|c| {
+        c.contains([';', '\\', '?', '#', '\0']) || c.split('/').any(|s| s == "." || s == "..")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

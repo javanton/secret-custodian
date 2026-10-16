@@ -301,11 +301,27 @@ fn path_pattern_validation_is_strict() {
         "/a%zz",
         "/%41pi",
         "/a/..%2fb/*",
+        "/repos/..%2F*",
+        "/repos/%252E%252E%252F*",
+        "/a/..%2Fb/*",
+        "/a/%2e%2e/b/*",
+        "/a/%252e%252e/b/*",
+        "/a%3Bx",
+        "/a%255Cb",
     ] {
         bad(p);
     }
     for p in [
-        "*", "/", "/*", "/repos/*", "/v1/me", "/a%2Fb", "/a%2Fb/*", "/repos/",
+        "*",
+        "/",
+        "/*",
+        "/repos/*",
+        "/v1/me",
+        "/a%2Fb",
+        "/a%2Fb/*",
+        "/repos/",
+        "/api/v4/projects/a%2Fb",
+        "/api/v4/*",
     ] {
         ok(p);
     }
@@ -342,6 +358,8 @@ fn framing_and_hop_by_hop_headers_cannot_be_injection_targets() {
         "proxy-authorization",
         "Proxy-Authenticate",
         "proxy-connection",
+        "proxy-foo",
+        "Proxy-Anything",
     ] {
         let mut r = new_rule(sid);
         r.target_name = h.into();

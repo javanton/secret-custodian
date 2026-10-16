@@ -151,12 +151,19 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
   puerto no forma parte del patrón. Los hosts con forma de IP no admiten reglas.
 - El path se normaliza antes de comparar (segmentos `.`/`..` resueltos, escapes de caracteres no
   reservados decodificados, `//` colapsado) y **se reenvía el path normalizado**: lo autorizado es
-  lo enviado. Además se compara una forma estricta (decodificación porcentual repetida, `\` como `/`,
-  `;params` eliminados, puntos resueltos) y **ambas formas deben coincidir** con la regla; si la forma
-  estricta no se puede calcular (NUL, UTF-8 inválido, codificación sin fin) no coincide ninguna regla
-  salvo `*`. Un `/` codificado solo se admite mientras permanezca dentro del prefijo de la regla.
-- Por cada destino de inyección gana la regla más específica (host exacto, path exacto, patrón más
-  largo). Si su método queda excluido, la respuesta es `403`: no se cae a una regla más amplia.
+  lo enviado. Además, para reglas con path distinto de `*`, el path se juzga en **todas sus lecturas**:
+  cada profundidad de decodificación porcentual (0 a 8 capas) combinada con cada variante de parseo
+  (cortar en `?`/`#`, quitar `;params` antes o después de decodificar, `\` como `/`), resolviendo
+  `.`/`..` y `//` en cada una. **Todas** las lecturas deben coincidir con la lectura equivalente del
+  patrón; así ningún origen plausible resuelve fuera del prefijo autorizado. Un path que no se puede
+  juzgar con seguridad (`%` mal formado, `%uXXXX`, UTF-8 inválido, NUL, más de 8 capas) recibe `403`
+  con reglas de path; solo `*` lo admite. Al crear la regla se rechazan los patrones que se ensanchan
+  a sí mismos (segmentos `.`/`..`, `;`, `\`, `?`, `#` o NUL en cualquier profundidad de decodificación).
+  Un `/` codificado solo se admite mientras permanezca dentro del prefijo de la regla.
+- Por cada destino de inyección gana la regla más específica (host exacto; entre wildcards, el sufijo
+  más largo, p. ej. `*.prod.corp.com` sobre `*.corp.com`; path exacto; patrón más largo). Si su
+  método queda excluido, la respuesta es `403` en lugar de caer a una regla más amplia: la garantía
+  es **por destino** (un destino distinto, p. ej. un parámetro de query, sí puede seguir aportando).
 - Los valores de secreto no pueden contener CR, LF ni NUL; en inyección `query` el valor se codifica
   en porcentaje.
 

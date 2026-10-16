@@ -36,7 +36,7 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 1. Secreto o plantilla con CR/LF/NUL (inyección de cabeceras): rechazado al guardar y al renderizar. Tareas 2 y 3.
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
-4. Path con `..`, `%2e%2e`, `//`, `%2f`, `\`, `;params`, doble codificación o NUL: se compara en la forma normalizada que se reenvía Y en una forma estricta (decodificación repetida, `\` como `/`, `;params` fuera, puntos resueltos); deben coincidir ambas, y lo no juzgable falla cerrado. Una regla `GET /repos/*` no autoriza `/repos/../admin` ni `/repos/..%2fadmin`, pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia). Tareas 3 y 8.
+4. Path con `..`, `%2e%2e`, `//`, `%2f`, `\`, `;params`, doble codificación o NUL: se compara en la forma normalizada que se reenvía Y en **todas las lecturas** (cada profundidad de decodificación porcentual 0..8 por cada variante de parseo: corte en `?`/`#`, `;params` fuera antes o después de decodificar, `\` como `/`, puntos resueltos); deben coincidir todas con la regla, y lo no juzgable (`%` mal formado, `%uXXXX`, UTF-8 inválido, NUL, más de 8 capas) falla cerrado para reglas con path. Los patrones que podrían ensancharse a sí mismos (`.`/`..`, `;`, `\`, `?`, `#`, NUL en cualquier profundidad) se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin` ni `/repos/..%2fadmin`, pero sí `/repos/a%2Fb`. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
 5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
 
 ---
@@ -1291,7 +1291,8 @@ fn decode_all_once(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Strict view of a path, used ONLY for matching (the proxy forwards `normalize_path`).
+/// Vista estricta de un path (solo la lectura totalmente decodificada). El matcher ya NO la usa
+/// sola: juzga todas las lecturas con `PathView` (más abajo). Se mantiene como API pública.
 /// Repeatedly percent-decodes everything (cap 8 rounds), maps `\` to `/`, strips `;params`
 /// from each segment, then resolves `.`/`..` and collapses `//`. `None` means the path cannot
 /// be judged safely (NUL, invalid UTF-8, or encoding that never stabilises).
@@ -1332,11 +1333,176 @@ pub fn strict_path(p: &str) -> Option<String> {
     }
     Some(out)
 }
+
+const MAX_DECODE_ROUNDS: usize = 8;
+
+/// One percent-decoding round. `first` is the round applied to the raw path: there a `%` that is
+/// not followed by two hex digits makes the path unjudgeable. Later rounds only see `%` that
+/// earlier decoding produced (e.g. `%25` -> `%`), which stay literal, except `%u`/`%U` (the
+/// IIS-style `%uXXXX` escape some origins honour), which is never judgeable.
+fn decode_round(input: &str, first: bool) -> Option<String> {
+    let b = input.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            match (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+                _ => {
+                    if first || matches!(b.get(i + 1), Some(b'u' | b'U')) {
+                        return None;
+                    }
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    let text = String::from_utf8(out).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text)
+}
+
+/// `[P, decode(P), decode(decode(P)), ...]` until the string stops changing. `None` when the path
+/// cannot be judged safely: malformed `%`, NUL, invalid UTF-8, or more than 8 decoding layers.
+pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
+    if p.contains('\0') {
+        return None;
+    }
+    let mut chain = vec![p.to_string()];
+    for round in 0..=MAX_DECODE_ROUNDS {
+        let next = decode_round(chain.last().expect("chain is never empty"), round == 0)?;
+        if &next == chain.last().expect("chain is never empty") {
+            return Some(chain);
+        }
+        if round == MAX_DECODE_ROUNDS {
+            return None;
+        }
+        chain.push(next);
+    }
+    None
+}
+
+fn strip_params(s: &str) -> String {
+    s.split('/')
+        .map(|seg| seg.split(';').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn cut_query(s: &str) -> &str {
+    s.find(['?', '#']).map_or(s, |i| &s[..i])
+}
+
+/// Resolves `.`/`..` and collapses `//` (trailing slash kept), without any decoding.
+fn resolve(s: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in s.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            x => segs.push(x),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if s.ends_with('/') && out != "/" {
+        out.push('/');
+    }
+    out
+}
+
+fn is_special(s: &str) -> bool {
+    s.contains(['?', '#', ';', '\\'])
+}
+
+/// Every plausible reading of a path (or path pattern), used ONLY for matching.
+pub(crate) struct PathView {
+    chain: Vec<String>,
+    /// Chain of the path with `;params` stripped BEFORE decoding; `None` when that is a no-op.
+    pre: Option<Vec<String>>,
+}
+
+impl PathView {
+    pub(crate) fn new(s: &str) -> Option<Self> {
+        let chain = decode_chain(s)?;
+        let stripped = strip_params(s);
+        let pre = if stripped == s {
+            None
+        } else {
+            Some(decode_chain(&stripped)?)
+        };
+        Some(PathView { chain, pre })
+    }
+
+    pub(crate) fn depths(&self) -> usize {
+        self.chain.len().max(self.pre.as_ref().map_or(0, Vec::len))
+    }
+
+    /// True when the parsing variants (query cut, `;` strip, `\` mapping) can differ from the plain reading.
+    pub(crate) fn needs_variants(&self) -> bool {
+        self.pre.is_some() || self.chain.iter().any(|c| is_special(c))
+    }
+
+    /// Readings at one decoding depth, in a fixed order. Two views produce aligned lists when asked
+    /// for the same `depth`/`full`: reading N of a path is compared with reading N of the pattern.
+    pub(crate) fn readings_at(&self, depth: usize, full: bool) -> Vec<String> {
+        let at = |c: &Vec<String>| c[depth.min(c.len() - 1)].clone();
+        let r = at(&self.chain);
+        if !full {
+            return vec![resolve(&r)];
+        }
+        let pre = at(self.pre.as_ref().unwrap_or(&self.chain));
+        let mut out = Vec::with_capacity(14);
+        for slash in [false, true] {
+            let map = |x: &str| {
+                if slash {
+                    x.replace('\\', "/")
+                } else {
+                    x.to_string()
+                }
+            };
+            let t = map(&r);
+            out.push(resolve(&t));
+            out.push(resolve(cut_query(&t)));
+            out.push(resolve(&strip_params(&t)));
+            out.push(resolve(&strip_params(cut_query(&t))));
+            out.push(resolve(cut_query(&strip_params(&t))));
+            let u = map(&pre);
+            out.push(resolve(&u));
+            out.push(resolve(cut_query(&u)));
+        }
+        out
+    }
+}
+
+/// True when a path PATTERN could widen itself: at any decoding depth its text contains a `.`/`..`
+/// segment, `;`, `\`, `?`, `#` or NUL, or it cannot be decoded safely.
+pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
+    let Some(chain) = decode_chain(body) else {
+        return true;
+    };
+    chain.iter().any(|c| {
+        c.contains([';', '\\', '?', '#', '\0']) || c.split('/').any(|s| s == "." || s == "..")
+    })
+}
 ```
 `matcher.rs` (encima de los tests):
 ```rust
 use crate::model::{InjectionKind, Rule};
-use crate::normalize::strict_path;
+use crate::normalize::PathView;
 use std::collections::HashMap;
 
 pub enum Decision<'a> {
@@ -1359,29 +1525,45 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// Path matching on two views: the forwarded (normalized) form against the pattern as written,
-/// AND the strict form (`strict_path`) against the strict form of the pattern. Both must match.
-/// `*` matches everything. An unjudgeable path (`strict` is `None`) matches no other pattern.
-fn path_matches(pattern: &str, path: &str, strict: Option<&str>) -> bool {
+/// Path matching on ALL readings: every percent-decoding depth (0..=8) crossed with every parsing
+/// variant (query cut, `;` strip, `\` as `/`). EVERY reading of the path must match the reading of
+/// the pattern at the same position. `*` matches everything. An unjudgeable path (`view` is
+/// `None`) or pattern matches no other pattern.
+fn path_matches(pattern: &str, path: &PathView) -> bool {
     if pattern == "*" {
         return true;
     }
-    let Some(strict) = strict else {
+    let (body, prefix) = match pattern.strip_suffix('*') {
+        Some(p) => (p, true),
+        None => (pattern, false),
+    };
+    let Some(pat) = PathView::new(body) else {
         return false;
     };
-    match pattern.strip_suffix('*') {
-        Some(prefix) => {
-            path.starts_with(prefix)
-                && strict_path(prefix).is_some_and(|sp| strict.starts_with(&sp))
-        }
-        None => pattern == path && strict_path(pattern).is_some_and(|sp| sp == strict),
-    }
+    let depths = path.depths().max(pat.depths());
+    let full = path.needs_variants() || pat.needs_variants();
+    (0..depths).all(|d| {
+        let want = pat.readings_at(d, full);
+        let got = path.readings_at(d, full);
+        got.iter().zip(&want).all(|(g, w)| {
+            if prefix {
+                g.starts_with(w.as_str())
+            } else {
+                g == w
+            }
+        })
+    })
 }
 
-/// (exact host, exact path, path pattern length): higher wins.
-fn specificity(r: &Rule, host: &str) -> (bool, bool, usize) {
+/// (exact host, wildcard suffix length, exact path, path pattern length): higher wins.
+fn specificity(r: &Rule, host: &str) -> (bool, usize, bool, usize) {
     (
         r.host_pattern == host,
+        if r.host_pattern.starts_with("*.") {
+            r.host_pattern.len()
+        } else {
+            0
+        },
         !r.path_pattern.ends_with('*'),
         r.path_pattern.len(),
     )
@@ -1395,13 +1577,14 @@ pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> 
     if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
     }
-    let strict = strict_path(path);
-    // Candidates match host and path (both views); methods are applied only AFTER the
+    let view = PathView::new(path);
+    // Candidates match host and path (every reading); methods are applied only AFTER the
     // specificity comparison so a narrower rule is never shadowed by a broader one.
     let mut groups: HashMap<(InjectionKind, String), Vec<&Rule>> = HashMap::new();
     for r in rules {
         if host_matches(&r.host_pattern, host)
-            && path_matches(&r.path_pattern, path, strict.as_deref())
+            && (r.path_pattern == "*"
+                || view.as_ref().is_some_and(|v| path_matches(&r.path_pattern, v)))
         {
             groups
                 .entry((r.kind, r.target_name.to_ascii_lowercase()))
@@ -3217,7 +3400,7 @@ async fn disallowed_method_is_403_and_never_reaches_upstream() {
 async fn path_traversal_cannot_escape_a_restricted_rule() {
     let (env, up, t) = setup(&["GET"], "/repos/*").await;
     assert_eq!(proxy_request(&env, &t, HOST, "GET", "/repos/ok", &[], vec![], false).await.status, 200);
-    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/other"] {
+    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/repos/x%252F..%252F..%252Frepos%252Fz%252Fw%2F..%2F..%2Fadmin", "/repos/..;%2Frepos%2Fx/..;/admin", "/repos/..%2F..%2Fadmin%3F%2F..%2F..%2Frepos%2Fy", "/repos/%u002e%u002e/admin", "/other"] {
         assert_eq!(proxy_request(&env, &t, HOST, "GET", p, &[], vec![], false).await.status, 403, "{p}");
     }
     assert_eq!(up.received.lock().unwrap().len(), 1);
