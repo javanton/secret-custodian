@@ -104,6 +104,10 @@ pub(crate) fn strip_routing_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// Rewrites the request for the origin: strips hop-by-hop and routing headers, removes the
+/// agent's copies of every injected header/parameter, adds the injections and sets the request
+/// target to `path` plus the (re-assembled) query. `path` is the path to forward: the original
+/// `uri.path()` when no path-restricted rule is involved, `normalize_path` of it otherwise.
 pub fn apply(
     parts: &mut Parts,
     path: &str,
@@ -127,8 +131,19 @@ pub fn apply(
             InjectionKind::Header => {
                 let name =
                     HeaderName::from_bytes(inj.name.as_bytes()).map_err(|_| InjectError::Header)?;
-                // `remove` drops every value under this (case-insensitive) name.
-                parts.headers.remove(&name);
+                // Drop every agent-supplied header that is the same header to a frontend that
+                // treats `_` and `-` alike (`X_Api_Key`, `x-api_key`, ...), not just the exact
+                // case-insensitive name.
+                let target = normalize_header_name(name.as_str());
+                let doomed: Vec<HeaderName> = parts
+                    .headers
+                    .keys()
+                    .filter(|k| normalize_header_name(k.as_str()) == target)
+                    .cloned()
+                    .collect();
+                for h in doomed {
+                    parts.headers.remove(h);
+                }
                 let mut v = HeaderValue::from_str(&inj.value).map_err(|_| InjectError::Header)?;
                 v.set_sensitive(true);
                 parts.headers.insert(name, v);
@@ -221,10 +236,30 @@ mod tests {
     }
 
     #[test]
-    fn path_is_rewritten_to_the_normalized_one() {
+    fn path_is_replaced_by_the_one_given() {
         let mut p = parts("/repos/../admin?z=1", &[]);
         apply(&mut p, "/admin", &[]).unwrap();
         assert_eq!(p.uri.to_string(), "/admin?z=1");
+    }
+
+    #[test]
+    fn lookalike_names_of_an_injected_header_are_removed() {
+        let mut p = parts(
+            "/x",
+            &[
+                ("x_api_key", "a1"),
+                ("X_Api_Key", "a2"),
+                ("x-api-key", "a3"),
+                ("x-api_key", "a4"),
+                ("x-other", "keep"),
+            ],
+        );
+        apply(&mut p, "/x", &[inj(Header, "X-API-Key", "REAL")]).unwrap();
+        let names: Vec<_> = p.headers.keys().map(|k| k.as_str().to_string()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(p.headers.get_all("x-api-key").iter().count(), 1);
+        assert_eq!(p.headers.get("x-api-key").unwrap(), "REAL");
+        assert_eq!(p.headers.get("x-other").unwrap(), "keep");
     }
 
     #[test]

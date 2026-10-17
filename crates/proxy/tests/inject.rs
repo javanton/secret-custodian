@@ -280,8 +280,9 @@ async fn gitlab_style_encoded_project_path_still_injects() {
 }
 
 #[tokio::test]
-async fn normalized_path_is_what_gets_forwarded() {
-    let (env, up, t) = setup(&["GET"], "*").await;
+async fn judged_path_is_what_gets_forwarded_under_a_restricted_rule() {
+    // Under a `*` rule nothing is judged and the original path is kept (see review_fixes.rs).
+    let (env, up, t) = setup(&["GET"], "/a/*").await;
     proxy_request(&env, &t, HOST, "GET", "//a/./b//c", &[], vec![], false).await;
     assert_eq!(up.received.lock().unwrap()[0].uri, "/a/b/c");
 }

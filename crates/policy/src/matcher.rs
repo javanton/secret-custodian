@@ -73,6 +73,15 @@ pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
     rules.iter().any(|r| host_matches(&r.host_pattern, host))
 }
 
+/// True when some rule whose host pattern matches `host` has a path pattern other than `*`:
+/// the path of a request to that host may be judged, so the proxy must forward exactly the path
+/// that was judged (`normalize_path`). When false, no path is ever judged for this host.
+pub fn has_path_restricted_rule_for_host(rules: &[Rule], host: &str) -> bool {
+    rules
+        .iter()
+        .any(|r| host_matches(&r.host_pattern, host) && r.path_pattern != "*")
+}
+
 pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> Decision<'a> {
     if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
@@ -879,5 +888,20 @@ mod tests {
     fn has_rules_for_host_ignores_method_and_path() {
         let rules = [rule(1, "a.com", "/only/*", &["GET"], Header, "A")];
         assert!(has_rules_for_host(&rules, "a.com"));
+    }
+
+    #[test]
+    fn path_restricted_rule_for_host_ignores_star_and_other_hosts() {
+        let rules = [
+            rule(1, "a.com", "*", &[], Header, "A"),
+            rule(2, "*.b.com", "/v1/*", &[], Header, "A"),
+            rule(3, "c.com", "/exact", &[], Header, "A"),
+        ];
+        assert!(!has_path_restricted_rule_for_host(&rules, "a.com"));
+        assert!(has_path_restricted_rule_for_host(&rules, "x.b.com"));
+        assert!(has_path_restricted_rule_for_host(&rules, "c.com"));
+        assert!(!has_path_restricted_rule_for_host(&rules, "b.com"));
+        assert!(!has_path_restricted_rule_for_host(&rules, "unknown.com"));
+        assert!(!has_path_restricted_rule_for_host(&[], "a.com"));
     }
 }

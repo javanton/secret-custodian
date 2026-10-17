@@ -294,6 +294,106 @@ pub(crate) fn audit(
     }
 }
 
+/// Audits a forwarded request exactly once.
+///
+/// Created right before the upstream request is dispatched and finished (`finish`) when the
+/// outcome is known. If it is dropped first - the agent closed the connection or reset the
+/// stream, so the handler future was dropped while the credential may already be on its way -
+/// the row is written as `client-aborted` with no status.
+pub(crate) struct AuditGuard {
+    state: Arc<ProxyState>,
+    identity: Identity,
+    host: String,
+    method: String,
+    path: String,
+    rule_id: Option<i64>,
+    /// `inject` or `passthrough`: the decision recorded when the response head arrives.
+    decision: &'static str,
+    done: bool,
+}
+
+impl AuditGuard {
+    pub fn new(
+        state: &Arc<ProxyState>,
+        identity: &Identity,
+        host: &str,
+        method: &str,
+        path: &str,
+        rule_id: Option<i64>,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            identity: identity.clone(),
+            host: host.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            rule_id,
+            decision: if rule_id.is_none() {
+                "passthrough"
+            } else {
+                "inject"
+            },
+            done: false,
+        }
+    }
+
+    /// Writes the row with the guard's own decision (the origin answered with `status`).
+    pub fn finish(self, status: Option<u16>) {
+        let d = self.decision;
+        self.finish_as(d, status);
+    }
+
+    /// Writes the row with an explicit decision (e.g. `upstream-error`).
+    pub fn finish_as(mut self, decision: &str, status: Option<u16>) {
+        self.done = true;
+        self.write(decision, status);
+    }
+
+    fn write(&self, decision: &str, status: Option<u16>) {
+        audit(
+            &self.state,
+            &self.identity,
+            &self.host,
+            &self.method,
+            &self.path,
+            decision,
+            status,
+            self.rule_id,
+        );
+    }
+}
+
+impl Drop for AuditGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.write("client-aborted", None);
+        }
+    }
+}
+
+/// 503 for a vault/policy failure: audited as `internal-error` (when the audit table is still
+/// writable) and answered with a static body. The error itself is logged by the caller, without
+/// request data. Nothing is ever forwarded or tunnelled after this.
+pub(crate) fn service_unavailable(
+    state: &ProxyState,
+    id: &Identity,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Response<ProxyBody> {
+    audit(
+        state,
+        id,
+        host,
+        method,
+        path,
+        "internal-error",
+        Some(503),
+        None,
+    );
+    text(StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -355,7 +455,7 @@ async fn plain(
 
     let role = match get_role(&state.vault, &identity.role) {
         Ok(Some(r)) => r,
-        _ => {
+        Ok(None) => {
             audit(
                 &state,
                 identity,
@@ -368,8 +468,18 @@ async fn plain(
             );
             return text(StatusCode::FORBIDDEN, "role not found\n");
         }
+        Err(e) => {
+            tracing::error!(error = %e, "could not load the role");
+            return service_unavailable(&state, identity, &host, &method, &target);
+        }
     };
-    let rules = list_rules(&state.vault, Some(&identity.role)).unwrap_or_default();
+    let rules = match list_rules(&state.vault, Some(&identity.role)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "could not load rules");
+            return service_unavailable(&state, identity, &host, &method, &target);
+        }
+    };
     let has_rules = has_rules_for_host(&rules, &host);
     if !has_rules && role.unmatched == Unmatched::Deny {
         audit(
@@ -422,7 +532,7 @@ async fn connect(
 
     let role = match get_role(&state.vault, &identity.role) {
         Ok(Some(r)) => r,
-        _ => {
+        Ok(None) => {
             audit(
                 &state,
                 identity,
@@ -435,8 +545,18 @@ async fn connect(
             );
             return text(StatusCode::FORBIDDEN, "role not found\n");
         }
+        Err(e) => {
+            tracing::error!(error = %e, "could not load the role");
+            return service_unavailable(&state, identity, &host, "CONNECT", "/");
+        }
     };
-    let rules = list_rules(&state.vault, Some(&identity.role)).unwrap_or_default();
+    let rules = match list_rules(&state.vault, Some(&identity.role)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "could not load rules");
+            return service_unavailable(&state, identity, &host, "CONNECT", "/");
+        }
+    };
 
     if has_rules_for_host(&rules, &host) {
         if !state.ca.is_host_permitted(&host) {

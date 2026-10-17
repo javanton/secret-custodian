@@ -1,14 +1,17 @@
 use crate::{
     body::{watch, Keep},
     inject,
-    server::{audit, identity_limit, text, Limits},
+    server::{audit, identity_limit, service_unavailable, text, AuditGuard, Limits},
     upstream::{BoxError, ProxyBody, UpstreamError},
     ProxyState,
 };
 use http_body_util::BodyExt;
 use hyper::{body::Incoming, header::HOST, Request, Response, StatusCode};
 use sg_auth::Identity;
-use sg_policy::{evaluate, list_rules, normalize_host, normalize_path, render, Decision};
+use sg_policy::{
+    evaluate, has_path_restricted_rule_for_host, list_rules, normalize_host, normalize_path,
+    render, Decision,
+};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -68,8 +71,13 @@ fn fail(
 /// Judges one request against the role's rules, injects, and relays it to the destination.
 ///
 /// The audit row is written before the response is returned (so before its first byte reaches
-/// the agent). The path judged by `evaluate` is `normalize_path(uri.path())` and exactly that
-/// path is forwarded.
+/// the agent), exactly once per forwarded request: if the agent goes away while the upstream
+/// request is in flight, an `AuditGuard` writes it as `client-aborted`.
+///
+/// The path judged by `evaluate` is always `normalize_path(uri.path())`. When any rule of the
+/// role that matches the host is path-restricted, exactly that judged path is forwarded;
+/// otherwise nothing is judged by path and the agent's original path is forwarded untouched
+/// (origins such as S3-style key stores care about `//` and escapes).
 ///
 /// `keep` is held by the response body until it is done, aborted or dropped. Bodies in both
 /// directions are aborted when they stop moving for `limits.body_idle_timeout`.
@@ -112,22 +120,31 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
     }
 
     let path = normalize_path(parts.uri.path());
-    // Reloaded for every request, so rule changes apply to open tunnels immediately.
+    // Reloaded for every request, so rule changes apply to open tunnels immediately. A failure
+    // is never "no rules": it is a 503 and nothing is forwarded.
     let rules = match list_rules(&st.vault, Some(&ctx.identity.role)) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "could not load rules");
-            return fail(
-                ctx,
-                &method,
-                &raw_target,
-                "upstream-error",
-                StatusCode::BAD_GATEWAY,
-                None,
-                "internal error\n",
-            );
+            return service_unavailable(st, &ctx.identity, &ctx.host, &method, &raw_target);
         }
     };
+    let forward_path = if has_path_restricted_rule_for_host(&rules, &ctx.host) {
+        path.clone()
+    } else {
+        parts.uri.path().to_string()
+    };
+    if forward_path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return fail(
+            ctx,
+            &method,
+            &raw_target,
+            "bad-request",
+            StatusCode::BAD_REQUEST,
+            None,
+            "bad request target\n",
+        );
+    }
     let (matched, rule_id) = match evaluate(&rules, &ctx.host, &method, &path) {
         Decision::Inject(m) => {
             // Credentials are NEVER injected over plain HTTP (no exception, not even localhost).
@@ -216,16 +233,31 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
         }
     }
 
-    if inject::apply(&mut parts, &path, &resolved).is_err() {
-        return fail(
-            ctx,
-            &method,
-            &raw_target,
-            "upstream-error",
-            StatusCode::BAD_GATEWAY,
-            rule_id,
-            "could not build the upstream request\n",
-        );
+    match inject::apply(&mut parts, &forward_path, &resolved) {
+        Ok(()) => {}
+        // The original path cannot be represented as an origin-form target.
+        Err(inject::InjectError::Uri) => {
+            return fail(
+                ctx,
+                &method,
+                &raw_target,
+                "bad-request",
+                StatusCode::BAD_REQUEST,
+                rule_id,
+                "bad request target\n",
+            );
+        }
+        Err(_) => {
+            return fail(
+                ctx,
+                &method,
+                &raw_target,
+                "upstream-error",
+                StatusCode::BAD_GATEWAY,
+                rule_id,
+                "could not build the upstream request\n",
+            );
+        }
     }
     let default_port = if ctx.tls { 443 } else { 80 };
     let bare = if ctx.host.contains(':') {
@@ -279,6 +311,9 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
     // Local services: loopback is reachable only over TLS (an agent cannot forge a certificate
     // trusted for `localhost`), for the exact host `localhost` and with an applicable rule.
     let local_service = ctx.tls && ctx.host == "localhost" && rule_id.is_some();
+    // From here on the credential may reach the origin: the row is written once, whatever
+    // happens, even when the agent drops this future.
+    let audit_guard = AuditGuard::new(st, &ctx.identity, &ctx.host, &method, &raw_target, rule_id);
     let result = st
         .upstream
         .send_to(&ctx.host, ctx.port, ctx.tls, outgoing, local_service)
@@ -286,21 +321,7 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
     drop(resolved); // wipe the decrypted values as soon as the request is on its way
     match result {
         Ok(resp) => {
-            let decision = if rule_id.is_none() {
-                "passthrough"
-            } else {
-                "inject"
-            };
-            audit(
-                st,
-                &ctx.identity,
-                &ctx.host,
-                &method,
-                &raw_target,
-                decision,
-                Some(resp.status().as_u16()),
-                rule_id,
-            );
+            audit_guard.finish(Some(resp.status().as_u16()));
             let (mut rparts, rbody) = resp.into_parts();
             inject::strip_hop_by_hop(&mut rparts.headers);
             let rbody: ProxyBody = rbody.map_err(|e| -> BoxError { Box::new(e) }).boxed();
@@ -308,27 +329,15 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
             keep.push(Box::new(up_guard));
             Response::from_parts(rparts, watch(rbody, idle, keep))
         }
-        Err(UpstreamError::TargetDenied) => fail(
-            ctx,
-            &method,
-            &raw_target,
-            "target-denied",
-            StatusCode::FORBIDDEN,
-            rule_id,
-            "destination not allowed\n",
-        ),
+        Err(UpstreamError::TargetDenied) => {
+            audit_guard.finish_as("target-denied", Some(StatusCode::FORBIDDEN.as_u16()));
+            text(StatusCode::FORBIDDEN, "destination not allowed\n")
+        }
         Err(e) => {
             // `e` carries no request data: only connect/TLS/IO descriptions.
             tracing::warn!(error = %e, host = %ctx.host, "upstream failure");
-            fail(
-                ctx,
-                &method,
-                &raw_target,
-                "upstream-error",
-                StatusCode::BAD_GATEWAY,
-                rule_id,
-                "upstream request failed\n",
-            )
+            audit_guard.finish_as("upstream-error", Some(StatusCode::BAD_GATEWAY.as_u16()));
+            text(StatusCode::BAD_GATEWAY, "upstream request failed\n")
         }
     }
 }

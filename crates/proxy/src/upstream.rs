@@ -5,6 +5,8 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::{
     collections::HashMap,
+    future::Future,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, OnceLock},
     time::Duration,
@@ -202,8 +204,12 @@ pub struct UpstreamConfig {
     /// Test/ops knob: connect to this address instead of resolving the host. An address with
     /// port 0 only supplies the IP; the requested port is kept.
     pub resolve_override: HashMap<String, SocketAddr>,
-    /// Bound on the TCP connect to the destination.
+    /// Overall bound on the TCP connect to the destination (resolution and every attempt).
     pub connect_timeout: Duration,
+    /// Bound on each single connection attempt when a host has several vetted addresses (default
+    /// 3 s): one blackholed address must not use up the whole `connect_timeout`, so the next
+    /// address gets its turn. Each attempt gets `min(remaining overall budget, this)`.
+    pub connect_attempt_timeout: Duration,
     /// Bound on TLS handshake plus sending the request until the response head arrives (default
     /// 120 s). The response body is not bounded (it is streamed). Note that when the origin
     /// waits for the whole request body before answering, this also bounds slow uploads.
@@ -235,6 +241,7 @@ impl UpstreamConfig {
             tls: Arc::new(tls),
             resolve_override: HashMap::new(),
             connect_timeout: Duration::from_secs(10),
+            connect_attempt_timeout: Duration::from_secs(3),
             response_header_timeout: Duration::from_secs(120),
             net_policy: NetPolicy::default(),
             max_upstream_connections: 256,
@@ -278,14 +285,13 @@ impl UpstreamConfig {
             if vetted.is_empty() {
                 return Err(UpstreamError::TargetDenied);
             }
-            let mut last = String::new();
-            for a in vetted {
-                match TcpStream::connect(a).await {
-                    Ok(s) => return Ok(s),
-                    Err(e) => last = e.to_string(),
-                }
-            }
-            Err(UpstreamError::Connect(last))
+            connect_each(
+                &vetted,
+                self.connect_timeout,
+                self.connect_attempt_timeout,
+                TcpStream::connect,
+            )
+            .await
         };
         tokio::time::timeout(self.connect_timeout, fut)
             .await
@@ -344,6 +350,42 @@ impl UpstreamConfig {
     }
 }
 
+/// Tries `addrs` in order, each attempt bounded by `min(remaining overall budget, per_attempt)`,
+/// and returns the first connection. `Timeout` when the overall budget is spent; otherwise the
+/// last error. `connect_one` is the single-address connector (`TcpStream::connect`; tests
+/// substitute their own).
+async fn connect_each<T, F, Fut>(
+    addrs: &[SocketAddr],
+    overall: Duration,
+    per_attempt: Duration,
+    mut connect_one: F,
+) -> Result<T, UpstreamError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + overall;
+    let mut last = String::from("no address");
+    for a in addrs {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(UpstreamError::Timeout);
+        }
+        match tokio::time::timeout(remaining.min(per_attempt), connect_one(*a)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = e.to_string(),
+            Err(_) => last = "connect attempt timed out".into(),
+        }
+    }
+    if deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .is_zero()
+    {
+        return Err(UpstreamError::Timeout);
+    }
+    Err(UpstreamError::Connect(last))
+}
+
 /// The addresses of the exact name `localhost` (RFC 6761).
 fn localhost_addrs(port: u16) -> Vec<SocketAddr> {
     vec![
@@ -376,6 +418,85 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::future::pending;
+    use std::time::Instant;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(192, 0, 2, last).into(), 80)
+    }
+
+    #[tokio::test]
+    async fn a_hanging_address_does_not_starve_the_next_one() {
+        let (a, b) = (addr(1), addr(2));
+        let started = Instant::now();
+        let got = connect_each(
+            &[a, b],
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            |x| async move {
+                if x == a {
+                    pending::<io::Result<SocketAddr>>().await
+                } else {
+                    Ok(x)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, b);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn the_overall_budget_still_bounds_all_attempts() {
+        let started = Instant::now();
+        let err = connect_each(
+            &[addr(1), addr(2), addr(3)],
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            |_| pending::<io::Result<SocketAddr>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpstreamError::Timeout), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn failing_then_working_address_connects_and_all_failing_reports_the_last_error() {
+        let (a, b) = (addr(1), addr(2));
+        let ok = connect_each(
+            &[a, b],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            |x| async move {
+                if x == a {
+                    Err(io::Error::other("refused"))
+                } else {
+                    Ok(x)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok, b);
+        let err = connect_each(
+            &[a],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            |_| async { Err::<SocketAddr, _>(io::Error::other("refused")) },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpstreamError::Connect(m) if m.contains("refused")));
+    }
+
+    #[test]
+    fn attempt_timeout_defaults_to_three_seconds() {
+        let c = UpstreamConfig::new(vec![]);
+        assert_eq!(c.connect_attempt_timeout, Duration::from_secs(3));
+    }
 
     #[test]
     fn localhost_resolves_to_loopback_only() {
