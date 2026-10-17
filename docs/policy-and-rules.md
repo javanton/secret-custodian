@@ -7,8 +7,9 @@ judged. Sources: `crates/policy/src/{model,store,matcher,normalize,render}.rs`,
 `crates/proxy/tests/inject.rs`. The spec reference is section 6.2 of
 [`docs/specs/2026-10-16-secret-guardian-vault.md`](specs/2026-10-16-secret-guardian-vault.md).
 
-There is no CLI or admin API yet (planned). Rules are created through the `sg_policy` functions
-(`add_role`, `add_rule`); the JSON shape shown in section 9 is the `serde` shape of `NewRule`.
+Rules are created with `sg rule add` (see [cli-reference.md](cli-reference.md#sg-rule)), the web UI, or
+`POST /rules` of the admin API ([admin-api.md](admin-api.md)); all call `sg_policy::add_rule`. The JSON shown in
+section 10 is the body of `POST /rules`.
 
 ## 1. Roles and the `Unmatched` policy
 
@@ -399,13 +400,14 @@ Principles:
 3. Prefer path prefixes that end in `/*` and start with the API's fixed root; avoid `*` unless the whole host is
    intended.
 4. Do not add a second `*` rule for the same destination on the same host unless you want it to cover everything.
-5. The CA must permit the host (`CaService::allow_domain`, see [tokens-and-ca.md](tokens-and-ca.md)); otherwise the
+5. The CA must permit the host (`sg ca allow-domain`, see [tokens-and-ca.md](tokens-and-ca.md)); otherwise the
    CONNECT for a ruled host answers `502`.
 6. Hosts are exact or one-label wildcards; add separate rules for each hostname (for example `api.github.com`
    and `uploads.github.com` are different hosts).
 
-Examples, as `NewRule` JSON (the shape the planned admin API would take; secret ids refer to
-secrets created beforehand with `Vault::add_secret`):
+Examples, as the JSON body of `POST /rules` (secret ids refer to secrets created beforehand with `sg secret add`; with the
+CLI, the first rule below is `sg rule add --role reviewer --host api.github.com --path '/repos/*' --methods GET --header
+Authorization --template 'Bearer {secret}' --secret gh`):
 
 GitHub, read-only role and read-write role (`Authorization: Bearer <token>`):
 

@@ -5,8 +5,10 @@ HTTPS request flows through the process, and why the main design decisions were 
 is derived from the code in `crates/` at the commit this documentation was written against; where a
 statement refers to a file, the file (and function) is cited so it can be checked.
 
-Status: the crates `core`, `policy`, `auth`, `ca` and `proxy` are implemented. The crates `admin`, `cli`
-and the binary `sg` exist in the workspace only as empty stubs (see [Planned](#planned-not-implemented)).
+Status: all eight workspace members are implemented; phase 1 is complete (what is not done is listed in
+[Beyond phase 1](#beyond-phase-1)). For the details of one area see the companion pages:
+[proxy-internals.md](proxy-internals.md), [admin-api.md](admin-api.md), [security-model.md](security-model.md),
+[operations.md](operations.md), [cli-reference.md](cli-reference.md) and [testing.md](testing.md).
 
 - Spec: [`docs/specs/2026-10-16-secret-guardian-vault.md`](specs/2026-10-16-secret-guardian-vault.md)
 - Plan: [`docs/plans/2026-10-16-secret-guardian-vault.md`](plans/2026-10-16-secret-guardian-vault.md)
@@ -32,6 +34,8 @@ The threat model summary (full table in spec section 2):
 | The CA private key leaks | The CA carries X.509 name constraints, so it can only sign for the domains the operator allowed (see [tokens-and-ca.md](tokens-and-ca.md)). |
 | An agent token leaks | Optional expiry, immediate revocation, and an audit trail keyed by `jti`. The proxy re-verifies the token before every request inside an open tunnel (`crates/proxy/src/mitm.rs`). |
 | The agent uses the proxy to reach unplanned hosts | Per-role `Unmatched` policy: `passthrough` (opaque tunnel) or `deny` (see [policy-and-rules.md](policy-and-rules.md)). |
+| The agent uses the proxy to reach loopback, cloud metadata or the vault itself | Network policy on the resolved address (`NetPolicy` in `crates/proxy/src/upstream.rs`); the proxy's and web UI's own ports are always denied. See [proxy-internals.md](proxy-internals.md#network-policy). |
+| A web page attacks the local admin UI | Loopback bind, `Host` and `Origin` checks, bearer sessions instead of cookies, one-time login tokens, CSP. See [admin-api.md](admin-api.md). |
 | The agent crafts paths that escape a restricted rule | Paths are judged "closed by construction" (see [policy-and-rules.md](policy-and-rules.md)). |
 
 Explicit limit (spec section 2): an agent that can reach the proxy can make requests with the
@@ -54,14 +58,14 @@ The workspace (`Cargo.toml`) has eight members. Crate names on disk are `crates/
 | `policy` (`sg-policy`) | implemented | Roles, rules and their validation; host/path/method matching; rendering the injected value. | `add_role`/`get_role`/`list_roles`/`remove_role`, `add_rule`/`list_rules`/`remove_rule`, `NewRule`, `Rule`, `Role`, `Unmatched`, `InjectionKind`, `PolicyError`, `evaluate`, `has_rules_for_host`, `Decision`, `normalize_host`, `normalize_path`, `is_ip_literal`, `render`. | `core` |
 | `auth` (`sg-auth`) | implemented | Issues and verifies agent tokens (EdDSA JWT), revocation, parsing of `Proxy-Authorization`. | `TokenService` (`new`, `issue`, `revoke`, `revoke_machine`, `list`), trait `TokenVerifier`, `Identity`, `IssuedToken`, `TokenMeta`, `AuthError`, `extract_proxy_token`. | `core` |
 | `ca` (`sg-ca`) | implemented | The name-constrained CA, leaf certificates, leaf cache. | `CaService` (`init_or_load`, `cert_pem`, `domains`, `allow_domain`, `is_host_permitted`, `server_config_for`), `CaError`, `crypto_provider`. | `core` |
-| `proxy` (`sg-proxy`) | implemented (CONNECT/MITM only) | Proxy listener, CONNECT handling, TLS termination, per-request policy evaluation, injection, upstream relay, audit of proxy events. | `serve`, `serve_with`, `ServeOptions`, `ProxyState`, `UpstreamConfig`. | `core`, `policy`, `auth`, `ca` |
-| `admin` (`sg-admin`) | planned (stub) | REST admin API, web sessions, embedded assets. | none yet (`crates/admin/src/lib.rs` is one line) | declared: `core`, `policy`, `auth`, `ca` |
-| `cli` (`sg-cli`) | planned (stub) | `clap` client that talks to `admin` over a Unix socket. | none yet | declared: `core` |
-| `sg` | planned (stub) | The single binary that assembles everything. | `crates/sg/src/main.rs` is one line | declared: all of the above |
+| `proxy` (`sg-proxy`) | implemented | Proxy listener, CONNECT handling (MITM and passthrough), plain-HTTP handling (never injected), TLS termination, per-request policy evaluation, injection, upstream relay, network policy, per-identity limits, audit of proxy events. | `serve`, `serve_with`, `ServeOptions`, `ProxyState`, `UpstreamConfig`, `NetPolicy`. | `core`, `policy`, `auth`, `ca` |
+| `admin` (`sg-admin`) | implemented | JSON admin API on two routers (Unix socket without authentication of its own; loopback web with Host/Origin guards, one-time login and bearer sessions), embedded web assets, connection limits. | `api_router`, `socket_router`, `web_router`, `serve_unix(_with)`, `serve_web(_with)`, `bind_unix`, `AppState`, `Sessions`, `AdminServeOptions`. See [admin-api.md](admin-api.md). | `core`, `policy`, `auth`, `ca` |
+| `cli` (`sg-cli`) | implemented | The client commands (`secret`, `role`, `rule`, `token`, `ca`, `audit`, `login-url`): `clap` definitions, a Unix-socket HTTP client that checks socket ownership, secret input rules, table and JSON output. See [cli-reference.md](cli-reference.md). | `ClientCommand`, `ClientOpts`, `run_main`, `run_io`, `call`, `call_raw`. | `core` |
+| `sg` | implemented | The single binary: `sg serve` (key sources, data directory, assembly of the three servers, signal handling), `sg keygen`, and the client commands. | binary only (`crates/sg/src/{main,serve,keys}.rs`) | all of the above |
 
 Dependencies are exactly those of each `Cargo.toml` (`crates/*/Cargo.toml`). Note that `policy`, `auth`
-and `ca` do not depend on each other: they only share `core`, and are composed by `proxy` (and later
-by `admin`). `TokenVerifier` is a trait so another validator (for example OIDC, a future phase) could
+and `ca` do not depend on each other: they only share `core`, and are composed by `proxy` and by
+`admin`. `TokenVerifier` is a trait so another validator (for example OIDC, a future phase) could
 be plugged into `ProxyState::verifier` without touching `policy` or `proxy`.
 
 ```mermaid
@@ -71,9 +75,9 @@ graph TD
     auth["auth (sg-auth)<br/>tokens, Proxy-Authorization"]
     ca["ca (sg-ca)<br/>name-constrained CA, leaves"]
     proxy["proxy (sg-proxy)<br/>CONNECT, MITM, injection"]
-    admin["admin (planned)"]
-    cli["cli (planned)"]
-    sg["sg binary (planned)"]
+    admin["admin (sg-admin)<br/>API, sessions, web assets"]
+    cli["cli (sg-cli)<br/>socket client, commands"]
+    sg["sg binary<br/>serve, keygen"]
 
     policy --> core
     auth --> core
@@ -82,22 +86,47 @@ graph TD
     proxy --> policy
     proxy --> auth
     proxy --> ca
-    admin -.-> core
-    admin -.-> policy
-    admin -.-> auth
-    admin -.-> ca
-    cli -.-> core
-    sg -.-> proxy
-    sg -.-> admin
-    sg -.-> cli
-    sg -.-> core
-    sg -.-> policy
-    sg -.-> auth
-    sg -.-> ca
+    admin --> core
+    admin --> policy
+    admin --> auth
+    admin --> ca
+    cli --> core
+    sg --> proxy
+    sg --> admin
+    sg --> cli
+    sg --> core
+    sg --> policy
+    sg --> auth
+    sg --> ca
 ```
 
-Solid arrows are real dependencies in the implemented crates; dashed arrows are declared in the
-`Cargo.toml` of the planned crates (they have no code yet).
+Arrows are the dependencies declared in each `Cargo.toml`. At run time the `admin` and `proxy` crates do not call
+each other: they share only the `Vault`, `TokenService` and `CaService` instances that `sg serve` builds.
+
+### Process layout of `sg serve`
+
+`crates/sg/src/serve.rs` assembles one process with three listeners that share the same state:
+
+```mermaid
+flowchart TD
+    start["sg serve"] --> dir["prepare data dir (0700)"]
+    dir --> probe["probe admin socket path (refuse a live one)"]
+    probe --> key["resolve key source (file, env or passphrase)"]
+    key --> open["open or create vault.db"]
+    open --> svc["TokenService, CaService"]
+    svc --> bind["bind proxy and web TCP listeners"]
+    bind --> t1["task: proxy (sg-proxy)"]
+    bind --> t2["task: web admin (sg-admin)"]
+    bind --> t3["task: admin socket (sg-admin)"]
+    t3 --> ready["socket is 0600: print proxy, admin, socket, ready"]
+    ready --> wait["wait for SIGINT or SIGTERM, or a task ending"]
+    wait --> stop["abort tasks, remove socket, exit"]
+```
+
+The proxy's network policy is given the actually bound proxy and web addresses (for wildcard binds, also every interface
+address at those ports) so that the proxy can never be pointed at the vault itself. The login token printed on the
+`admin:` line is the first entry of the in-memory `Sessions` store; the same store backs `POST /login` on the web
+listener and `POST /admin/login-token` on the socket.
 
 ### What each crate owns in the database
 
@@ -169,7 +198,9 @@ Step notes (all from the cited files):
    8 KiB, parsed by `sg_auth::extract_proxy_token`, then `TokenVerifier::verify`. Any failure returns
    `407` with `Proxy-Authenticate: Basic realm="secret-guardian"`. **No audit row is written for a
    failed authentication** (there is no identity to attribute it to). A request that is not CONNECT
-   gets `501` "plain HTTP proxying is not enabled yet".
+   is handled as plain HTTP (`server.rs`, `plain`): credentials are never injected into it, so it is either
+   forwarded untouched (host without rules under a `passthrough` role) or refused; see
+   [proxy-internals.md](proxy-internals.md#plain-http-absolute-form).
 2. **CONNECT target** (`server.rs`, `connect`): the authority must exist, contain no `@`, and its host
    must pass `normalize_host`; port defaults to 443; port 0 is rejected (`400`, audited as `bad-request` with the identity).
 3. **Role and rules**: an unknown role (e.g. the role was deleted after the token was issued) gives
@@ -179,7 +210,7 @@ Step notes (all from the cited files):
    only then answers `200` (`passthrough`, or `tunnel-connect-failed` with `502`).
 4. **CA check**: if the host has rules but the CA's name constraints do not permit it
    (`CaService::is_host_permitted`), the answer is `502` with a hint to run `sg ca allow-domain`
-   (audit `ca-not-permitted`). The hint names a command that does not exist yet (planned CLI).
+   (audit `ca-not-permitted`).
 5. **TLS termination** (`mitm.rs`): after the `200`, the connection is upgraded, the leaf config for the
    host is obtained from `CaService::server_config_for`, and `hyper_util`'s auto builder serves HTTP/1.1
    or HTTP/2 according to ALPN.
@@ -201,24 +232,27 @@ Step notes (all from the cited files):
    upstream request is on its way.
 10. **Upstream** (`upstream.rs`): a fresh TCP connection per request (10 s connect timeout), TLS via
     `rustls` with system roots plus any extra roots given to `UpstreamConfig::new`, then an HTTP/1.1
-    exchange; 60 s bound on handshake plus request until the response head arrives; the response body
-    is streamed and not bounded. Failures give `502` with audit `upstream-error`.
+    exchange; 120 s bound on handshake plus request until the response head arrives; the response body
+    is streamed, never buffered, and aborted if it makes no progress for 60 s. The destination address is
+    vetted by the network policy first (`403`, audit `target-denied`). Failures give `502` with audit
+    `upstream-error`.
 11. **Audit and response**: the row (`inject`, status of the upstream response, id of the first
     matching rule) is written once the upstream response head has been received and before the response
     is returned to the agent (truncated bodies keep the status of the head that was sent). The audited path is the raw
     request path with the query string removed, not the normalized one. If writing the audit row fails,
     the error is logged and the request proceeds (`server.rs`, `audit`).
 
-Audit decision values written by the proxy (all found in `server.rs`, `mitm.rs`, `forward.rs`):
-`mitm`, `passthrough` (CONNECT and, in `forward`, no-rule requests, which cannot occur today because
-`allow_unruled` is always `false`), `unmatched-denied`, `unknown-role`, `ca-not-permitted`,
-`tunnel-connect-failed`, `token-invalid`, `host-mismatch`, `forbidden`, `plaintext-refused`
-(plain `http://` to a host with rules, always: credentials are never injected without TLS), `bad-request`
-(authenticated but malformed `400`), `identity-limit` (`429`, per-token cap), `inject`, `upstream-error`.
+The sixteen audit decision strings the proxy can write (found in `server.rs`, `mitm.rs`, `forward.rs`) are explained
+one by one, with their status codes, in [proxy-internals.md](proxy-internals.md#audit-decisions): `mitm`, `passthrough`
+(CONNECT, and plain HTTP to an unruled host), `inject`, `unmatched-denied`, `unknown-role`, `ca-not-permitted`,
+`tunnel-connect-failed`, `target-denied`, `identity-limit`, `bad-request`, `token-invalid`, `method-refused`,
+`host-mismatch`, `forbidden`, `plaintext-refused` and `upstream-error`.
 
-Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`): at most 1024 simultaneous client
-connections (excess clients wait in the kernel backlog because the permit is taken before `accept`), and
-30 s to send a complete request head.
+Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`; `sg serve` uses the defaults): at most 1024
+simultaneous client connections (excess clients wait in the kernel backlog because the permit is taken before
+`accept`), 30 s to send a complete request head, 10 minutes of tunnel inactivity, 8 hours of tunnel lifetime, 64 tunnels
+and 64 concurrent upstream requests per token, 60 s without body progress. The full table is in
+[proxy-internals.md](proxy-internals.md).
 
 ## 4. Concurrency model
 
@@ -243,6 +277,10 @@ connections (excess clients wait in the kernel backlog because the permit is tak
 - **Crypto calls are synchronous and run on the async worker threads** (AES-GCM and ed25519 are cheap;
   Argon2id only runs at `Vault::init`/`open` with a passphrase). SQLite calls also block the worker
   thread while holding the mutex; the design accepts this because it is a local single-operator tool.
+- **The admin servers** (`crates/admin/src/serve.rs`) are plain hyper HTTP/1 connections served from the same runtime,
+  with a connection cap (256), a header-read timeout (10 s) and a maximum connection lifetime (1 h). Handlers call the
+  synchronous `Vault` directly. `Sessions` (login tokens and web sessions) keeps two small mutex-protected maps of
+  SHA-256 digests, capped at 8 pending login tokens and 16 sessions.
 - **CA leaf issuance** holds the cache lock while issuing so concurrent callers for one host share one
   leaf (`server_config_for`).
 - **WAL mode** is enabled at init (`PRAGMA journal_mode=WAL`), but with a single connection per process the
@@ -313,10 +351,13 @@ an independent oracle.
 - **Tokens are stateless but registered.** Verification checks the signature offline, then requires the
   `jti` to exist in `tokens` and not be revoked (details in [tokens-and-ca.md](tokens-and-ca.md)).
 
-## Planned (not implemented)
+## Beyond phase 1
 
-The following is described in the spec and the plan but has no code today and must not be relied on:
-the `admin` REST API and web UI, the `cli` crate and the `sg` binary (including `sg serve`, `sg keygen`,
-`sg ca allow-domain`, key-file loading, `--upstream-ca`), Docker packaging, and the plain-HTTP proxy path
-(today a non-CONNECT request gets `501`). See the plan:
+Everything described on this page exists in the code. The spec ([section 10](specs/2026-10-16-secret-guardian-vault.md))
+lists what is deliberately left for later phases and must not be relied on today: a launcher/sidecar (`sg run`) that
+keeps the token out of the agent's reach; remote administration with a login (opt-in); OIDC federation as a second
+`TokenVerifier` with per-agent tokens; injection into request bodies and request signing (SigV4, HMAC). Also not
+implemented: rotation of the master key, data key, token signing key and CA key; removal of a CA domain; audit retention;
+schema migrations. Known limitations and residual risks are collected in [security-model.md](security-model.md#non-goals-and-residual-risks);
+the plan that built phase 1 is
 [`docs/plans/2026-10-16-secret-guardian-vault.md`](plans/2026-10-16-secret-guardian-vault.md).

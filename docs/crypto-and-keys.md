@@ -34,9 +34,11 @@ graph TD
 
 The three user-facing sources of the spec (key file `--key-file`/`SG_KEY_FILE`, env var
 `SG_MASTER_KEY`, passphrase prompt) map onto those two variants: key file and env var both yield a
-base64 32-byte key (`Raw`), the passphrase yields `Passphrase`. **The code that reads the key file, the
-environment variable or the terminal does not exist yet** (planned `sg`/`cli`); `sg-core` only offers
-`kek_from_base64` and `kek_from_passphrase`. `sg keygen` is likewise not implemented.
+base64 32-byte key (`Raw`), the passphrase yields `Passphrase`. The code that reads them is in
+`crates/sg/src/keys.rs` (`resolve_key`): exactly one source must be given; a key file must have no group/other
+permission bits (mode `0600`); `SG_MASTER_KEY` is read from the environment only (never a flag); the passphrase is
+prompted on a terminal (twice when the vault is first created). `sg keygen --out FILE` writes a new random key
+(base64, mode `0600`, never overwrites). `sg-core` itself only offers `kek_from_base64` and `kek_from_passphrase`.
 
 **Argon2id parameters** (`crypto.rs`, `argon2id()`), fixed explicitly so a crate default change cannot
 alter derived keys:
@@ -168,7 +170,9 @@ What it cannot guarantee:
 
 `WrongKey` vs `KeySourceMismatch` distinguishes only the *kind* of key source, which is visible
 in plaintext `meta.kdf` anyway; a wrong value of the right kind and a corrupt file give the same
-`WrongKey`. The spec says the failure reason is not revealed; the code reveals the kind mismatch.
+`WrongKey`. The spec says the failure reason is not revealed: `sg serve` honours that by printing the same
+`could not unlock the vault with the given key source` for `WrongKey`, `KeySourceMismatch`, `InvalidKey` and `Crypto`
+(`open_error` in `crates/sg/src/serve.rs`); only the library error types distinguish them.
 
 ## 8. What an attacker with X can do
 

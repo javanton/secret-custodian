@@ -42,8 +42,8 @@ A token from one vault does not verify on another (test `token_from_one_vault_do
    (`TokenService::list` returns `TokenMeta` without it).
 
 `issue` does not check that the role exists: tokens for a non-existent role can be issued and then fail with
-`403` (`unknown-role`) at CONNECT. The library does not limit the maximum TTL; the plan puts a 10-year cap in the
-(not yet implemented) admin API.
+`403` (`unknown-role`) at CONNECT. The library does not limit the maximum TTL; the admin API and the CLI cap it at 10 years (315360000 s). The admin API
+also checks that the role exists (`unknown role`).
 
 ### 1.3 Verification order
 
@@ -175,7 +175,7 @@ Consequences:
   `leaf_issued_before_allow_domain_still_verifies_against_the_reissued_ca`).
 - A client that still trusts the **old** certificate refuses the newly allowed domain (its constraints are narrower;
   test `old_ca_certificate_refuses_a_newly_allowed_domain`). Agents must reload the exported public certificate after each
-  `allow_domain` that adds a domain. The spec says the CLI/UI warn about this; neither exists yet.
+  `allow_domain` that adds a domain. `sg ca allow-domain` prints a notice, `sg rule add` warns when a rule's host is not permitted, and the web UI shows both.
 - The random serial matters because the issuer name and key stay the same across re-issues.
 - `init_or_load` on an existing vault also rebuilds the signing certificate object (new serial) from the stored key and
   domains; the stored `cert_pem` (what operators export) is not replaced, and leaves signed by the rebuilt object verify
@@ -204,8 +204,7 @@ Consequences:
 
 When a host has rules but is not permitted, the proxy never reaches this point: CONNECT is answered `502` with the
 message `the CA does not permit <host>; run 'sg ca allow-domain <domain>' and reload the CA certificate` and audit
-`ca-not-permitted` (the command is part of the planned CLI and does not exist yet; programmatically it is
-`CaService::allow_domain`).
+`ca-not-permitted` (`sg ca allow-domain`).
 
 Upstream connections are independent of this CA: the proxy validates the real server's certificate with the system
 roots plus any extra roots in `UpstreamConfig::new` (`upstream.rs`).
@@ -229,17 +228,18 @@ Most of these variables **replace** the tool's trust store rather than extend it
 breaks verification of hosts that are not intercepted; when such an agent also talks to passthrough hosts, point the
 variable at a file with the system roots plus this CA. Re-export the file after each `allow_domain` that adds a domain.
 
+Known defect: leaf certificates carry no Authority Key Identifier, so strict verifiers (Python 3.13+ default contexts) refuse them; see the README, "Configure an agent".
+
 Known limitations (spec section 6.5 and 11; these are properties of the clients, not verifiable in this code base):
 
 - Tools with certificate pinning will refuse the proxy's certificate.
 - Java uses its own trust store and ignores these variables (it needs the CA imported into its keystore).
 - Binaries that ignore the environment variables, as the spec says of some Go programs, will not trust the CA.
 - Libraries that do not enforce name constraints get no protection from the CA's constraints.
-- Plain HTTP is not proxied at all today (`501`), and websockets or upgrades are only handled for the initial request
-  (spec 6.5; the code strips `Upgrade`).
+- Plain HTTP is proxied but never receives injected credentials ([proxy-internals.md](proxy-internals.md#plain-http-absolute-form)); websockets and other upgrades are not supported
+  (the proxy strips `Upgrade`).
 
-## Planned (not implemented)
+## Commands
 
-`sg ca export`, `sg ca allow-domain`, `sg ca status`, the web download of the certificate, `sg token create|revoke|ls`,
-the admin API TTL cap, and the `TokenVerifier` for OIDC are in the spec and plan only. See
-[`docs/plans/2026-10-16-secret-guardian-vault.md`](plans/2026-10-16-secret-guardian-vault.md).
+`sg ca export|allow-domain|status` and `sg token create|revoke|revoke-machine|ls` are documented in
+[cli-reference.md](cli-reference.md); the web UI offers the same operations.

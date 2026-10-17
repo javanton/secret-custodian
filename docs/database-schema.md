@@ -233,7 +233,9 @@ value, no token signing key and no CA private key. The test `database_file_never
 - The directory that holds the file is not created or chmod-ed by `sg-core`. `paths::default_data_dir`
   only computes a path (`$XDG_DATA_HOME/secret-guardian`, else `$HOME/.local/share/secret-guardian`, else
   `/tmp/secret-guardian`; empty or relative variables are ignored). Creating and securing the directory
-  is left to the (planned) CLI.
+  is done by `sg serve` (`prepare_data_dir` in `crates/sg/src/serve.rs`): it creates the directory and any missing
+  parents with mode `0700`, tightens a looser directory it owns (`note: tightened <dir> to mode 0700`) and refuses
+  one owned by another user.
 - `Vault::open` never creates a file: if the path does not exist it returns `CoreError::Io` (kind
   `NotFound`) and creates nothing, and it opens SQLite with `SQLITE_OPEN_READ_WRITE` only (no `CREATE`
   flag). `Vault::open_or_init` calls `init` when the path does not exist.
@@ -277,8 +279,9 @@ database, or has no `meta` table, produces `CoreError::Db`.
 ## 7. Versioning and migration status
 
 `SCHEMA_VERSION` is `1` and is written to `meta.schema_version` at init. `Vault::open` reads it back
-after the key is verified and refuses any other value with `CoreError::UnsupportedSchema`, which is
-mapped to an internal error (500) by the admin API. There is no migration framework and no
+after the key is verified and refuses any other value with `CoreError::UnsupportedSchema`, which
+`sg serve` reports at start-up as `database schema version N is not supported by this build (supports 1)` and exits
+with status 1 (`open_error` in `crates/sg/src/serve.rs`); the server never starts on such a file. There is no migration framework and no
 `ALTER TABLE` in the code. As the code stands:
 
 - A vault created by a future version that changed the schema is refused by this code with
@@ -299,8 +302,11 @@ No upgrade or downgrade path is promised by this document.
   Store them separately.
 - The vault is opened in WAL mode: the consistent state is the main file together with `-wal`/`-shm`.
   A raw copy of only the main file while the process is running can miss committed data that is still in
-  the WAL. The code contains no backup command; a copy taken with the process stopped (or any SQLite-aware
-  online backup) is what the code can guarantee. This page does not document a backup tool because none exists.
+  the WAL (observed: a freshly started server had a 4096-byte `vault.db` and a 70 KB `-wal`). The program has no
+  backup command. What works: stop the server and copy the files, or take an online copy through SQLite's backup
+  API (verified with Python's `sqlite3` module against a running server; a vault started from that copy had the same
+  secrets, tokens and CA certificate). Exact commands, permissions to restore and audit pruning are in
+  [operations.md](operations.md#backups).
 - A restored database keeps its tokens, CA and signing key: previously issued tokens stay valid
   (subject to expiry and revocation) and agents do not need to reload the CA certificate. A different
   database, even with the same key, has a different DEK, signing key and CA.
