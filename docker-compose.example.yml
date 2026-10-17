@@ -1,9 +1,14 @@
 # Example deployment of Secret Guardian. Copy to docker-compose.yml and adjust.
 #
 # Setup:
-#   1. Create the master key once and back it up (losing it means losing every stored secret):
-#        docker run --rm -v "$PWD":/out --entrypoint sg secret-guardian:dev keygen --out /out/sg.key
-#      (or `sg keygen --out sg.key` on the host). The file is mode 0600 and owned by you.
+#   1. Create the master key once and back it up (losing it means losing every stored secret).
+#      Easiest: `sg keygen --out sg.key` on the host (mode 0600, owned by you). Or generate it inside
+#      a volume as root and hand it to the container user (uid 10001), then mount that volume at
+#      /run/secrets instead of using the `secrets:` entry below:
+#        docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-guardian:dev \
+#          -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
+#      (A plain `docker run -v "$PWD":/out ... keygen --out /out/sg.key` fails with `Permission
+#      denied`: uid 10001 cannot write to your directory.)
 #   2. The key is delivered as a Docker secret. Compose file-based secrets are bind-mounted with the
 #      host file's ownership, so the `uid`/`mode` below only take effect with Swarm; with plain
 #      `docker compose` make the HOST file readable only by uid 10001:
@@ -18,7 +23,10 @@
 #        docker compose exec secret-guardian sg token create --machine agent1 --role reviewer \
 #            --proxy-url http://secret-guardian:8080
 #      Web UI: docker compose exec secret-guardian sg login-url   (open the printed link on the host,
-#      it points to http://localhost:9090).
+#      it points to http://localhost:9090). If you publish the UI on another host port, e.g.
+#      "127.0.0.1:19090:9090", add `--admin-public-url http://localhost:19090` to `command:` (or set
+#      SG_ADMIN_PUBLIC_URL): the printed link then names that URL and its Host is accepted, so
+#      `--admin-allowed-host` is not needed.
 #
 # Security notes:
 #   * The admin UI has NO remote login: it is published on the host loopback only, and every session

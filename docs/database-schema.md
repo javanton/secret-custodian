@@ -99,7 +99,7 @@ every `Vault::init` and `Vault::open`.
   references the secret).
 - Readers: `list_secrets` and `get_secret_meta` (metadata only, never `value_enc`),
   `reveal_for_injection` (decrypts; the proxy only), `sg_policy` validation (`SELECT COUNT(*) ... WHERE id`).
-- Value constraints (`validate_secret_value`): non-empty, at most 8192 bytes, no CR, LF or NUL.
+- Value constraints (`validate_secret_value`): non-empty, at most 8192 bytes, no control characters (bytes below 0x20 except TAB, and 0x7F); non-ASCII UTF-8 is allowed.
 
 ### 2.3 `roles`
 

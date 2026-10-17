@@ -325,7 +325,9 @@ REST/JSON sobre `axum`. Recursos: `secrets`, `roles`, `rules`, `tokens`, `ca`, `
 
 ### 7.2 Seguridad de la web local
 
-- Validación estricta de `Host` (`localhost`, `127.0.0.1`) contra DNS rebinding.
+- Validación estricta de `Host` contra DNS rebinding. Valores aceptados: `localhost:<puerto>`,
+  `127.0.0.1:<puerto>` y `[::1]:<puerto>`, más los de `--admin-allowed-host` y
+  `--admin-public-url`; siempre con el puerto.
 - Al arrancar (o con `sg login-url`, que usa solo el socket Unix) se imprime una URL de un solo
   uso `http://localhost:<puerto>/#t=<token>`. El token va en el **fragmento**, que el navegador
   nunca envía al servidor ni en `Referer`. La página lo lee, lo borra con `history.replaceState`
@@ -351,14 +353,14 @@ REST/JSON sobre `axum`. Recursos: `secrets`, `roles`, `rules`, `tokens`, `ca`, `
 ### 7.3 CLI
 
 ```
-sg serve [--key-file|--passphrase] [--proxy-bind] [--admin-bind] [--data-dir] [--socket] [--upstream-ca <pem>]
+sg serve [--key-file|--passphrase] [--proxy-bind] [--admin-bind] [--admin-public-url] [--data-dir] [--socket] [--upstream-ca <pem>]
 sg keygen   [--out <fichero>]
 sg secret   add|rotate|rm|ls
 sg role     add|rm|ls            (--unmatched passthrough|deny)
 sg rule     add|rm|ls            (--role --host --path --methods --header|--query --template --secret)
 sg token    create|revoke|ls     (--machine --role --ttl)
 sg ca       export|allow-domain|status
-sg audit    ls [--role --host --since]
+sg audit       [--role --host --since]
 ```
 
 `sg secret add` lee el valor de stdin o de un prompt sin eco, nunca de argumentos de línea

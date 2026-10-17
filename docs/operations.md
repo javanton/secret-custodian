@@ -48,6 +48,11 @@ flags, and a health check that runs `sg ca status`. The default command is
 | Admin socket (default `$XDG_RUNTIME_DIR/secret-guardian.sock`, else `<data dir>/sg.sock`) | socket `0600` in a directory that is `0700` and owned by the server's user | the server's user | The socket **is** the admin credential. The server refuses to create it in a directory open to others, and the CLI refuses to use one |
 | Exported CA certificate (`sg ca export`) | anything | - | Public; distribute freely, but only to the agents that need it |
 
+Logging: warnings and errors go to stderr (default `RUST_LOG=warn`); only connection-level `debug` events exist beyond
+that, nothing is logged at `info`. First-run detection: `sg serve` treats a missing, empty or table-less `vault.db` (what a
+crashed first start leaves behind) as uninitialised, removes the leftovers and initialises again, so the passphrase is asked
+twice in that case; a database with tables but no `meta` row is reported as corrupt, never silently replaced.
+
 Why `XDG_RUNTIME_DIR` by default: it is `0700`, per user and cleaned at logout. If it is not set the fallback is
 inside the data directory (already `0700`). A shared directory such as `/tmp` is refused unless it is a private
 subdirectory you created with `chmod 700`.
@@ -226,8 +231,11 @@ flowchart LR
   agent on the `agents` network *can* reach `secret-guardian:9090`; that is why the proxy refuses to relay to its own
   ports, the UI checks `Host`/`Origin` and everything needs a one-time login token. Do not publish 9090 on any other
   interface.
-- If you publish the UI on another host port (`-p 127.0.0.1:19090:9090`) add `--admin-allowed-host localhost:19090`,
-  and note that the login URL printed by `sg login-url` inside the container names port `9090`: replace it by hand.
+- If you publish the UI on another host port (`-p 127.0.0.1:19090:9090`) add `--admin-public-url http://localhost:19090`
+  (or `SG_ADMIN_PUBLIC_URL`): the `admin:` line and `sg login-url` then print that URL and its host:port joins the
+  `Host`/`Origin` allowlist, so `--admin-allowed-host` is only needed for additional names. The web listener is plain HTTP and
+  `Origin` must be `http://<allowed host>`, so an `https://` public URL (TLS terminated elsewhere) is accepted but its
+  browser requests with an `https://` `Origin` are still refused.
 - Run the CLI inside the container: `docker compose exec secret-guardian sg secret ls`; secrets via
   `printf %s "$TOKEN" | docker compose exec -T secret-guardian sg secret add github`.
 - Hardening used by the example and verified by the Docker end-to-end script: read-only root filesystem, `tmpfs`
@@ -245,7 +253,7 @@ flowchart LR
   then mount the volume read-only at `/run/secrets`; (b) `sudo chown 10001:10001 sg.key && sudo chmod 0400 sg.key` on the
   host (the compose example's route; not run here because it needs root); (c) pass `SG_MASTER_KEY` and drop `--key-file`
   from the command. Routes (a) and (c) were run and work. Also note that
-  `docker run --rm -v "$PWD":/out --entrypoint sg ... keygen --out /out/sg.key` (a step in the compose file's comments)
+  `docker run --rm -v "$PWD":/out --entrypoint sg ... keygen --out /out/sg.key`
   fails with `Permission denied` unless the host directory is writable by uid 10001; run `sg keygen` on the host or use
   (a).
 - Agents that are not in Docker use the published/host-side proxy address instead; keep the proxy bound to loopback or
@@ -366,7 +374,7 @@ Messages are copied from real runs. "Agent side" means what the agent's HTTP cli
 | `sg serve`: `error: already running: <socket> accepts connections` | A live server owns the socket | Use another `--socket` and `--data-dir`, or stop the other one |
 | `sg serve`: `error: database schema version 99 is not supported by this build (supports 1)` | The database was written by a different version | Run a matching build; restore a backup |
 | `sg serve`: `WARNING: the admin interface is bound to 0.0.0.0:...` | Non-loopback `--admin-bind` | Fine inside a container whose port is published to host loopback only; otherwise bind loopback |
-| Browser: `unexpected Host header` (HTTP 421) | The UI was opened with a `Host` the server does not allow (another port, a hostname, an IP in a container) | Open the URL printed by `sg login-url`; add `--admin-allowed-host host:port` for published/remapped ports |
+| Browser: `unexpected Host header` (HTTP 421) | The UI was opened with a `Host` the server does not allow (another port, a hostname, an IP in a container) | Open the URL printed by `sg login-url`; set `--admin-public-url http://host:port` (or add `--admin-allowed-host host:port`) for published/remapped ports |
 | Browser: "Sign in required" / `invalid or already used login token` | Link used twice, older than 10 minutes, or the server restarted | `sg login-url` for a fresh link |
 | Agent: `curl: (56) CONNECT tunnel failed, response 407` | No, wrong, malformed, expired or revoked token | Check `HTTPS_PROXY` (token in the password position); `sg token ls` shows `STATUS` |
 | Agent: `curl: (56) CONNECT tunnel failed, response 403` | Host has no rule for the role and the role is `deny` (audit `unmatched-denied`), the role was deleted (`unknown-role`), or the network policy refused the target (`target-denied`, e.g. loopback or the vault's own port) | `sg audit --limit 5` shows which; add a rule or use a `passthrough` role; `--allow-loopback-targets` for local test targets |

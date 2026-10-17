@@ -89,7 +89,9 @@ ids are autoincrement and used as the final tie-break.
   keeps the other parameters in order, drops empty `&&` fragments, and appends `target_name=<encoded>` at
   the end.
 - A rendered value containing CR, LF or NUL is rejected (`invalid injection value`, `502`). A secret
-  containing `{secret}` is not expanded twice.
+  containing `{secret}` is not expanded twice. The vault itself refuses to store values with any control character, so a
+  header value that `http::HeaderValue` would refuse cannot normally exist; if one does (a template adding such a
+  character), the `502` is accompanied by a `warn` log naming the rule id and host, never the value.
 - Independent of rules, the proxy strips from the forwarded request all hop-by-hop headers, every
   `Proxy-*` header, and headers named in `Connection`; the same on the response (`strip_hop_by_hop`).
 

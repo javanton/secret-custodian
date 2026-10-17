@@ -150,7 +150,7 @@ Metadata object (`SecretMeta`): `{"id": 3, "name": "api-key", "created_at": 1792
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
 | `GET /secrets` | - | `200` array of `SecretMeta`, sorted by name | - |
-| `POST /secrets` | `{"name": "api-key", "value": "..."}` | `201` `SecretMeta` | `400` `invalid name: use [a-z0-9._-], max 64 chars`, `400` `invalid secret value: empty` / `too long` / `contains CR, LF or NUL`; `409` `already exists` |
+| `POST /secrets` | `{"name": "api-key", "value": "..."}` | `201` `SecretMeta` | `400` `invalid name: use [a-z0-9._-], max 64 chars`, `400` `invalid secret value: empty` / `too long` / `contains control characters`; `409` `already exists` |
 | `GET /secrets/{name}` | - | `200` `SecretMeta` | `400` invalid name, `404` `not found` |
 | `PUT /secrets/{name}` (rotate) | `{"value": "..."}` | `200` `SecretMeta` with `rotated_at` set | as above, `404` |
 | `DELETE /secrets/{name}` | - | `204` | `404`; `409` `still referenced by a rule` |

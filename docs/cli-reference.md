@@ -70,6 +70,7 @@ sg serve [OPTIONS]
 | `--socket <PATH>` | `SG_SOCKET` | see above | Admin socket to create. Its directory must be yours and `0700`. A stale socket file is replaced; a socket with a live server is refused. |
 | `--proxy-bind <ADDR>` | `SG_PROXY_BIND` | `127.0.0.1:8080` | Address of the proxy. Must be `IP:port` (a hostname such as `localhost:80` is a usage error). Port `0` picks a free port; the real one is printed. |
 | `--admin-bind <ADDR>` | `SG_ADMIN_BIND` | `127.0.0.1:9090` | Address of the web UI. A non-loopback address prints a warning (there is no remote login). |
+| `--admin-public-url <URL>` | `SG_ADMIN_PUBLIC_URL` | `http://localhost:<bound admin port>` | The URL you really use to reach the web UI, `http(s)://host[:port]` without userinfo, path, query or fragment (invalid values end the start with an error). It is printed on the `admin:` line, returned by `sg login-url`, and its host:port (the bare host too when the port is the scheme default) is added to the `Host`/`Origin` allowlist. |
 | `--admin-allowed-host <HOST:PORT>` | - | none | Extra `Host`/`Origin` value accepted by the web UI. Repeatable. Needed when a container publishes the UI on a different port. |
 | `--key-file <FILE>` | `SG_KEY_FILE` | none | Master key file: base64 of 32 bytes, as written by `sg keygen`. Must be mode `0600` (no group/other bits). |
 | `--passphrase` | - | off | Derive the master key from a passphrase typed at a prompt. Needs a terminal. |
@@ -95,8 +96,8 @@ ready
 
 `ready` is printed once all three listeners are bound and the socket is `0600`. The `admin:` line is a
 **one-time login URL** for the web UI (valid 10 minutes, single use). The proxy line shows the bound address
-(`http://0.0.0.0:8080` inside a container). The login URL always names the port the process bound; if a
-container publishes the UI on another host port, fix the port by hand and add `--admin-allowed-host`.
+(`http://0.0.0.0:8080` inside a container). The login URL names `http://localhost:<bound port>` unless `--admin-public-url` is given; if a
+container publishes the UI on another host port, pass `--admin-public-url http://localhost:<hostport>`.
 Warnings and errors go to stderr.
 
 **Start-up order and failures.** The data directory is prepared, then the socket path is probed (a live
@@ -108,7 +109,9 @@ the start fails (an empty data directory may remain).
 **Stopping.** `SIGINT` or `SIGTERM`: listeners are dropped, the socket file is removed, exit code `0`.
 A second signal exits immediately with `130`.
 
-**First start.** `vault.db` is created (`0600`), a random data key and the token signing key are generated and
+**First start.** A missing, empty or table-less `vault.db` (`Vault::needs_init`; a crashed first start leaves one) counts as a
+first run: leftovers are removed and the vault is initialised (a database with tables but no `meta` row is corrupt and is
+an error). `vault.db` is created (`0600`), a random data key and the token signing key are generated and
 sealed under the master key, and a CA with no permitted domains is created. Nothing else is created
 automatically: you add roles, secrets, rules and CA domains.
 
@@ -122,7 +125,7 @@ hint: the web UI only accepts Host values for port 45631; if it is published on 
 The `hint:` line appears only when the port is not `9090` and no `--admin-allowed-host` was given.
 
 Host values the web UI accepts by default: `localhost:<port>`, `127.0.0.1:<port>`, `[::1]:<port>`, plus every
-`--admin-allowed-host`. `Origin` must be exactly `http://<one of those>`.
+`--admin-allowed-host` and `--admin-public-url` value. `Origin` must be exactly `http://<one of those>`.
 
 ## `sg keygen`
 
