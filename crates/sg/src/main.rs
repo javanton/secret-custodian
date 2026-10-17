@@ -45,7 +45,8 @@ EXAMPLE WORKFLOW
     after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Admin socket of a running `sg serve` (default: $XDG_RUNTIME_DIR/secret-guardian.sock)
+    /// Admin socket of a running `sg serve` (default: $XDG_RUNTIME_DIR/secret-guardian.sock; when
+    /// XDG_RUNTIME_DIR is unset, empty or relative: <data dir>/sg.sock)
     #[arg(long, global = true, env = "SG_SOCKET", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[command(flatten)]

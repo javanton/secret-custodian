@@ -644,6 +644,99 @@ fn the_proxy_and_admin_ports_are_denied_as_connect_targets() {
 }
 
 #[test]
+fn admin_public_url_drives_the_printed_and_minted_urls_and_the_host_allowlist() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let bind = format!("127.0.0.1:{port}");
+    let s = start_with(&bind, &["--admin-public-url", "http://localhost:12345"]);
+    assert!(
+        s.login.starts_with("http://localhost:12345/#t="),
+        "admin line: {}",
+        s.login
+    );
+    let (ok, url) = sg(&s, &["login-url"], None);
+    assert!(
+        ok && url.trim().starts_with("http://localhost:12345/#t="),
+        "{url}"
+    );
+    // no --admin-allowed-host needed: the public URL's host:port is accepted
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.write_all(
+        b"GET /api/secrets HTTP/1.1\r\nHost: localhost:12345\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut resp = String::new();
+    let _ = raw.read_to_string(&mut resp);
+    assert!(resp.contains(" 401 "), "Host guard must pass: {resp}");
+    // while an unrelated Host is still refused
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.write_all(
+        b"GET /api/secrets HTTP/1.1\r\nHost: evil.example:12345\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut resp = String::new();
+    let _ = raw.read_to_string(&mut resp);
+    assert!(resp.contains(" 421 "), "{resp}");
+}
+
+#[test]
+fn invalid_admin_public_url_is_refused_at_startup() {
+    let dir = private_tempdir();
+    let key = dir.path().join("k.key");
+    keygen(&key);
+    let out = sg_cmd()
+        .args(["serve", "--data-dir"])
+        .arg(dir.path().join("d"))
+        .arg("--socket")
+        .arg(dir.path().join("s.sock"))
+        .arg("--key-file")
+        .arg(&key)
+        .args(["--admin-public-url", "http://h:1/path"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--admin-public-url"), "{err}");
+}
+
+#[test]
+fn an_empty_vault_file_counts_as_a_first_run_and_is_initialised() {
+    let dir = private_tempdir();
+    let key = dir.path().join("k.key");
+    keygen(&key);
+    let data = dir.path().join("d");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("vault.db"), b"").unwrap();
+    let mut c = sg_cmd()
+        .args(["serve", "--data-dir"])
+        .arg(&data)
+        .arg("--socket")
+        .arg(dir.path().join("s.sock"))
+        .arg("--key-file")
+        .arg(&key)
+        .args(["--proxy-bind", "127.0.0.1:0", "--admin-bind", "127.0.0.1:0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(c.stdout.take().unwrap()).lines();
+    let mut ready = false;
+    for l in lines.by_ref().map_while(Result::ok) {
+        if l == "ready" {
+            ready = true;
+            break;
+        }
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(ready, "serve did not recover from the empty vault file");
+    assert!(std::fs::metadata(data.join("vault.db")).unwrap().len() > 0);
+}
+
+#[test]
 fn help_texts_are_meaningful() {
     let top = sg_cmd().arg("--help").output().unwrap();
     let t = String::from_utf8_lossy(&top.stdout).to_string();
@@ -663,6 +756,10 @@ fn help_texts_are_meaningful() {
         assert!(t.contains(needle), "sg --help lacks {needle}:\n{t}");
     }
     assert!(t.contains("SECURITY MODEL") && t.contains("EXAMPLE"), "{t}");
+    assert!(
+        t.contains("sg.sock") && t.contains("XDG_RUNTIME_DIR"),
+        "socket fallback undocumented:\n{t}"
+    );
     let serve = sg_cmd().args(["serve", "--help"]).output().unwrap();
     let t = String::from_utf8_lossy(&serve.stdout).to_string();
     for needle in [
@@ -674,11 +771,14 @@ fn help_texts_are_meaningful() {
         "--upstream-ca",
         "--allow-loopback-targets",
         "--admin-allowed-host",
+        "--admin-public-url",
+        "SG_ADMIN_PUBLIC_URL",
         "SG_MASTER_KEY",
         "SG_KEY_FILE",
     ] {
         assert!(t.contains(needle), "sg serve --help lacks {needle}:\n{t}");
     }
+    assert!(!t.contains("RUST_LOG=info"), "nothing logs at info:\n{t}");
     let kg = sg_cmd().args(["keygen", "--help"]).output().unwrap();
     assert!(String::from_utf8_lossy(&kg.stdout).contains("--out"));
 }

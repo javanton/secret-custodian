@@ -30,7 +30,12 @@ KEY SOURCES (exactly one):
   --passphrase                      prompt (twice on first creation); needs a terminal
 
 OUTPUT (stdout, one item per line): `proxy: <url>`, `admin: <login url>`, `socket: <path>`, then
-`ready` once every listener is bound. Warnings and logs go to stderr (RUST_LOG=info for more).
+`ready` once every listener is bound. Warnings and errors go to stderr; RUST_LOG=debug adds
+connection-level detail (nothing is logged at info level).
+
+The web UI is plain HTTP on --admin-bind. When it is reached through a published port or a name
+other than localhost:<bound port>, pass --admin-public-url: that URL is printed and used by
+`sg login-url`, and its host:port is accepted as Host/Origin.
 
 Stop with SIGINT or SIGTERM (the socket file is removed); a second SIGINT forces the exit.")]
 pub struct ServeArgs {
@@ -43,8 +48,13 @@ pub struct ServeArgs {
     /// Address of the local web UI. Anything but loopback prints a warning: there is no remote login
     #[arg(long, env = "SG_ADMIN_BIND", default_value = "127.0.0.1:9090")]
     admin_bind: SocketAddr,
-    /// Extra Host/Origin accepted by the web UI, e.g. when a container publishes it on another
-    /// port (repeatable)
+    /// URL the operator actually uses to reach the web UI, e.g. http://localhost:19090 when a
+    /// container publishes 9090 on host port 19090. Printed on the `admin:` line, returned by
+    /// `sg login-url`, and its host:port is accepted as Host/Origin. Default:
+    /// http://localhost:<bound admin port>
+    #[arg(long, env = "SG_ADMIN_PUBLIC_URL", value_name = "URL", value_parser = parse_public_url)]
+    admin_public_url: Option<PublicUrl>,
+    /// Extra Host/Origin accepted by the web UI (repeatable); not needed for --admin-public-url
     #[arg(long = "admin-allowed-host", value_name = "HOST:PORT")]
     admin_allowed_host: Vec<String>,
     /// File with the master key (base64 of 32 bytes, as written by `sg keygen`; must be mode 0600)
@@ -64,6 +74,75 @@ pub struct ServeArgs {
     /// The proxy's and the admin UI's own ports stay denied either way
     #[arg(long)]
     allow_loopback_targets: bool,
+}
+
+/// A validated `--admin-public-url`: `base` has no trailing slash, `hosts` are the `Host` values
+/// browsers send for it (with the port; the bare host too when the port is the scheme default).
+#[derive(Clone, Debug)]
+pub struct PublicUrl {
+    base: String,
+    hosts: Vec<String>,
+}
+
+/// Accepts only `http(s)://host[:port]` (optionally one trailing `/`): no userinfo, path, query
+/// or fragment.
+fn parse_public_url(s: &str) -> Result<PublicUrl, String> {
+    const MSG: &str = "expected http(s)://host[:port] without userinfo, path, query or fragment";
+    let (scheme, rest, default_port) = if let Some(r) = s.strip_prefix("http://") {
+        ("http", r, 80u16)
+    } else if let Some(r) = s.strip_prefix("https://") {
+        ("https", r, 443u16)
+    } else {
+        return Err(MSG.into());
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.is_empty()
+        || rest.contains(['/', '?', '#', '@', '\\', ' '])
+        || rest.chars().any(char::is_control)
+    {
+        return Err(MSG.into());
+    }
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']').ok_or(MSG)?;
+        addr.parse::<std::net::Ipv6Addr>().map_err(|_| MSG)?;
+        let port = match after {
+            "" => None,
+            a => Some(a.strip_prefix(':').ok_or(MSG)?),
+        };
+        (format!("[{addr}]"), port)
+    } else {
+        let (h, p) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        let ok = !h.is_empty()
+            && !h.contains(':')
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if !ok {
+            return Err(MSG.into());
+        }
+        (h.to_ascii_lowercase(), p)
+    };
+    let port = match port {
+        Some(p) => Some(
+            p.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or("the port must be 1-65535")?,
+        ),
+        None => None,
+    };
+    Ok(match port {
+        Some(p) => PublicUrl {
+            base: format!("{scheme}://{host}:{p}"),
+            hosts: vec![format!("{host}:{p}")],
+        },
+        None => PublicUrl {
+            base: format!("{scheme}://{host}"),
+            hosts: vec![format!("{host}:{default_port}"), host],
+        },
+    })
 }
 
 impl ServeArgs {
@@ -212,13 +291,20 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
     let login = sessions.new_login_token();
     let mut allowed_hosts = allowed_hosts_for(admin_addr);
     allowed_hosts.extend(args.admin_allowed_host.iter().cloned());
+    let web_base_url = match &args.admin_public_url {
+        Some(u) => {
+            allowed_hosts.extend(u.hosts.iter().cloned());
+            u.base.clone()
+        }
+        None => format!("http://localhost:{}", admin_addr.port()),
+    };
     let app = AppState {
         vault,
         tokens,
         ca,
         sessions,
         allowed_hosts,
-        web_base_url: Some(format!("http://localhost:{}", admin_addr.port())),
+        web_base_url: Some(web_base_url.clone()),
     };
 
     // Signal handlers first, so a signal during start-up is not lost.
@@ -268,7 +354,7 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
     }
 
     println!("proxy: http://{proxy_addr}");
-    println!("admin: http://localhost:{}/#t={login}", admin_addr.port());
+    println!("admin: {web_base_url}/#t={login}");
     println!("socket: {}", socket.display());
     println!("ready");
 
@@ -325,6 +411,49 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_url_accepts_http_and_https_with_optional_port() {
+        let u = parse_public_url("http://localhost:19090").unwrap();
+        assert_eq!(u.base, "http://localhost:19090");
+        assert_eq!(u.hosts, vec!["localhost:19090"]);
+        let u = parse_public_url("http://vault.example:9090/").unwrap();
+        assert_eq!(u.base, "http://vault.example:9090");
+        let u = parse_public_url("https://Vault.Example").unwrap();
+        assert_eq!(u.base, "https://vault.example");
+        assert_eq!(u.hosts, vec!["vault.example:443", "vault.example"]);
+        let u = parse_public_url("http://[::1]:7000").unwrap();
+        assert_eq!(u.base, "http://[::1]:7000");
+        assert_eq!(u.hosts, vec!["[::1]:7000"]);
+        assert_eq!(
+            parse_public_url("http://h").unwrap().hosts,
+            vec!["h:80", "h"]
+        );
+    }
+
+    #[test]
+    fn public_url_rejects_everything_else() {
+        for bad in [
+            "",
+            "localhost:9090",
+            "ftp://h:1",
+            "http://",
+            "http://:80",
+            "http://u@h:1",
+            "http://u:p@h:1",
+            "http://h:1/path",
+            "http://h:1/#t=x",
+            "http://h:1?x=1",
+            "http://h:0",
+            "http://h:99999",
+            "http://h:abc",
+            "http://a b:1",
+            "http://h//",
+            "http://[::1",
+        ] {
+            assert!(parse_public_url(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
 
     fn mode(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
