@@ -90,8 +90,14 @@ fn parse_public_url(s: &str) -> Result<PublicUrl, String> {
     const MSG: &str = "expected http(s)://host[:port] without userinfo, path, query or fragment";
     let (scheme, rest, default_port) = if let Some(r) = s.strip_prefix("http://") {
         ("http", r, 80u16)
-    } else if let Some(r) = s.strip_prefix("https://") {
-        ("https", r, 443u16)
+    } else if s.starts_with("https://") {
+        // The admin UI only accepts `http://` Origins on writes, so an https public URL would
+        // make every browser write fail with 403. Refuse it instead of accepting a broken setup.
+        return Err(
+            "https is not supported: the admin UI is served over plain http on loopback \
+                    (publish it on 127.0.0.1 and open it with http://)"
+                .into(),
+        );
     } else {
         return Err(MSG.into());
     };
@@ -419,9 +425,9 @@ mod tests {
         assert_eq!(u.hosts, vec!["localhost:19090"]);
         let u = parse_public_url("http://vault.example:9090/").unwrap();
         assert_eq!(u.base, "http://vault.example:9090");
-        let u = parse_public_url("https://Vault.Example").unwrap();
-        assert_eq!(u.base, "https://vault.example");
-        assert_eq!(u.hosts, vec!["vault.example:443", "vault.example"]);
+        let u = parse_public_url("http://Vault.Example").unwrap();
+        assert_eq!(u.base, "http://vault.example");
+        assert_eq!(u.hosts, vec!["vault.example:80", "vault.example"]);
         let u = parse_public_url("http://[::1]:7000").unwrap();
         assert_eq!(u.base, "http://[::1]:7000");
         assert_eq!(u.hosts, vec!["[::1]:7000"]);
@@ -429,6 +435,18 @@ mod tests {
             parse_public_url("http://h").unwrap().hosts,
             vec!["h:80", "h"]
         );
+    }
+
+    #[test]
+    fn public_url_rejects_https_with_an_explanation() {
+        for url in [
+            "https://vault.example",
+            "https://localhost:9090",
+            "https://h:1/",
+        ] {
+            let err = parse_public_url(url).unwrap_err();
+            assert!(err.contains("https is not supported"), "{url}: {err}");
+        }
     }
 
     #[test]

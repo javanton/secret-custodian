@@ -415,7 +415,7 @@ error.
 | `--socket PATH` | `SG_SOCKET` | `$XDG_RUNTIME_DIR/secret-guardian.sock`, else `<data dir>/sg.sock` | Admin Unix socket (mode `0600`, in a `0700` directory); also what client commands connect to |
 | `--proxy-bind ADDR` | `SG_PROXY_BIND` | `127.0.0.1:8080` | Proxy listener (`IP:port`) |
 | `--admin-bind ADDR` | `SG_ADMIN_BIND` | `127.0.0.1:9090` | Web UI listener; non-loopback prints a warning |
-| `--admin-public-url URL` | `SG_ADMIN_PUBLIC_URL` | `http://localhost:<bound admin port>` | URL you really use for the web UI (`http(s)://host[:port]`, no path); printed on the `admin:` line, returned by `sg login-url`, and its host:port is accepted as `Host`/`Origin` |
+| `--admin-public-url URL` | `SG_ADMIN_PUBLIC_URL` | `http://localhost:<bound admin port>` | URL you really use for the web UI (`http://host[:port]`, no path; `https://` is rejected); printed on the `admin:` line, returned by `sg login-url`, and its host:port is accepted as `Host`/`Origin` |
 | `--admin-allowed-host HOST:PORT` | - | none | Extra `Host`/`Origin` accepted by the web UI (repeatable) |
 | `--key-file FILE` | `SG_KEY_FILE` | none | Master key file (base64 of 32 bytes, mode `0600`) |
 | (no flag) | `SG_MASTER_KEY` | none | The same base64 key in the environment |

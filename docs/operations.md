@@ -234,8 +234,8 @@ flowchart LR
 - If you publish the UI on another host port (`-p 127.0.0.1:19090:9090`) add `--admin-public-url http://localhost:19090`
   (or `SG_ADMIN_PUBLIC_URL`): the `admin:` line and `sg login-url` then print that URL and its host:port joins the
   `Host`/`Origin` allowlist, so `--admin-allowed-host` is only needed for additional names. The web listener is plain HTTP and
-  `Origin` must be `http://<allowed host>`, so an `https://` public URL (TLS terminated elsewhere) is accepted but its
-  browser requests with an `https://` `Origin` are still refused.
+  `Origin` must be `http://<allowed host>`, so `--admin-public-url` rejects `https://` URLs at start-up (a TLS-terminating
+  reverse proxy in front of the UI is not supported: browser writes would carry an `https://` `Origin` and be refused).
 - Run the CLI inside the container: `docker compose exec secret-guardian sg secret ls`; secrets via
   `printf %s "$TOKEN" | docker compose exec -T secret-guardian sg secret add github`.
 - Hardening used by the example and verified by the Docker end-to-end script: read-only root filesystem, `tmpfs`
