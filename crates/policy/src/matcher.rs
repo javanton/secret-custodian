@@ -436,6 +436,36 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_paths_are_unjudgeable_for_restricted_rules_but_not_for_star() {
+        let restricted = [rule(1, "a.com", "/allowed/*", &[], Header, "A")];
+        let star = [rule(1, "a.com", "*", &[], Header, "A")];
+        for raw in [
+            "/allowed/%EF%B8%B0/admin",
+            "/allowed/%EF%B8%99/x",
+            "/allowed/\u{2100}",
+            "/allowed/\u{2105}",
+            "/allowed/\u{FE30}/admin",
+            "/allowed/\u{FE19}/x",
+            "/allowed/caf%C3%A9",
+            "/allowed/%E6%97%A5%E6%9C%AC",
+            "/allowed/%F0%9F%98%80",
+            "/allowed/\u{0416}",
+            "/allowed/%25E6%2597%25A5",
+        ] {
+            assert_eq!(
+                ids(evaluate(&restricted, "a.com", "GET", raw)),
+                vec![-1],
+                "{raw}"
+            );
+            assert_eq!(ids(evaluate(&star, "a.com", "GET", raw)), vec![1], "{raw}");
+        }
+        assert_eq!(
+            ids(evaluate(&restricted, "a.com", "GET", "/allowed/ascii-ok")),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn star_pattern_still_matches_unjudgeable_paths() {
         let rules = [rule(1, "a.com", "*", &[], Header, "A")];
         assert_eq!(ids(evaluate_raw(&rules, "a.com", "GET", "/x/%00")), vec![1]);
@@ -510,7 +540,6 @@ mod tests {
             "/repos/a%2Fb",
             "/repos/a%20b",
             "/repos/100%25",
-            "/repos/caf%C3%A9",
             "/repos/a;b",
             "/repos/a%2Fb/issues",
         ] {
@@ -737,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_separator_lookalikes_and_plus_as_space_are_forbidden() {
+    fn non_ascii_lookalikes_and_plus_as_space_are_forbidden() {
         let rules = [rule(
             1,
             "api.github.com",
@@ -755,6 +784,20 @@ mod tests {
             "/repos/a%E2%80%8Bb",
             "/repos/..+/admin",
             "/repos/..%2B/admin",
+            // Allowlist: any non-ASCII reading is unjudgeable.
+            "/repos/\u{2100}",
+            "/repos/\u{2105}/x",
+            "/repos/\u{FE30}/x",
+            "/repos/\u{FE19}/x",
+            "/repos/caf%C3%A9",
+            "/repos/%E6%97%A5%E6%9C%AC",
+            "/repos/%F0%9F%98%80",
+            "/repos/caf\u{e9}",
+            "/repos/\u{1F600}",
+            "/repos/%25C3%25A9",
+            "/repos/\u{0416}\u{0434}",
+            "/repos/\u{0905}",
+            "/repos/\u{1F4A9}/%E2%82%AC",
         ] {
             assert_eq!(
                 ids(evaluate_raw(&rules, "api.github.com", "GET", raw)),
@@ -762,14 +805,7 @@ mod tests {
                 "{raw}"
             );
         }
-        for raw in [
-            "/repos/caf%C3%A9",
-            "/repos/%E6%97%A5%E6%9C%AC",
-            "/repos/%F0%9F%98%80",
-            "/repos/a+b",
-            "/repos/c++",
-            "/repos/.github",
-        ] {
+        for raw in ["/repos/a+b", "/repos/c++", "/repos/.github"] {
             assert_eq!(
                 ids(evaluate_raw(&rules, "api.github.com", "GET", raw)),
                 vec![1],

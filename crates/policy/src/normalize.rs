@@ -146,29 +146,13 @@ pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
 /// Longest path (bytes) a restricted rule will judge; anything longer is unjudgeable.
 pub(crate) const MAX_JUDGED_PATH_LEN: usize = 8192;
 
-/// Code points that some origin may fold, normalize or trim into `.`, `/`, `\`, `?`, `#`, a
-/// space, or nothing (NFKC/NFKD look-alikes, invisible and format characters).
-fn is_forbidden_unicode(c: char) -> bool {
-    matches!(c,
-        '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{037E}' | '\u{1680}' | '\u{180E}'
-        | '\u{2000}'..='\u{200F}'
-        | '\u{2024}'..='\u{2026}'
-        | '\u{2028}'..='\u{202F}'
-        | '\u{2044}'
-        | '\u{2047}'..='\u{2049}'
-        | '\u{205F}'..='\u{2064}'
-        | '\u{2215}' | '\u{2216}' | '\u{29F8}' | '\u{3000}'
-        | '\u{FE50}'..='\u{FE6B}'
-        | '\u{FEFF}'
-        | '\u{FF01}'..='\u{FF65}')
-}
-
-/// Control characters (C0, DEL), separator/dot look-alikes and non-ASCII whitespace: never
-/// judgeable. Ordinary non-ASCII letters (accents, CJK, emoji) are fine.
+/// Allowlist at the mechanism level: a reading is judgeable only if every character is ASCII and
+/// not a control character (C0, DEL). Any non-ASCII character (look-alikes of `.`, `/`, `\`,
+/// `?`, `#`, invisible and format characters, ordinary accents, CJK, emoji...) makes the path
+/// unjudgeable: some origin may fold, normalize or trim it into a separator, a dot or nothing,
+/// and an open-ended blocklist of such code points cannot be complete.
 fn has_forbidden_char(s: &str) -> bool {
-    s.chars().any(|c| {
-        c.is_ascii_control() || is_forbidden_unicode(c) || (!c.is_ascii() && c.is_whitespace())
-    })
+    s.chars().any(|c| !c.is_ascii() || c.is_ascii_control())
 }
 
 /// A segment such as `.`, `..`, `...`, `.. `, `..+`: non-empty, has a `.`, only dots, spaces,
