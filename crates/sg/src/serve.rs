@@ -160,7 +160,7 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket);
 
     let db = data_dir.join("vault.db");
-    let first_run = !db.exists();
+    let first_run = Vault::needs_init(&db);
     let key = resolve_key(
         &KeySource {
             key_file: args.key_file.clone(),

@@ -20,8 +20,10 @@ pub fn validate_secret_value(v: &str) -> Result<(), CoreError> {
     if v.len() > MAX_VALUE {
         return Err(CoreError::InvalidSecretValue("too long"));
     }
-    if v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
-        return Err(CoreError::InvalidSecretValue("contains CR, LF or NUL"));
+    // Exactly what `http::HeaderValue::from_str` refuses (C0 controls except TAB, and DEL), so a
+    // stored value can always be injected as a header. Non-ASCII UTF-8 is accepted by it too.
+    if v.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(CoreError::InvalidSecretValue("contains control characters"));
     }
     Ok(())
 }

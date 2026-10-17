@@ -1750,6 +1750,7 @@ dependencies = [
  "argon2",
  "base64",
  "hex",
+ "http",
  "rand",
  "rusqlite",
  "serde",

@@ -139,12 +139,35 @@ impl Vault {
         })
     }
 
-    pub fn open_or_init(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
-        if path.exists() {
-            Self::open(path, key)
-        } else {
-            Self::init(path, key)
+    /// True when there is no usable vault at `path` and `init` is the right call: the file is
+    /// missing, empty, or a SQLite database with no tables (what a crashed `init` leaves behind).
+    /// A database that has tables but no `meta` row is NOT uninitialized: it is corrupt.
+    pub fn needs_init(path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(m) if m.len() == 0 => true,
+            Ok(m) if !m.is_file() => false,
+            Ok(_) => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|c| {
+                    c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                })
+                .is_ok_and(|n| n == 0),
         }
+    }
+
+    /// Opens the vault, creating it first when [`Vault::needs_init`]. Leftovers of an interrupted
+    /// `init` (empty or table-less file, `-wal`, `-shm`) are removed before initialising again.
+    pub fn open_or_init(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
+        if !path.try_exists()? {
+            return Self::init(path, key);
+        }
+        if Self::needs_init(path) {
+            remove_db_files(path);
+            return Self::init(path, key);
+        }
+        Self::open(path, key)
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {

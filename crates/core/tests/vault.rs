@@ -307,3 +307,95 @@ fn wrong_key_on_unsupported_schema_still_reports_wrong_key() {
         .unwrap();
     assert!(matches!(err, CoreError::WrongKey));
 }
+
+#[test]
+fn other_control_characters_are_rejected_but_tab_and_non_ascii_are_accepted() {
+    let dir = tempdir().unwrap();
+    let v = Vault::init(&dir.path().join("v.db"), raw(&crypto::random_key())).unwrap();
+    v.add_secret("s", "ok").unwrap();
+    for bad in ["a\x01b", "a\x1bb", "a\x7fb", "\x08", "a\x0bb", "a\x1fb"] {
+        for res in [
+            v.add_secret("t", bad).map(|_| ()),
+            v.rotate_secret("s", bad).map(|_| ()),
+        ] {
+            match res {
+                Err(CoreError::InvalidSecretValue(m)) => {
+                    assert_eq!(m, "contains control characters", "{bad:?}")
+                }
+                other => panic!("{bad:?} not rejected: {other:?}"),
+            }
+        }
+    }
+    v.add_secret("tab", "a\tb").unwrap();
+    v.rotate_secret("s", "p\u{e4}ss").unwrap();
+    // everything the vault stores must be injectable as a header value
+    assert!(http::HeaderValue::from_str("a\tb").is_ok());
+    assert!(http::HeaderValue::from_str("p\u{e4}ss").is_ok());
+}
+
+fn sqlite_without_tables(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    drop(conn);
+}
+
+#[test]
+fn empty_file_is_uninitialized_and_init_recovers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    std::fs::write(&path, b"").unwrap();
+    assert!(Vault::needs_init(&path));
+    assert!(Vault::open(&path, raw(&crypto::random_key())).is_err());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "open must not touch it"
+    );
+    let key = crypto::random_key();
+    Vault::open_or_init(&path, raw(&key)).unwrap();
+    assert!(!Vault::needs_init(&path));
+    Vault::open(&path, raw(&key)).unwrap();
+}
+
+#[test]
+fn sqlite_file_without_tables_is_uninitialized_and_leftovers_are_removed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    sqlite_without_tables(&path);
+    std::fs::write(dir.path().join("v.db-wal"), b"junk").unwrap();
+    std::fs::write(dir.path().join("v.db-shm"), b"junk").unwrap();
+    assert!(Vault::needs_init(&path));
+    let key = crypto::random_key();
+    Vault::open_or_init(&path, raw(&key)).unwrap();
+    assert!(!Vault::needs_init(&path));
+    Vault::open(&path, raw(&key)).unwrap();
+}
+
+#[test]
+fn needs_init_is_true_for_missing_and_false_for_real_vaults() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    assert!(Vault::needs_init(&path));
+    Vault::init(&path, raw(&crypto::random_key())).unwrap();
+    assert!(!Vault::needs_init(&path));
+}
+
+#[test]
+fn database_with_tables_but_no_meta_row_is_corrupt_not_reinitialized() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let key = crypto::random_key();
+    Vault::init(&path, raw(&key)).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM meta", [])
+        .unwrap();
+    assert!(!Vault::needs_init(&path));
+    let before = std::fs::read(&path).unwrap();
+    assert!(Vault::open_or_init(&path, raw(&key)).is_err());
+    assert_eq!(
+        before,
+        std::fs::read(&path).unwrap(),
+        "must not be modified"
+    );
+}

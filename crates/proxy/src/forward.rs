@@ -219,7 +219,9 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
                 name: r.target_name.clone(),
                 value: Zeroizing::new(v),
             }),
-            Err(_) => {
+            Err(e) => {
+                // The reason never contains the secret; log which rule so the operator can fix it.
+                tracing::warn!(rule_id = ?rule_id, host = %ctx.host, reason = %e, "rule value cannot be rendered");
                 return fail(
                     ctx,
                     &method,
@@ -247,7 +249,8 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
                 "bad request target\n",
             );
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!(rule_id = ?rule_id, host = %ctx.host, error = %e, "injected value is not valid in the request (header name or value)");
             return fail(
                 ctx,
                 &method,
@@ -274,7 +277,8 @@ pub(crate) async fn forward(req: Request<Incoming>, ctx: &Ctx, keep: Keep) -> Re
         Ok(v) => {
             parts.headers.insert(HOST, v);
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!(rule_id = ?rule_id, host = %ctx.host, error = %e, "injected value is not valid in the request (header name or value)");
             return fail(
                 ctx,
                 &method,
