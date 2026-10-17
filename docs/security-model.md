@@ -75,7 +75,7 @@ Capabilities assumed: runs arbitrary code with its token and network access to t
 |---|---|
 | Make any request that one of its role's rules authorises, for as long as the token is valid (inherent in the model, spec section 2) | Read a secret value: nothing returns it, and the proxy overwrites any credential the agent sets for the same header or query parameter |
 | Use a `passthrough` role to reach any host without rules, including private LAN addresses | Reach loopback, link-local/cloud metadata, multicast, the vault's own proxy and web ports (network policy); plain `http://` never carries an injected credential |
-| Learn the shape of its role by trial (`403` versus success) | Exceed the rule's path prefix by traversal or encoding tricks (path judged at every decoding depth, only the normalized path is forwarded) |
+| Learn the shape of its role by trial (`403` versus success) | Exceed the rule's path prefix by traversal or encoding tricks (path judged at every decoding depth, the normalized path is forwarded whenever a path-restricted rule applies; non-ASCII paths are unjudgeable) |
 | Exhaust its **own** budgets (64 tunnels, 64 concurrent upstream requests) | Starve other tokens (per-identity caps, global connection and upstream caps, idle and lifetime timeouts) |
 | Send a `Host`, routing or forwarding header | Steer the injected request with them (`Host` must match the tunnel; method-override, `X-Forwarded-*`, `Via`, `X-Original-URL` and friends are stripped) |
 | Ask for `TRACE`/`TRACK` to reflect credentials | Get them (`405`) |
@@ -166,7 +166,7 @@ connect is not possible. Private LAN addresses are allowed on purpose (homelab):
 | Rebinding, CSRF, session theft, XSS, framing | See the web-page table | `crates/admin/src/web.rs`, `api.rs`, `sessions.rs`; `web/app.js` |
 | Token forgery or reuse | EdDSA signature verified before claims; strict header; issuer; expiry; revocation row required | `crates/auth/src/token.rs` |
 | Revoked token keeps working | Re-verified before every request in a MITM tunnel | `crates/proxy/src/mitm.rs` |
-| Path escapes of a restricted rule | Normalize then judge every decoding depth; refuse dot-like segments under every separator model, control and confusable characters; forward the normalized path | `crates/policy/src/{normalize,matcher}.rs`; exhaustive oracle test |
+| Path escapes of a restricted rule | Normalize then judge every decoding depth; refuse dot-like segments under every separator model, control characters and every non-ASCII character (allowlist); forward the normalized path where a restricted rule applies; an unreadable rule set is a `503`, never "no rules" | `crates/policy/src/{normalize,matcher}.rs`; exhaustive oracle test |
 | Method fallback to a broader rule | A method excluded from the most specific rule is `403`, no fallback | `crates/policy/src/matcher.rs` |
 | Credentials over plain HTTP | Never injected, no exception | `crates/proxy/src/forward.rs` (`plaintext-refused`) |
 | SSRF: loopback, metadata, link-local, vault ports | Network policy on the resolved address; own ports denied; wildcard binds expanded to interface addresses | `crates/proxy/src/upstream.rs` (`NetPolicy`); `crates/sg/src/serve.rs` |

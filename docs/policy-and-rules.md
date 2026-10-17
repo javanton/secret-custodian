@@ -128,7 +128,7 @@ Since IP literals cannot have rules, a CONNECT to an IP address always follows t
 - `Forbidden`: the host has rules but no rule authorises this request. (`403`.)
 - `Inject(rules)`: the rules to apply, sorted by id.
 
-`path` must already be normalized: the proxy passes `normalize_path(uri.path())`.
+`path` must already be normalized: the proxy always judges `normalize_path(uri.path())`.
 
 Algorithm, in order:
 
@@ -185,8 +185,12 @@ that host (test `star_pattern_still_matches_unjudgeable_paths`).
 
 Per request (`forward.rs`): host consistency check; `normalize_path`; `list_rules` (fresh from the DB);
 `evaluate`; for `Inject`, decrypt each matched rule's secret, render, strip the agent's value for the same
-destination, set the injection, forward the **normalized path** and the original query (minus replaced
-parameters). `Forbidden` and `NoRuleForHost` both return `403 "not allowed for this role"` and audit
+destination, set the injection, forward the path and the original query (minus replaced
+parameters). The forwarded path is the **normalized (judged) path** whenever any rule of the role whose host
+matches has a path pattern other than `*` (`has_path_restricted_rule_for_host`); otherwise nothing is judged by
+path and the agent's **original path** is forwarded untouched (including for unruled hosts under a
+`passthrough` role), because origins such as S3-style key stores or `/fetch/https://other` care about `//`
+and escapes. A path that cannot be represented as an origin-form target gets `400` (`bad-request`). `Forbidden` and `NoRuleForHost` both return `403 "not allowed for this role"` and audit
 `forbidden`. The audit row records the id of the lowest-id matching rule only.
 
 ## 6. Path judging
@@ -196,7 +200,8 @@ the rules below apply.
 
 ### 6.1 `normalize_path`
 
-`normalize_path(raw)` resolves what is safe to resolve; the proxy forwards its output.
+`normalize_path(raw)` resolves what is safe to resolve; the proxy always judges its output and forwards it
+when a path-restricted rule is involved (section 5).
 
 - Split on `/`. For each segment, decode `%XX` escapes **only when they encode an unreserved character**
   (ASCII letter, digit, `-`, `.`, `_`, `~`); hex digits may be any case. Other escapes are left untouched
@@ -233,12 +238,12 @@ On **every** reading, the path is refused (unjudgeable) if either holds:
   all at once; a segment is dot-like if it contains a `.` and consists only of `.`, space, tab and `+`.
   Examples: `.`, `..`, `...`, `.. ` (dot dot space), `..+`. So `..;` (splits to `..`), `..\`, `..%2f`
   (reading 1 is `../`), `..%20`, `..+` are all refused.
-- **A forbidden character**: any ASCII control character (C0 and DEL, including tab and newline), any
-  non-ASCII whitespace, or a code point in the confusable/invisible set `is_forbidden_unicode`:
-  U+00A0, U+00AD, U+034F, U+037E, U+1680, U+180E, U+2000 to U+200F, U+2024 to U+2026, U+2028 to U+202F,
-  U+2044, U+2047 to U+2049, U+205F to U+2064, U+2215, U+2216, U+29F8, U+3000, U+FE50 to U+FE6B, U+FEFF
-  and U+FF01 to U+FF65 (this includes the full-width forms of `.`, `/`, `\`, `?`, `#`, `;`, `%` and others).
-  Ordinary non-ASCII text (accented letters, CJK, emoji) is allowed.
+- **A forbidden character** (an allowlist, not a blocklist): any ASCII control character (C0 and DEL,
+  including tab and newline) or **any non-ASCII character at all**. A path is judgeable only if every
+  character of every reading is ASCII. Look-alikes such as U+FE30 and U+FE19 (which NFKC folds to `..` and
+  `...`) or U+2100 to U+2106 (which contain `/`) cannot be listed exhaustively, so they are refused together
+  with ordinary accents, CJK and emoji. Fail closed: to let such paths through, use a `*` path rule for the
+  destination (or ASCII-encode the identifier differently if the origin allows it).
 
 ### 6.4 Unjudgeable inputs (summary)
 
@@ -254,7 +259,7 @@ For a restricted rule, a path is unjudgeable, the rule does not match, and the r
 | Other control characters in any reading | `/repos/a%09b`, `/repos/a%0Ab`, `/repos/a%7Fb` |
 | Invalid UTF-8 after decoding | `/repos/a%ff` |
 | More than 8 decoding layers | (cap `MAX_DECODE_ROUNDS = 8`) |
-| Confusable or invisible Unicode | `/repos/%E2%80%A5/admin` (U+2025), `/repos/%EF%BC%8E%EF%BC%8E/admin` (U+FF0E), `/repos/a%E2%80%8Bb` (U+200B), `/repos/..%C2%A0/admin` (U+00A0) |
+| Any non-ASCII character in any reading (look-alikes, invisibles, accents, CJK, emoji) | `/repos/%E2%80%A5/admin` (U+2025), `/repos/%EF%B8%B0/admin` (U+FE30), `/repos/%EF%B8%99/x` (U+FE19), raw U+2100, `/repos/a%E2%80%8Bb` (U+200B), `/repos/caf%C3%A9`, `/repos/%E6%97%A5%E6%9C%AC`, `/repos/%F0%9F%98%80`, `/repos/%25C3%25A9` |
 | A dot-like segment in any reading | `/repos/..%20/admin`, `/repos/.../admin`, `/repos/..;/admin`, `/repos/..%2fadmin`, `/repos/..\admin`, `/repos/..+/admin`, `/repos/..%2B/admin`, `/repos/%252e%252e%252fadmin` |
 
 ### 6.5 Prefix and equality semantics
@@ -284,12 +289,13 @@ Consequences, all consistent with tests:
 ### 6.6 Self-widening patterns (rejected at creation)
 
 A pattern body is rejected if, at **any** decoding depth, it contains `;`, `\`, `?`, `#`, NUL or any
-control character, a forbidden Unicode character, a dot-like segment (under any separator model), or
+control character, a non-ASCII character, a dot-like segment (under any separator model), or
 a segment ending in `.` or a space (an origin that trims those, for example a Windows-style one, would
-reinterpret the prefix); or if it cannot be decoded safely or exceeds 8192 bytes. Tests list rejected
+reinterpret the prefix); or if it contains any non-ASCII character (raw, or after decoding: `/repos/caf%C3%A9/*`
+is rejected); or if it cannot be decoded safely or exceeds 8192 bytes. Tests list rejected
 examples such as `/a%3Bx`, `/a%255Cb`, `/a/%2e%2e/b/*`, `/a/.../b`, `/a/%20../b`, `/v1./*`, `/a /*`, `/v1.`,
 `/a%20/*`, `/a%2E/*`, and accepted ones such as `/`, `/*`, `/repos/*`, `/v1/me`, `/a%2Fb`, `/a%2Fb/*`,
-`/repos/`, `/api/v4/projects/a%2Fb`, `/api/v4/*`, `/repos/caf%C3%A9/*`, `/v1*`, `/repos/.github/*`, `/a.b/*`.
+`/repos/`, `/api/v4/projects/a%2Fb`, `/api/v4/*`, `/v1*`, `/repos/.github/*`, `/a.b/*`.
 
 ## 7. The closure argument and its assumptions
 
@@ -315,12 +321,11 @@ defines six, not seven):
 | A1 | The origin percent-decodes only `%HH` with ASCII hex digits, byte by byte, then reads UTF-8, any number of rounds, at any point. |
 | A2 | The origin's separators are a subset of `/ \ ; ? #`, and stripping `;params` removes from `;` to the next `/` or the end. |
 | A3 | Origins only remove suffixes starting at `?`/`#`, spans from `;` to the next `/`, one `/` of a `//`, and trailing dots/spaces of a segment. |
-| A4 | Character transformations are ASCII only (`\` to `/`, ASCII case folding); Unicode normalisation and `+` as space are covered by the forbidden-character list and by the dot-like set. |
+| A4 | Character transformations are ASCII only (`\` to `/`, ASCII case folding); Unicode normalisation is covered by the ASCII allowlist (any non-ASCII character makes the path unjudgeable) and `+` as space by the dot-like set. |
 | A5 | A dot segment is only recognised if made of dots, spaces, tabs and `+`. |
-| A6 | The origin receives exactly the string that was judged: the proxy forwards `normalize_path(raw)`; the query does not take part in routing. |
+| A6 | When a path-restricted rule is involved, the origin receives exactly the string that was judged: the proxy forwards `normalize_path(raw)`; the query does not take part in routing. Otherwise no path is judged and the origin receives the original path. |
 
-An origin that violates these (for example one that folds some other Unicode character into `.`) is outside
-the guarantee. The guarantee is about **path prefix rules**; it says nothing about what the origin does with
+An origin that violates these is outside the guarantee. The guarantee is about **path prefix rules**; it says nothing about what the origin does with
 the content of segments that stay inside the prefix.
 
 Exhaustive test. `crates/policy/src/matcher.rs` contains an independent oracle (it shares no code with the
@@ -341,16 +346,19 @@ Because unjudgeable inputs are refused for restricted rules (a `*` rule is unaff
 - Any request path with a literal `%` that is not a valid escape (for example an unescaped `100%`). Escaped
   `%25` is fine.
 - Percent-encoded bytes that are not valid UTF-8 (for example `%ff`), such as binary identifiers in a path.
-- Paths containing control characters, NBSP, zero-width characters, or full-width/look-alike punctuation
-  in any decoded reading; raw non-ASCII letters, CJK and emoji are fine.
+- Paths containing control characters or **any non-ASCII character** in any decoded reading: accented
+  letters (`/repos/caf%C3%A9`), CJK, emoji, NBSP, zero-width characters, full-width/look-alike punctuation.
+  Use a `*` path rule for destinations that need them.
 - Segments made only of dots, spaces, tabs and `+` that survive normalization (`...`, `..+`), and `;` forms such as `..;`.
 - Paths longer than 8 KiB or encoded more than 8 levels deep.
 - Doubly encoded input whose inner reading is dangerous (`%252e%252e%252f`). Plain double-encoding of harmless
   text (such as `%2520` for a space) is still accepted.
 - A catch-all `*` rule for the same destination silently covers all of the above (section 4, operator note).
 - Rule patterns must be in normalized form with upper-case hex; creation fails otherwise.
-- The agent's path is **rewritten** before forwarding: `//`, `.`, `..`, and escapes of unreserved characters
-  (`%41` becomes `A`) are normalized. Servers that treat `/a//b` and `/a/b` differently will see the latter.
+- When a path-restricted rule exists for the host, the agent's path is **rewritten** before forwarding: `//`,
+  `.`, `..`, and escapes of unreserved characters (`%41` becomes `A`) are normalized. Servers that treat
+  `/a//b` and `/a/b` differently will see the latter. For hosts with only `*` rules (and unruled hosts under a
+  `passthrough` role) the original path is forwarded untouched.
 - The audit log records the raw path (query stripped), not the normalized path.
 - Rule changes take effect immediately, including for open tunnels (rules are reloaded per request).
 - `Unmatched = passthrough` is decided at CONNECT per host; once a host has any rule, requests in that tunnel
@@ -361,7 +369,7 @@ Because unjudgeable inputs are refused for restricted rules (a `*` rule is unaff
 Rule: host `api.github.com` (tests use `api.example.test`), `path_pattern = /repos/*`, `methods = [GET]`,
 header `Authorization`, template `Bearer {secret}`. "Forwarded" is the path seen by the upstream. Sources:
 `matcher.rs` tests (`method_and_path_restrict`, `every_decoding_depth_and_parsing_variant_is_judged`,
-`unicode_separator_lookalikes_and_plus_as_space_are_forbidden`, `closed_by_construction_regressions_are_forbidden`)
+`non_ascii_lookalikes_and_plus_as_space_are_forbidden`, `closed_by_construction_regressions_are_forbidden`)
 and `crates/proxy/tests/inject.rs` (`path_traversal_cannot_escape_a_restricted_rule`,
 `witness_that_normalizes_into_the_prefix_is_forwarded_normalized`,
 `restricted_rule_still_authorises_legitimate_encoded_paths`).
@@ -373,8 +381,9 @@ and `crates/proxy/tests/inject.rs` (`path_traversal_cannot_escape_a_restricted_r
 | `GET /admin`, `GET /other` | 403 | outside the prefix |
 | `GET /repos/a/../b` | inject | forwarded as `/repos/b` |
 | `GET /repos/a%2Fb` | inject | forwarded unchanged (`%2F` stays encoded) |
-| `GET /repos/a%2Fb/issues`, `/repos/a%20b`, `/repos/100%25`, `/repos/caf%C3%A9`, `/repos/a;b` | inject | |
-| `GET /repos/a+b`, `/repos/c++`, `/repos/.github`, `/repos/%E6%97%A5%E6%9C%AC`, `/repos/%F0%9F%98%80` | inject | not dot-like, no forbidden characters |
+| `GET /repos/a%2Fb/issues`, `/repos/a%20b`, `/repos/100%25`, `/repos/a;b` | inject | |
+| `GET /repos/a+b`, `/repos/c++`, `/repos/.github` | inject | not dot-like, ASCII only |
+| `GET /repos/caf%C3%A9`, `/repos/%E6%97%A5%E6%9C%AC`, `/repos/%F0%9F%98%80` | 403 | non-ASCII reading (inject under a `*` rule) |
 | `GET /repos/a\b` (raw backslash) | inject | forwarded as `/repos/a\b` |
 | `GET /repos/a\..%3B\k/../admin` | inject | the plain `..` is resolved first; forwarded as `/repos/admin` |
 | `GET /repos/../admin`, `/repos/%2e%2e/admin`, `/repos/%2E%2E/admin` | 403 | normalized to `/admin` |
@@ -385,7 +394,7 @@ and `crates/proxy/tests/inject.rs` (`path_traversal_cannot_escape_a_restricted_r
 | `GET /repos/%u002e%u002e/admin`, `/repos/%U002E%U002E/admin` | 403 | `%u` escapes |
 | `GET /repos/%zz`, `/repos/%`, `/repos/a%ff` | 403 | malformed `%` / invalid UTF-8 |
 | `GET /repos/a%00b`, `/repos/a%09b`, `/repos/a%0Ab`, `/repos/a%7Fb` | 403 | control characters |
-| `GET /repos/%E2%80%A5/admin`, `/repos/%EF%BC%8E%EF%BC%8E/admin`, raw U+2025, raw U+FF0E, raw U+200B, raw U+00A0 | 403 | confusables / invisibles |
+| `GET /repos/%E2%80%A5/admin`, `/repos/%EF%BC%8E%EF%BC%8E/admin`, `/repos/%EF%B8%B0/admin`, raw U+2025, U+FF0E, U+FE30, U+FE19, U+2100, U+200B, U+00A0 | 403 | non-ASCII (confusables / invisibles) |
 | `GET /repos` or `GET /reposx` (rule `/repos/*`, any method) | 403 | slash boundary |
 | `GET /repos/` (same rule) | inject | |
 | `GET /repos/` + 8185 `a` (total 8192 bytes) / one more `a` (8193) | inject / 403 | length cap (`/repos/*`, any method) |

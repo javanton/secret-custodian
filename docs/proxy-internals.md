@@ -93,7 +93,10 @@ no audit row, before the proxy code runs.
 
 ### Deciding what to do with the host
 
-After the role is loaded (`403 role not found` + `unknown-role` if it was deleted), the proxy asks one question:
+After the role is loaded (`403 role not found` + `unknown-role` if it was deleted), the proxy asks one question.
+A database error while loading the role or the rules is **never** read as "no rules": the answer is `503 service
+unavailable`, audit `internal-error` (written if the audit table is still writable), and nothing is forwarded or
+tunnelled. The same holds inside a tunnel and for plain HTTP.
 **does the role have any rule whose host pattern matches this host** (ignoring path, method and port)?
 
 | Rules for host? | Role `unmatched` | CA permits host? | Outcome |
@@ -153,10 +156,15 @@ Both MITM requests and plain-HTTP requests run through this function. In order:
    (`Host does not match the CONNECT target`), audit `host-mismatch`. This stops an agent from reusing a tunnel and
    its certificate to address another virtual host.
 3. **Path normalization.** `normalize_path(uri.path())` resolves `.`/`..`, collapses `//` and decodes escapes of
-   unreserved characters; **that normalized path is what is judged and what is forwarded**. The query string is not
-   part of the path.
+   unreserved characters; **that normalized path is always what is judged**. It is also what is forwarded when
+   any rule of the role whose host pattern matches has a path pattern other than `*` (a path-restricted rule is
+   involved). When none has (an unruled host under a `passthrough` role, or only `*` rules) nothing is judged by
+   path and the agent's **original path** (`uri.path()`) is forwarded untouched, with the original query: origins
+   such as S3-style key stores or `/fetch/https://other.site` distinguish `//` and escapes. A path that cannot
+   be rebuilt as an origin-form target (control characters, whitespace, an invalid URI) gets `400 bad request
+   target`, audit `bad-request`. The query string is not part of the path.
 4. **Rules are reloaded from the database for every request**, so rule edits apply to open tunnels immediately.
-   A database error here is `502 internal error`, audit `upstream-error`.
+   A database error here is `503 service unavailable`, audit `internal-error`; nothing is forwarded.
 5. **Evaluation** (`evaluate`, summarized): candidates are the role's rules whose host and path match; they are
    grouped by injection destination (header name or query parameter); in each group the most specific rule wins
    (exact host over wildcard, longer wildcard over shorter, exact path over prefix, longer pattern); among equally
@@ -182,9 +190,13 @@ Both MITM requests and plain-HTTP requests run through this function. In order:
    `identity-limit`.
 10. **Send** (see [Upstream connection handling](#upstream-connection-handling)). The request body is streamed, never
     buffered.
-11. **Audit and respond.** The audit row (`inject`, or `passthrough` for unruled plain HTTP) is written when the
-    upstream response head has arrived, **before** the head is returned to the agent; it records the upstream status
-    and the id of the first matching rule. The response has its hop-by-hop headers removed and its body is streamed
+11. **Audit and respond.** An `AuditGuard` is created right before the upstream request is dispatched, so exactly
+    one row is written per forwarded request in every path. The row (`inject`, or `passthrough` for unruled plain
+    HTTP) is written when the upstream response head has arrived, **before** the head is returned to the agent; it
+    records the upstream status and the id of the first matching rule. An upstream failure writes
+    `upstream-error`/`target-denied` instead. If the agent drops the connection or resets the stream while the
+    upstream request is pending (the credential may already have been sent), the guard is dropped without
+    finishing and writes the row with decision `client-aborted` and no status. The response has its hop-by-hop headers removed and its body is streamed
     back. A body truncated later keeps the status of the head that was already sent. If writing the audit row fails,
     the error is logged and the request proceeds (fail-open for what was already forwarded).
 
@@ -196,13 +208,13 @@ Applied to **every** forwarded request, injected or not (`inject::apply`):
 |---|---|
 | Hop-by-hop: `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, every header starting with `Proxy-`, and any header named in `Connection` | framing is recomputed by hyper; `Upgrade` removal is why WebSockets do not work |
 | Routing and attribution overrides: `X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`, `X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Real-IP`, `Forwarded`, `X-Original-Host`, `X-Host`, `Via`, `Front-End-Https`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`, `X-Cluster-Client-IP`, and every `X-Forwarded-*` | compared after lower-casing and mapping `_` to `-`, so `X_HTTP_METHOD_OVERRIDE` is removed too. `Referer` and `Origin` are kept |
-| Any value the agent sent under the injection **destination**: for a header rule, every value of that header (any case); for a query rule, every parameter whose percent-decoded name equals the target name (case-insensitive, also inside `;`-separated sub-parameters, also a bare `name` with no `=`) | so an agent cannot supply a competing credential |
+| Any value the agent sent under the injection **destination**: for a header rule, every value of every header whose name equals the target after lower-casing and mapping `_` to `-` (so `X_Api_Key`, `x_api_key` and `X-API-KEY` all go when the target is `X-Api-Key`); for a query rule, every parameter whose percent-decoded name equals the target name (case-insensitive, also inside `;`-separated sub-parameters, also a bare `name` with no `=`) | so an agent cannot supply a competing credential |
 
 | Written | Notes |
 |---|---|
 | Header rule: the rendered template as the header value (marked sensitive) | `Bearer {secret}` and similar |
 | Query rule: `name=<value>` appended at the **end** of the query, with every byte except ASCII letters and digits percent-encoded | query injection is weaker than header injection: origins often echo URLs back (see Limitations in the README) |
-| The normalized path | what was judged is what is sent |
+| The path: normalized when a path-restricted rule matches the host, otherwise the original path | where a path is judged, what was judged is what is sent |
 
 The method override in the **query or body** (for example `_method=DELETE` accepted by some frameworks) is not
 defended against.
@@ -261,7 +273,7 @@ The last row is why an agent cannot use the proxy to reach the admin web UI or t
 | Aspect | Value |
 |---|---|
 | Connection | a **new** TCP connection per forwarded request; TLS to the origin with `rustls` (TLS 1.2 and 1.3) against the system root store plus every `--upstream-ca` file; the server name is the CONNECT host; HTTP/1.1 only |
-| Connect timeout | 10 s for name resolution plus TCP connect, and also the time a request may wait for a free upstream slot |
+| Connect timeout | 10 s overall for name resolution plus TCP connect, and also the time a request may wait for a free upstream slot. When the host resolves to several vetted addresses they are tried in order, each attempt bounded by `min(remaining overall budget, connect_attempt_timeout)` (default 3 s, `UpstreamConfig::connect_attempt_timeout`), so one blackholed address does not starve the next. Applies to forwarded requests and passthrough CONNECT |
 | Response-head timeout | 120 s for TLS handshake plus sending the request until the response head arrives. The response body is **not** bounded by it. When an origin waits for the whole request body before answering, this also bounds slow uploads |
 | Global cap | 256 simultaneous upstream connections; excess requests wait up to the connect timeout and then fail with `502` |
 | Per-identity cap | 64 upstream requests per token (`429` beyond), 64 tunnels per token |
@@ -300,7 +312,9 @@ what it means. The host column of an audit row is the CONNECT target or the requ
 | `host-mismatch` | 421 | inside a tunnel / plain | `Host` or authority differs from the CONNECT target |
 | `forbidden` | 403 | inside a tunnel / plain | No rule authorises this method and path, or `COPY`/`MOVE` without an explicit method |
 | `plaintext-refused` | 403 | plain HTTP | A rule would have injected a credential into a plain HTTP request |
-| `upstream-error` | 502 | inside a tunnel / plain | Upstream failure (connect, TLS, I/O, timeout), or an internal failure (rules unreadable, secret undecryptable, bad injected value) |
+| `upstream-error` | 502 | inside a tunnel / plain | Upstream failure (connect, TLS, I/O, timeout), or an internal failure (secret undecryptable, bad injected value) |
+| `internal-error` | 503 | CONNECT, inside a tunnel, plain HTTP | The role or the rules could not be loaded from the vault; fails closed (nothing forwarded or tunnelled), body `service unavailable` |
+| `client-aborted` | none | inside a tunnel / plain | The agent closed the connection or reset the stream while the upstream request was in flight (the credential may have reached the origin); no status |
 
 Audit rows contain the machine, role, token id, host, method, path (no query), rule id, decision and status. They never
 contain a secret, a token, a query string or a header.

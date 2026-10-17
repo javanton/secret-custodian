@@ -184,7 +184,7 @@ sequenceDiagram
         Note over P,V: Forbidden or NoRuleForHost: AUDIT forbidden 403
         P->>V: reveal_for_injection(secret_id) (decrypt, AAD secret:{id})
         P->>Po: render(template, secret, kind)
-        P->>P: inject::apply (strip agent credential, set header or query, forward normalized path)
+        P->>P: inject::apply (strip agent credential, set header or query, forward the judged path, or the original one when nothing is path-restricted)
         P->>U: new TCP + TLS connection (rustls, system roots + extra roots), HTTP/1.1 request
         U-->>P: response head, then streamed body
         P->>V: AUDIT decision=inject status=upstream status, rule_id
@@ -222,15 +222,16 @@ Step notes (all from the cited files):
    must normalise to the CONNECT host, and at least one must be present; otherwise `421`
    (`host-mismatch`). This stops an agent from reusing a tunnel (and its certificate) to address a
    different virtual host.
-8. **Judging** (`forward.rs`): the path judged by `evaluate` is `normalize_path(uri.path())` and
-   exactly that normalized path is what is forwarded (`inject::apply` rebuilds the URI from it).
+8. **Judging** (`forward.rs`): the path judged by `evaluate` is `normalize_path(uri.path())`. If any rule of
+   the role matching the host is path-restricted, exactly that normalized path is forwarded; otherwise the
+   original `uri.path()` is (`inject::apply` rebuilds the URI from the path it is given).
    Rules are reloaded from the DB on each request, so rule changes apply to open tunnels immediately
    (test `rule_changes_apply_to_requests_inside_an_open_tunnel` in `crates/proxy/tests/inject.rs`).
 9. **Reveal and render**: for every winning rule the secret is decrypted
    (`Vault::reveal_for_injection`) into a `Zeroizing<String>`, rendered into the template
    (`sg_policy::render`) and wrapped again in `Zeroizing`; the values are dropped as soon as the
    upstream request is on its way.
-10. **Upstream** (`upstream.rs`): a fresh TCP connection per request (10 s connect timeout), TLS via
+10. **Upstream** (`upstream.rs`): a fresh TCP connection per request (10 s overall connect timeout, 3 s per address), TLS via
     `rustls` with system roots plus any extra roots given to `UpstreamConfig::new`, then an HTTP/1.1
     exchange; 120 s bound on handshake plus request until the response head arrives; the response body
     is streamed, never buffered, and aborted if it makes no progress for 60 s. The destination address is
@@ -242,11 +243,12 @@ Step notes (all from the cited files):
     request path with the query string removed, not the normalized one. If writing the audit row fails,
     the error is logged and the request proceeds (`server.rs`, `audit`).
 
-The sixteen audit decision strings the proxy can write (found in `server.rs`, `mitm.rs`, `forward.rs`) are explained
+The eighteen audit decision strings the proxy can write (found in `server.rs`, `mitm.rs`, `forward.rs`) are explained
 one by one, with their status codes, in [proxy-internals.md](proxy-internals.md#audit-decisions): `mitm`, `passthrough`
 (CONNECT, and plain HTTP to an unruled host), `inject`, `unmatched-denied`, `unknown-role`, `ca-not-permitted`,
 `tunnel-connect-failed`, `target-denied`, `identity-limit`, `bad-request`, `token-invalid`, `method-refused`,
-`host-mismatch`, `forbidden`, `plaintext-refused` and `upstream-error`.
+`host-mismatch`, `forbidden`, `plaintext-refused`, `upstream-error`, `internal-error` (vault failure, `503`,
+fail closed) and `client-aborted` (the agent went away while the request was in flight).
 
 Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`; `sg serve` uses the defaults): at most 1024
 simultaneous client connections (excess clients wait in the kernel backlog because the permit is taken before
@@ -333,8 +335,8 @@ A rule such as `GET /repos/*` must not authorise a request that some origin serv
 resolve `..`. Rather than imitate one origin, the matcher makes the question moot: it reads the path at
 every percent-decoding depth and refuses to judge (so the restricted rule does not match and the answer
 is `403`) any path in which a dot-like segment exists under *any* separator model, plus control
-characters, look-alike Unicode and a few other inputs. If nothing is left to resolve, no ordering of
-origin operations can leave the prefix. The proxy also forwards the normalized path, so what is
+characters, any non-ASCII character (an allowlist: look-alikes cannot be enumerated) and a few other inputs. If nothing is left to resolve, no ordering of
+origin operations can leave the prefix. Where a path-restricted rule is involved the proxy also forwards the normalized path, so what is
 authorised is what is sent. The argument, its assumptions A1-A6 and the side effects are described in
 [policy-and-rules.md](policy-and-rules.md); an exhaustive test enumerates about 1.5 million paths against
 an independent oracle.

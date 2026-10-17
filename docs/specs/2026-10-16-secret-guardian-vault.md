@@ -161,8 +161,12 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
 - Las reglas comparan el **hostname** normalizado (minúsculas, sin punto final, sin puerto); el
   puerto no forma parte del patrón. Los hosts con forma de IP no admiten reglas.
 - El path se normaliza antes de comparar (segmentos `.`/`..` resueltos, escapes de caracteres no
-  reservados decodificados, `//` colapsado) y **se reenvía el path normalizado**: lo autorizado es
-  lo enviado. Además, para reglas con path distinto de `*`, el
+  reservados decodificados, `//` colapsado). Si alguna regla del rol que casa con el host tiene un
+  path distinto de `*`, **se reenvía el path normalizado**: lo autorizado es lo enviado. Si ninguna
+  regla que casa con el host tiene path restringido (hosts sin reglas bajo un rol `passthrough`, o
+  solo con reglas `*`), no se juzga ningún path y se reenvía el **path original** del agente tal cual
+  (más la query original), porque algunos orígenes (claves estilo S3, `/fetch/https://otro`)
+  distinguen `//` o los escapes. Además, para reglas con path distinto de `*`, el
   juicio está **cerrado por construcción**: se leen todas las profundidades de decodificación
   porcentual (0 a 8 capas) y en ninguna puede haber un segmento punto (`.`, `..`, `...`, `.. `, `..+`: solo
   puntos, espacios, tabs o `+`) separando a la vez por `/`, `\`, `;`, `?` y `#`. Sin nada que resolver,
@@ -170,15 +174,18 @@ Una regla dice: *en este rol, para estos host/path/métodos, inyecta este secret
   `/`, resolver puntos) puede salir del prefijo. Además, cada lectura debe empezar por el prefijo del
   patrón decodificado el mismo número de veces (igualdad exacta si el patrón no termina en `*`).
   No se puede juzgar, y las reglas con path responden `403` (solo `*` lo admite), un path con `%` mal
-  formado, `%uXXXX`, UTF-8 inválido, NUL u otro carácter de control (C0, DEL), confusables Unicode
-  de `.`, `/`, `\`, `?` o espacio, y espacios o caracteres invisibles no ASCII (p. ej. U+2025,
-  U+FF0E, U+2215, U+FF1F, U+00A0, U+200B), más de 8 capas de codificación o más de 8 KiB.
+  formado, `%uXXXX`, UTF-8 inválido, NUL u otro carácter de control (C0, DEL), **cualquier carácter
+  no ASCII en cualquier profundidad de decodificación** (lista blanca: se juzga solo si todas las
+  lecturas son ASCII; así no hace falta enumerar confusables como U+2025, U+FF0E, U+2215, U+FF1F,
+  U+FE30, U+FE19, U+2100..U+2106 o U+200B, y letras con acento, CJK o emoji tampoco son juzgables),
+  más de 8 capas de codificación o más de 8 KiB. Falla cerrado: para esos paths usa una regla con
+  path `*` o codifica la ruta de otro modo (ASCII).
   Consecuencia: `normalize_path` resuelve antes de juzgar los `..`/`%2e%2e` simples, así que
   `/repos/a/../b` pasa a `/repos/b` y se acepta, y `/repos/x/.` pasa a `/repos/x`; solo reciben `403`
   con reglas de path los segmentos punto que sobreviven a la normalización (`..;`, `..%2F`, `.. `,
   `...`, `..+`, formas doblemente codificadas) y los bytes no juzgables. Al crear la regla se
   rechazan los patrones que se ensanchan a sí mismos (segmentos punto, `;`, `\`, `?`, `#`, NUL,
-  controles o confusables en cualquier profundidad de decodificación) y los que tienen un segmento
+  controles o cualquier carácter no ASCII en cualquier profundidad de decodificación) y los que tienen un segmento
   terminado en `.` o espacio (un origen estilo Windows lo recortaría). Un prefijo que no termina en
   `/` (p. ej. `/v1*`) también casa con `/v1beta`, por diseño.
   Un `/` codificado solo se admite mientras permanezca dentro del prefijo de la regla.
@@ -200,11 +207,12 @@ El argumento de cierre descansa en estas suposiciones:
 - **A3**: los orígenes solo eliminan sufijos que empiezan en `?`/`#`, tramos desde `;` hasta el
   siguiente `/`, una `/` de `//`, y los puntos/espacios finales de un segmento.
 - **A4**: las transformaciones de caracteres son solo ASCII (`\` a `/`, plegado de mayúsculas ASCII);
-  la normalización Unicode y el `+` como espacio quedan cubiertos por la lista de caracteres
-  prohibidos y por el conjunto de segmentos punto.
+  la normalización Unicode queda cubierta por la lista blanca ASCII (cualquier carácter no ASCII hace
+  el path no juzgable) y el `+` como espacio por el conjunto de segmentos punto.
 - **A5**: los segmentos punto solo se reconocen si están hechos de puntos, espacios, tabs y `+`.
-- **A6**: el origen recibe exactamente la cadena que se juzgó (el proxy reenvía
-  `normalize_path(raw)`; la query no interviene en el enrutado).
+- **A6**: cuando interviene una regla con path restringido, el origen recibe exactamente la cadena que
+  se juzgó (el proxy reenvía `normalize_path(raw)`; la query no interviene en el enrutado); si no
+  interviene ninguna, no se juzga ningún path y el origen recibe el path original.
 - **A7**: el proxy elimina las cabeceras de override de enrutado y de reenvío (`X-HTTP-Method-Override`,
   `X-Original-URL`, `X-Original-URI`, `X-Forwarded-*`, `Forwarded`, `Via`, `X-Client-IP`,
   `True-Client-IP`, `CF-Connecting-IP`, `X-Cluster-Client-IP`...) comparando el nombre normalizado

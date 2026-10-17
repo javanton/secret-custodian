@@ -383,6 +383,7 @@ Messages are copied from real runs. "Agent side" means what the agent's HTTP cli
 | `405` body `method not allowed` (`method-refused`) | `TRACE`, `TRACK` or `CONNECT` inside a tunnel | Do not use them |
 | `429` body `too many open tunnels for this token` / `too many concurrent requests for this token` | A token reached 64 tunnels or 64 in-flight requests (`Retry-After: 1`) | Reduce parallelism, or use another token; connection pooling helps |
 | `502` body `upstream request failed` (`upstream-error`) | Upstream refused, timed out, or its TLS certificate is not trusted by the vault (a private CA) | Check the vault's `WARN` log line for the cause; for private CAs start with `--upstream-ca <pem>` |
+| `503` body `service unavailable` (`internal-error`) | The vault could not read the role or the rules (database error); the proxy fails closed and forwards nothing | Check the vault `ERROR` log line; restore the database |
 | `502` body `secret unavailable` | The stored secret no longer decrypts (database damaged or tampered) | Restore a backup; re-add the secret |
 | `sg secret rm`: `error: still referenced by a rule` | A rule uses the secret | `sg rule ls` and `sg rule rm <id>` first |
 | `sg rule add`: `warning: the CA does not permit <host>...` | Rule host not in the CA's permitted domains | `sg ca allow-domain <domain>` |
