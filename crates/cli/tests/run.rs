@@ -258,6 +258,54 @@ async fn server_errors_that_echo_the_value_never_reach_the_output() {
     assert!(msg.contains("bad request"), "{msg}");
 }
 
+#[tokio::test]
+async fn short_values_do_not_mangle_ordinary_words_in_server_errors() {
+    let f = fake(|_| (409, br#"{"error":"secret already exists"}"#.to_vec()));
+    let r = cli(&f, &["secret", "add", "gh"], b"x\n").await;
+    assert!(
+        r.err_msg().contains("secret already exists"),
+        "{}",
+        r.err_msg()
+    );
+    let r = cli(&f, &["secret", "add", "gh"], b"ist\n").await;
+    assert!(
+        r.err_msg().contains("secret already exists"),
+        "{}",
+        r.err_msg()
+    );
+}
+
+#[tokio::test]
+async fn short_values_are_still_never_echoed_as_the_whole_message() {
+    let f = fake(|rec| {
+        let v: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+        (
+            400,
+            serde_json::json!({"error": v["value"]})
+                .to_string()
+                .into_bytes(),
+        )
+    });
+    let r = cli(&f, &["secret", "add", "gh"], b"hunter2\n").await;
+    assert!(!r.err_msg().contains("hunter2"), "{}", r.err_msg());
+}
+
+#[tokio::test]
+async fn values_of_eight_bytes_are_redacted_inside_longer_messages() {
+    let f = fake(|rec| {
+        let body = String::from_utf8_lossy(&rec.body).to_string();
+        (
+            400,
+            serde_json::json!({"error": format!("bad: {body}")})
+                .to_string()
+                .into_bytes(),
+        )
+    });
+    let r = cli(&f, &["secret", "add", "gh"], b"12345678\n").await;
+    assert!(!r.err_msg().contains("12345678"), "{}", r.err_msg());
+    assert!(r.err_msg().contains("bad"), "{}", r.err_msg());
+}
+
 // ---- errors ---------------------------------------------------------------------------------
 
 #[tokio::test]

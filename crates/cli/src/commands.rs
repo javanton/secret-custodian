@@ -165,18 +165,28 @@ pub struct AuditArgs {
 
 // ---- request helpers -------------------------------------------------------------------------
 
+/// Shorter secret values are never searched for inside server messages.
+const MIN_REDACT_LEN: usize = 8;
+
 fn error_message(status: StatusCode, v: &Value, redact: Option<&str>) -> String {
     let mut msg = match v.get("error").and_then(Value::as_str) {
         Some(m) => sanitize(m, 300),
         None => format!("server returned HTTP {status}"),
     };
     if let Some(secret) = redact.filter(|s| !s.is_empty()) {
-        // A server echoing the request body would carry the value raw or JSON-escaped.
-        let escaped = serde_json::to_string(secret).unwrap_or_default();
-        let escaped = escaped.trim_matches('"');
-        msg = msg.replace(secret, "[redacted]");
-        if !escaped.is_empty() {
-            msg = msg.replace(escaped, "[redacted]");
+        if msg.trim() == secret {
+            return "[redacted]".to_string();
+        }
+        // Substring redaction only for values long enough to be secrets: replacing a 1-3 byte
+        // value would mangle ordinary words ("exists" for the value "x").
+        if secret.len() >= MIN_REDACT_LEN {
+            // A server echoing the request body would carry the value raw or JSON-escaped.
+            let escaped = serde_json::to_string(secret).unwrap_or_default();
+            let escaped = escaped.trim_matches('"');
+            msg = msg.replace(secret, "[redacted]");
+            if !escaped.is_empty() {
+                msg = msg.replace(escaped, "[redacted]");
+            }
         }
     }
     msg
@@ -867,8 +877,11 @@ mod tests {
 
     #[test]
     fn error_message_redacts_the_value_raw_and_escaped() {
-        let v = json!({"error": "bad: {\"value\":\"p\\\"w\"} and p\"w"});
-        let m = error_message(StatusCode::BAD_REQUEST, &v, Some("p\"w"));
-        assert!(!m.contains("p\"w") && !m.contains("p\\\"w"), "{m}");
+        let v = json!({"error": "bad: {\"value\":\"pass\\\"word\"} and pass\"word"});
+        let m = error_message(StatusCode::BAD_REQUEST, &v, Some("pass\"word"));
+        assert!(
+            !m.contains("pass\"word") && !m.contains("pass\\\"word"),
+            "{m}"
+        );
     }
 }
