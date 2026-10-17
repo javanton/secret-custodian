@@ -180,8 +180,8 @@ Where each class of security property is pinned:
   shortened timeouts used by the limit tests.
 - Compatibility is tested with `curl`, rustls clients and hand-written TLS clients, plus a manual check with Python and
   Node. There is no automated matrix of agent tools (Claude Code, `gh`, `git`, Go, Java, browsers...).
-- Strict X.509 clients: no automated test runs a verifier with `X509_STRICT` against the vault's leaf certificates
-  (which lack an Authority Key Identifier); this is a known defect, see the README.
+- Strict X.509 clients: `openssl_strict_verification_accepts_leaves` runs `openssl verify -x509_strict` against fresh and
+  reloaded CAs (skipped with a message when `openssl` is missing); Python 3.14 was checked manually, not in the suite.
 - Platform: only Linux is tested. The program reads `/proc/self`, so other systems are unsupported.
 - When `node` is missing the JS logic test only prints a message and passes, so a machine without it runs `cargo test`
   green without having run them.

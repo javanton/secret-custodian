@@ -696,3 +696,132 @@ fn allow_domain_trims_and_lowercases() {
     assert!(ca.allow_domain("git hub.com").is_err());
     assert!(ca.allow_domain("git\thub.com").is_err());
 }
+
+// ---- key identifiers and strict (RFC 5280 / X509_STRICT) verification ----
+
+fn ski_of(pem: &str) -> Vec<u8> {
+    let der = pem_to_der(pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    match cert
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+        .unwrap()
+        .expect("CA has no SubjectKeyIdentifier")
+        .parsed_extension()
+    {
+        ParsedExtension::SubjectKeyIdentifier(k) => k.0.to_vec(),
+        o => panic!("{o:?}"),
+    }
+}
+
+fn aki_of(pem: &str) -> Vec<u8> {
+    let der = pem_to_der(pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    match cert
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER)
+        .unwrap()
+        .expect("leaf has no AuthorityKeyIdentifier")
+        .parsed_extension()
+    {
+        ParsedExtension::AuthorityKeyIdentifier(a) => a
+            .key_identifier
+            .as_ref()
+            .expect("AKI without keyid")
+            .0
+            .to_vec(),
+        o => panic!("{o:?}"),
+    }
+}
+
+fn assert_leaf_matches_ca(ca: &CaService, host: &str) {
+    let (leaf_pem, _) = ca.issue_leaf_pem_for_test(host).unwrap();
+    let ski = ski_of(&ca.cert_pem());
+    assert!(!ski.is_empty());
+    assert_eq!(aki_of(&leaf_pem), ski, "leaf AKI must equal CA SKI");
+}
+
+#[test]
+fn leaf_aki_equals_ca_ski_fresh_after_allow_domain_and_after_reload() {
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    assert_leaf_matches_ca(&ca, "api.github.com");
+    let ski_before = ski_of(&ca.cert_pem());
+    ca.allow_domain("example.org").unwrap();
+    assert_eq!(ski_before, ski_of(&ca.cert_pem()), "SKI must be stable");
+    assert_leaf_matches_ca(&ca, "api.github.com");
+    assert_leaf_matches_ca(&ca, "www.example.org");
+    let reloaded = CaService::init_or_load(v).unwrap();
+    assert_eq!(ski_before, ski_of(&reloaded.cert_pem()));
+    assert_leaf_matches_ca(&reloaded, "api.github.com");
+}
+
+#[test]
+fn leaf_extensions_are_those_of_a_strict_end_entity_certificate() {
+    let (_d, _v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    let (leaf_pem, _) = ca.issue_leaf_pem_for_test("api.github.com").unwrap();
+    let der = pem_to_der(&leaf_pem);
+    let (_, cert) = X509Certificate::from_der(&der).unwrap();
+    let bc = cert
+        .basic_constraints()
+        .unwrap()
+        .expect("no basicConstraints");
+    assert!(!bc.value.ca);
+    let ku = cert.key_usage().unwrap().expect("no keyUsage").value;
+    assert!(ku.digital_signature() && !ku.key_cert_sign() && !ku.crl_sign());
+    let eku = cert.extended_key_usage().unwrap().expect("no EKU").value;
+    assert!(eku.server_auth && !eku.client_auth && !eku.any);
+    assert!(cert.subject_alternative_name().unwrap().is_some());
+    let ca_der = pem_to_der(&ca.cert_pem());
+    let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
+    let bc = ca_cert.basic_constraints().unwrap().unwrap();
+    assert!(bc.critical && bc.value.ca && bc.value.path_len_constraint == Some(0));
+}
+
+#[test]
+fn issue_leaf_pem_for_test_respects_the_name_constraints_gate() {
+    let (_d, _v, ca) = ca();
+    assert!(matches!(
+        ca.issue_leaf_pem_for_test("github.com"),
+        Err(CaError::NotPermitted)
+    ));
+}
+
+#[test]
+fn openssl_strict_verification_accepts_leaves() {
+    use std::process::Command;
+    if Command::new("openssl").arg("version").output().is_err() {
+        eprintln!("SKIP: openssl binary not found on PATH");
+        return;
+    }
+    let (_d, v, ca) = ca();
+    ca.allow_domain("github.com").unwrap();
+    ca.allow_domain("example.org").unwrap();
+    let reloaded = CaService::init_or_load(v).unwrap();
+    for svc in [&ca, &reloaded] {
+        for host in ["api.github.com", "github.com", "www.example.org"] {
+            let dir = tempdir().unwrap();
+            let (leaf, _) = svc.issue_leaf_pem_for_test(host).unwrap();
+            std::fs::write(dir.path().join("ca.pem"), svc.cert_pem()).unwrap();
+            std::fs::write(dir.path().join("leaf.pem"), leaf).unwrap();
+            let out = Command::new("openssl")
+                .current_dir(dir.path())
+                .args([
+                    "verify",
+                    "-x509_strict",
+                    "-CAfile",
+                    "ca.pem",
+                    "-verify_hostname",
+                    host,
+                    "leaf.pem",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "openssl strict verify of {host} failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}

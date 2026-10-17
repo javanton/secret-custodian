@@ -1,10 +1,10 @@
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
-    SerialNumber,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+    NameConstraints, SerialNumber,
 };
 use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use sg_core::{crypto, CoreError, Vault};
 use std::{
     collections::HashMap,
@@ -76,6 +76,8 @@ fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     serial[0] &= 0x7f;
     p.serial_number = Some(SerialNumber::from_slice(&serial));
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    // SKI is derived from the (stable) CA key; leaves reference it through their AKI.
+    p.key_identifier_method = KeyIdMethod::Sha256;
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let names: Vec<String> = if domains.is_empty() {
         vec![PLACEHOLDER_TLD.into()]
@@ -274,7 +276,10 @@ impl CaService {
             } else {
                 name
             };
-            let leaf = self.issue_leaf(&name, cert, &KeyPair::generate().map_err(tls)?)?;
+            let leaf = self
+                .issue_leaf(&name, cert, &KeyPair::generate().map_err(tls)?)?
+                .der()
+                .clone();
             let sni = ServerName::try_from(name).map_err(|_| REJECT)?;
             verifier
                 .verify_server_cert(&leaf, &[], &sni, &[], UnixTime::now())
@@ -288,13 +293,31 @@ impl CaService {
         host: &str,
         signer: &rcgen::Certificate,
         leaf_key: &KeyPair,
-    ) -> Result<CertificateDer<'static>, CaError> {
+    ) -> Result<rcgen::Certificate, CaError> {
         let mut params = CertificateParams::new(vec![host.to_string()]).map_err(tls)?;
+        // Strict verifiers (OpenSSL X509_STRICT, Python 3.13+) require an Authority Key Identifier
+        // equal to the CA's SKI; both are derived from the CA key, so they survive re-issuing.
+        params.use_authority_key_identifier_extension = true;
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.not_before = OffsetDateTime::now_utc() - TDuration::hours(1);
         params.not_after = OffsetDateTime::now_utc() + TDuration::hours(24);
-        let leaf = params.signed_by(leaf_key, signer, &self.key).map_err(tls)?;
-        Ok(leaf.der().clone())
+        params.signed_by(leaf_key, signer, &self.key).map_err(tls)
+    }
+
+    /// Issues a fresh leaf for a permitted host and returns `(certificate PEM, private key PEM)`.
+    /// For tests only; it goes through the same host check as `server_config_for`.
+    #[doc(hidden)]
+    pub fn issue_leaf_pem_for_test(&self, host: &str) -> Result<(String, String), CaError> {
+        let host = host.to_ascii_lowercase();
+        if !self.is_host_permitted(&host) {
+            return Err(CaError::NotPermitted);
+        }
+        let signer = lock(&self.state).signer.clone();
+        let leaf_key = KeyPair::generate().map_err(tls)?;
+        let leaf = self.issue_leaf(&host, &signer, &leaf_key)?;
+        Ok((leaf.pem(), leaf_key.serialize_pem()))
     }
 
     pub fn is_host_permitted(&self, host: &str) -> bool {
@@ -321,7 +344,7 @@ impl CaService {
             }
         }
         let leaf_key = KeyPair::generate().map_err(tls)?;
-        let leaf_der = self.issue_leaf(&host, &signer, &leaf_key)?;
+        let leaf_der = self.issue_leaf(&host, &signer, &leaf_key)?.der().clone();
         let der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         let mut cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()

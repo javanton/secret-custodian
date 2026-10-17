@@ -266,34 +266,15 @@ the old one refuses the newly allowed name (`permitted subtree violation`).
 HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080 CURL_CA_BUNDLE=$PWD/sg-ca.pem curl https://api.example.com/...
 ```
 
-**Python `requests` / `urllib`**: honours `HTTPS_PROXY`, `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`. **Known defect:** with
-Python 3.13 or later the default `ssl` context enables strict X.509 verification and rejects the vault's leaf
-certificates, which lack an Authority Key Identifier extension:
-`[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier`. Reproduced with Python 3.14.7
-(OpenSSL 3.5.7) with both `urllib` and `requests` 2.33; curl and Node are unaffected. Workaround (verified) until the
-certificates are fixed: clear the strict flag in your own context.
+**Python `requests` / `urllib`**: honours `HTTPS_PROXY`, `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`. No extra code is needed:
+Python 3.13 and later (whose default `ssl` context enables `VERIFY_X509_STRICT`) works because the vault's leaf
+certificates carry an Authority Key Identifier (verified with Python 3.14.7, OpenSSL 3.5.7, with both `urllib` and
+`requests`).
 
-```python
-import ssl, requests
-from requests.adapters import HTTPAdapter
-
-def lax_context():
-    ctx = ssl.create_default_context()           # honours SSL_CERT_FILE
-    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # the vault's leaf certificates carry no Authority Key Identifier
-    return ctx
-
-class LaxAdapter(HTTPAdapter):
-    def init_poolmanager(self, *a, **kw):
-        super().init_poolmanager(*a, ssl_context=lax_context(), **kw)
-    def proxy_manager_for(self, *a, **kw):
-        return super().proxy_manager_for(*a, ssl_context=lax_context(), **kw)
-
-s = requests.Session()
-s.mount("https://", LaxAdapter())
-print(s.get("https://api.example.com/").text)
+```sh
+HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080 SSL_CERT_FILE=$PWD/sg-ca.pem REQUESTS_CA_BUNDLE=$PWD/sg-ca.pem \
+  python3 -c 'import requests; print(requests.get("https://api.example.com/").text)'
 ```
-
-Older Pythons do not enable that flag by default (not tested here).
 
 **Node.js:** `NODE_EXTRA_CA_CERTS` works, but Node does not read `HTTPS_PROXY` by itself. On recent Node releases (tested with
 22.22) set `NODE_USE_ENV_PROXY=1` (or run `node --use-env-proxy`): `fetch` then goes through the proxy (it prints an
@@ -480,7 +461,6 @@ Read these before relying on it:
 - **Headers and query parameters only.** No request-body injection, no request signing (AWS SigV4, HMAC).
 - **No WebSockets / `Upgrade`** through the proxy (the headers are stripped).
 - **Clients that cannot use the vault CA:** certificate-pinned programs, Java (own trust store), some Go binaries.
-- **Python 3.13+ rejects the vault's certificates** (missing Authority Key Identifier); workaround above. This is a defect to fix.
 - **Responses are not inspected.** Reflected credentials are visible to the agent; query-parameter keys are especially prone to
   this (`Link`, `Location`).
 - **Query injection** appends `name=value` (percent-encoded) at the end and removes the agent's own copies of that parameter;
@@ -560,8 +540,7 @@ the reference pages under `docs/` describe the code.
 
 Planned for later phases (from the spec; none of it exists yet): a launcher/sidecar (`sg run`) that keeps the token out of
 the agent's reach; remote administration with a login (opt-in); OIDC federation as a second token verifier with per-agent tokens;
-injection into request bodies and request signing (SigV4 and similar). A known defect awaiting a fix: the leaf certificates lack an
-Authority Key Identifier (see [Limitations](#limitations)).
+injection into request bodies and request signing (SigV4 and similar).
 
 ## License
 

@@ -113,11 +113,28 @@ CA certificate properties (`ca_params`):
 | Property | Value |
 |---|---|
 | Subject | CN = `Secret Guardian CA` |
-| Basic constraints | CA, path length 0 (`Constrained(0)`): it can only sign leaves |
+| Basic constraints | CA, path length 0 (`Constrained(0)`), critical: it can only sign leaves |
 | Key usage | `keyCertSign`, `cRLSign` only |
+| Subject Key Identifier | SHA-256 based, derived from the CA public key, so it is the same in every re-issued certificate |
 | Validity | `not_before` = now minus 1 day, `not_after` = now plus 3650 days |
 | Serial | 16 random bytes with the top bit cleared (positive), generated at every build |
 | Name constraints | permitted DNS subtrees = the allowed domains; excluded IP subtrees = `0.0.0.0/0` and `::/0` |
+
+Leaf certificate properties (`issue_leaf`), all required by strict verifiers (OpenSSL `X509_STRICT`, Python 3.13+):
+
+| Extension | Value |
+|---|---|
+| Subject Alternative Name | the requested host (DNS name) |
+| Basic constraints | `CA:FALSE`, critical |
+| Key usage | `digitalSignature` |
+| Extended key usage | `serverAuth` only |
+| Authority Key Identifier | `keyid` equal to the CA's Subject Key Identifier |
+| Subject Key Identifier | derived from the leaf key |
+| Validity | about 24 hours |
+
+The AKI and SKI are derived from the CA key, so they do not change when `allow_domain` re-issues the CA certificate or when
+the service reloads from the vault (tests `leaf_aki_equals_ca_ski_fresh_after_allow_domain_and_after_reload` and
+`openssl_strict_verification_accepts_leaves`, which runs `openssl verify -x509_strict` when the binary exists).
 
 ### 2.2 Name constraints
 
@@ -228,7 +245,7 @@ Most of these variables **replace** the tool's trust store rather than extend it
 breaks verification of hosts that are not intercepted; when such an agent also talks to passthrough hosts, point the
 variable at a file with the system roots plus this CA. Re-export the file after each `allow_domain` that adds a domain.
 
-Known defect: leaf certificates carry no Authority Key Identifier, so strict verifiers (Python 3.13+ default contexts) refuse them; see the README, "Configure an agent".
+Leaf certificates carry an Authority Key Identifier, so strict verifiers (OpenSSL `X509_STRICT`, the default context of Python 3.13+) accept them.
 
 Known limitations (spec section 6.5 and 11; these are properties of the clients, not verifiable in this code base):
 

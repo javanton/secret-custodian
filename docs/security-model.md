@@ -201,8 +201,6 @@ for phase 1.
 - Certificate-pinned clients, Java (own trust store) and programs that ignore the CA environment variables will not
   work with the MITM. Clients that do not enforce name constraints get no protection from them.
 - Origins are reached over HTTP/1.1 only.
-- Known defect: leaf certificates carry no Authority Key Identifier, so strict X.509 verifiers refuse them, among
-  them Python 3.13+ default contexts (`urllib`, `requests`, `httpx`, `aiohttp`). See the README, "Configure an agent".
 
 **Policy limits**
 
