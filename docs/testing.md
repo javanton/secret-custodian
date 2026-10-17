@@ -1,7 +1,7 @@
 # Testing
 
 How the project is tested, what each suite covers, how to run it, how to add tests, and what is **not** covered.
-Counts below come from a real `cargo test --workspace` run on the commit this page was written against (449 tests
+Counts below come from a real `cargo test --workspace` run on the commit this page was written against (484 tests
 passed, 1 ignored; wall time about 3 min 46 s including a cold build). They will drift as tests are added: run the
 command to get the current numbers.
 
@@ -36,7 +36,7 @@ Principles used throughout:
 ```sh
 cargo test -p sg-policy                        # one crate (package names are sg-<dir>; the binary package is `sg`)
 cargo test -p sg-proxy --test inject           # one integration file
-cargo test --workspace                         # everything (449 passed, 1 ignored, about 4 min cold)
+cargo test --workspace                         # everything (484 passed, 1 ignored, about 4 min cold)
 cargo test -p sg-policy --release -- --include-ignored   # + the exhaustive path test (1 min 07 s wall incl. build)
 node --test crates/admin/tests/js/app.test.js  # JS logic tests alone (9 tests, about 0.1 s)
 scripts/e2e.sh                                 # real curl through the real proxy (needs curl, openssl, python3)
@@ -55,15 +55,15 @@ Counts are `passed` per binary from the workspace run (unit tests are the `src/`
 
 | Crate | Unit | Integration files (tests) | Total |
 |---|---|---|---|
-| `sg-core` | 15 | `audit` (10), `vault` (19) | 44 |
-| `sg-policy` | 55 (+1 ignored) | `policy` (19) | 74 (+1 ignored) |
+| `sg-core` | 15 | `audit` (10), `vault` (24) | 49 |
+| `sg-policy` | 57 (+1 ignored) | `policy` (19) | 76 (+1 ignored) |
 | `sg-auth` | 4 | `tokens` (30) | 34 |
-| `sg-ca` | 0 | `ca` (29) | 29 |
-| `sg-proxy` | 9 | `connect` (20), `hardening` (12), `inject` (26), `limits` (18), `netpolicy` (13), `no_leaks` (1), `plain_and_streaming` (29) | 128 |
+| `sg-ca` | 0 | `ca` (33) | 33 |
+| `sg-proxy` | 14 | `connect` (20), `hardening` (12), `inject` (26), `limits` (18), `netpolicy` (13), `no_leaks` (1), `plain_and_streaming` (29), `review_fixes` (10) | 143 |
 | `sg-admin` | 2 | `api` (15), `hygiene` (2), `serve` (14), `sessions` (11), `web_assets` (5, one of which runs the 9 `node` tests), `web_guard` (17) | 66 |
-| `sg-cli` | 16 | `client` (8), `run` (29) | 53 |
-| `sg` | 10 | `cli_e2e` (11) | 21 |
-| **Workspace** | | | **449 passed, 1 ignored** |
+| `sg-cli` | 16 | `client` (8), `run` (32) | 56 |
+| `sg` | 13 | `cli_e2e` (14) | 27 |
+| **Workspace** | | | **484 passed, 1 ignored** |
 
 ### What each suite covers
 

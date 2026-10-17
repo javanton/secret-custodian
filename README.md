@@ -503,7 +503,7 @@ Running the checks (details and inventory in [docs/testing.md](docs/testing.md))
 
 ```sh
 cargo test -p sg-policy                                  # scoped, while developing
-cargo test --workspace                                   # everything (449 tests pass, 1 ignored; about 4 minutes cold)
+cargo test --workspace                                   # everything (484 tests pass, 1 ignored; about 4 minutes cold)
 cargo test -p sg-policy --release -- --include-ignored   # + the exhaustive path oracle (1.5 million paths, about 40 s)
 node --test crates/admin/tests/js/app.test.js            # JavaScript logic tests (also run by cargo test)
 scripts/e2e.sh                                           # real curl through the real proxy
