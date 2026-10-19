@@ -985,3 +985,60 @@ async fn a_legacy_rule_with_a_host_the_ca_rejects_does_not_block_new_secrets() {
     assert_eq!(st, StatusCode::CREATED, "{body}");
     assert_eq!(domains(app).await, vec!["a.com", "b.com"]);
 }
+
+#[tokio::test]
+async fn an_identical_rule_is_refused_with_409_and_names_the_existing_one() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gh", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    let first = v["rules"][0]["id"].as_i64().unwrap();
+    let same = json!({"role":"dev","host_pattern":"a.com","kind":"header",
+        "target_name":"Authorization","template":"Bearer {secret}","secret_id":sid});
+    let (st, body) = call(&app, "POST", "/rules", Some(same)).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains(&format!("identical rule already exists (rule {first})")),
+        "{body}"
+    );
+    assert_eq!(
+        json_of(&call(&app, "GET", "/rules", None).await.1)
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // a rule that differs in one field is accepted
+    let other = json!({"role":"dev","host_pattern":"a.com","path_pattern":"/v1/*","kind":"header",
+        "target_name":"Authorization","template":"Bearer {secret}","secret_id":sid});
+    assert_eq!(
+        call(&app, "POST", "/rules", Some(other)).await.0,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn two_identical_rules_in_one_secret_creation_fail_and_create_nothing() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let mut body = secret_body("gh", "dev", "a.com");
+    let rule = body["rules"][0].clone();
+    body["rules"].as_array_mut().unwrap().push(rule);
+    let (st, text) = call(&app, "POST", "/secrets", Some(body)).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{text}");
+    assert_eq!(call(&app, "GET", "/secrets", None).await.1, "[]");
+    assert!(json_of(&call(&app, "GET", "/rules", None).await.1)
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(domains(&app).await.is_empty());
+}

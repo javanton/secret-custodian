@@ -60,6 +60,10 @@ impl From<sg_policy::PolicyError> for ApiError {
             Invalid(m) => Self(StatusCode::BAD_REQUEST, m.into()),
             NotFound => Self::not_found(),
             AlreadyExists => Self(StatusCode::CONFLICT, "already exists".into()),
+            DuplicateRule(id) => Self(
+                StatusCode::CONFLICT,
+                format!("an identical rule already exists (rule {id})"),
+            ),
             Core(c) => c.into(),
             Db(d) => Self::internal(&d),
         }

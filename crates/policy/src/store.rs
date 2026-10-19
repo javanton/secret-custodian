@@ -220,6 +220,9 @@ pub fn add_rule(v: &Vault, r: NewRule) -> Result<Rule, PolicyError> {
 pub fn insert_rule_in(conn: &Connection, r: NewRule) -> Result<Rule, PolicyError> {
     validate(conn, &r)?;
     let methods: Vec<String> = r.methods.iter().map(|m| m.to_ascii_uppercase()).collect();
+    if let Some(id) = find_identical_rule(conn, &r, &methods)? {
+        return Err(PolicyError::DuplicateRule(id));
+    }
     conn.execute(
         "INSERT INTO rules (role, host_pattern, path_pattern, methods, injection_kind, target_name, template, secret_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -236,6 +239,41 @@ pub fn insert_rule_in(conn: &Connection, r: NewRule) -> Result<Rule, PolicyError
         template: r.template,
         secret_id: r.secret_id,
     })
+}
+
+/// Id of an existing rule equal to `r` in every field. Methods compare as sets, so order and case
+/// do not matter; an empty list (any method) is different from an explicit one.
+fn find_identical_rule(
+    conn: &Connection,
+    r: &NewRule,
+    methods: &[String],
+) -> Result<Option<i64>, PolicyError> {
+    let wanted: std::collections::BTreeSet<&str> = methods.iter().map(String::as_str).collect();
+    let mut st = conn.prepare(
+        "SELECT id, methods FROM rules
+         WHERE role = ?1 AND host_pattern = ?2 AND path_pattern = ?3 AND injection_kind = ?4
+           AND target_name = ?5 AND template = ?6 AND secret_id = ?7
+         ORDER BY id",
+    )?;
+    let rows = st
+        .query_map(
+            params![
+                r.role,
+                r.host_pattern,
+                r.path_pattern,
+                r.kind.as_str(),
+                r.target_name,
+                r.template,
+                r.secret_id
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().find_map(|(id, stored)| {
+        let have: std::collections::BTreeSet<&str> =
+            stored.split(',').filter(|m| !m.is_empty()).collect();
+        (have == wanted).then_some(id)
+    }))
 }
 
 pub fn list_rules(v: &Vault, role: Option<&str>) -> Result<Vec<Rule>, PolicyError> {

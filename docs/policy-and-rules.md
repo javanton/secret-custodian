@@ -84,6 +84,11 @@ A secret that no rule uses can never be injected, so the admin layer (not the SQ
 - **Creation.** `POST /secrets` / `sg secret add` creates the secret together with its first rule(s), atomically
   (`rules` is required and has 1 to 20 items). The rules use the same validation as `add_rule` (section 2.1) through
   `RuleSpec`, a rule without `secret_id`. Extra rules come from `POST /rules` / `sg rule add`.
+- **Identical rules.** A rule equal to an existing one in every field (role, host, path, injection kind, target name,
+  template and secret; methods compare as a set, so order and case do not matter, and an empty list is different from an
+  explicit one) is refused with `409 an identical rule already exists (rule N)`. This applies to `POST /rules` and to two
+  equal rules inside one `POST /secrets` (nothing is created). Rules that differ in any field, or that use another secret,
+  are accepted.
 - **Deleting a rule.** Refused with `409` when it is the last rule of its secret: delete the secret instead, or add
   another rule first.
 - **Deleting a secret.** Deletes its rules in the same transaction (there is no longer a "still referenced" error).

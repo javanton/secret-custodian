@@ -116,6 +116,9 @@ pub enum PolicyError {
     NotFound,
     #[error("already exists")]
     AlreadyExists,
+    /// An identical rule (same role, host, path, methods, injection and secret) exists; carries its id.
+    #[error("an identical rule already exists (rule {0})")]
+    DuplicateRule(i64),
     #[error(transparent)]
     Core(#[from] sg_core::CoreError),
     #[error("database error: {0}")]

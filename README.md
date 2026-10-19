@@ -123,7 +123,7 @@ PROXY="$(sed -n 's/^proxy: http:\/\///p' serve.out)"
 wrote sg.key
 Back this file up: without it the vault cannot be opened.
 proxy: http://127.0.0.1:33691
-admin: http://localhost:45081/#t=9e9f86cc1378bd4246951ee3212002143ca445fd2b5d51932c961c65008e061a
+admin: http://localhost:45081/#t=9e9f86cc1378bd4246951ee3212002143ca445fd2b5d52232c961c65008e061a
 socket: /tmp/tmp.vINqLarwc9/sg.sock
 ready
 ```
@@ -510,7 +510,7 @@ Running the checks (details and inventory in [docs/testing.md](docs/testing.md))
 
 ```sh
 cargo test -p sg-policy                                  # scoped, while developing
-cargo test --workspace                                   # everything (519 tests pass, 1 ignored; about 4 minutes cold)
+cargo test --workspace                                   # everything (522 tests pass, 1 ignored; about 4 minutes cold)
 cargo test -p sg-policy --release -- --include-ignored   # + the exhaustive path oracle (1.5 million paths, about 40 s)
 node --test crates/admin/tests/js/app.test.js            # JavaScript logic tests (also run by cargo test)
 scripts/e2e.sh                                           # real curl through the real proxy

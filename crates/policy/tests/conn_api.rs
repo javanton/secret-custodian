@@ -69,3 +69,45 @@ fn insert_rule_in_still_validates() {
         Err(PolicyError::Invalid("unknown role"))
     ));
 }
+
+#[test]
+fn an_identical_rule_is_rejected_and_names_the_existing_one() {
+    let (_d, v) = vault();
+    add_role(&v, "dev", Unmatched::Deny).unwrap();
+    add_role(&v, "rev", Unmatched::Deny).unwrap();
+    let s = v.add_secret("s", "x").unwrap();
+    let other = v.add_secret("o", "x").unwrap();
+    let conn = v.conn();
+    let mut a = spec("dev", "a.com");
+    a.methods = vec!["GET".into(), "head".into()];
+    let first = insert_rule_in(&conn, a.clone().with_secret(s.id)).unwrap();
+
+    // the same rule again, and with the methods in another order and case
+    assert!(matches!(
+        insert_rule_in(&conn, a.clone().with_secret(s.id)),
+        Err(PolicyError::DuplicateRule(id)) if id == first.id
+    ));
+    let mut reordered = a.clone();
+    reordered.methods = vec!["HEAD".into(), "get".into()];
+    assert!(matches!(
+        insert_rule_in(&conn, reordered.with_secret(s.id)),
+        Err(PolicyError::DuplicateRule(id)) if id == first.id
+    ));
+
+    // differing in any one field is a different rule
+    let mut path = a.clone();
+    path.path_pattern = "/v1/*".into();
+    insert_rule_in(&conn, path.with_secret(s.id)).unwrap();
+    let mut methods = a.clone();
+    methods.methods = vec!["GET".into()];
+    insert_rule_in(&conn, methods.with_secret(s.id)).unwrap();
+    let mut template = a.clone();
+    template.template = "Token {secret}".into();
+    insert_rule_in(&conn, template.with_secret(s.id)).unwrap();
+    let mut role = a.clone();
+    role.role = "rev".into();
+    insert_rule_in(&conn, role.with_secret(s.id)).unwrap();
+    insert_rule_in(&conn, a.clone().with_secret(other.id)).unwrap();
+    // and the rejections left nothing behind: first + 5 distinct ones
+    assert_eq!(list_rules_in(&conn, None).unwrap().len(), 6);
+}

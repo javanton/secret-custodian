@@ -153,7 +153,7 @@ invariant existed (see [operations.md](operations.md#upgrading-from-a-version-wi
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
 | `GET /secrets` | - | `200` array of `SecretMeta` plus `rules` (count), sorted by name | - |
-| `POST /secrets` | `{"name", "value", "rules": [RuleSpec, ...]}` (`rules` required, 1 to 20 items) | `201` `{"secret": SecretMeta, "rules": [Rule, ...], "ca_changed": bool, "notice": null \| "<text>"}` | `400` `invalid name: use [a-z0-9._-], max 64 chars`; `400` `invalid secret value: empty` / `too long` / `contains control characters`; `400` `a secret needs at least one rule: ...` (missing or empty `rules`); `400` `too many rules for one secret (max 20)`; `400` any rule error (`unknown role`, `host_pattern must be ...`, template and path errors, `domain rejected: <reason>`); `409` `already exists` |
+| `POST /secrets` | `{"name", "value", "rules": [RuleSpec, ...]}` (`rules` required, 1 to 20 items) | `201` `{"secret": SecretMeta, "rules": [Rule, ...], "ca_changed": bool, "notice": null \| "<text>"}` | `400` `invalid name: use [a-z0-9._-], max 64 chars`; `400` `invalid secret value: empty` / `too long` / `contains control characters`; `400` `a secret needs at least one rule: ...` (missing or empty `rules`); `400` `too many rules for one secret (max 20)`; `400` any rule error (`unknown role`, `host_pattern must be ...`, template and path errors, `domain rejected: <reason>`); `409` `already exists`; `409` `an identical rule already exists (rule N)` (two equal rules in `rules`) |
 | `GET /secrets/{name}` | - | `200` `SecretMeta` | `400` invalid name, `404` `not found` |
 | `PUT /secrets/{name}` (rotate) | `{"value": "..."}` | `200` `SecretMeta` with `rotated_at` set | as above, `404` |
 | `DELETE /secrets/{name}` | - | `204`; the secret's rules are deleted with it and the CA is re-synced | `404` |
@@ -206,7 +206,7 @@ Rule object: `{"id", "role", "host_pattern", "path_pattern", "methods": [...], "
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
 | `GET /rules[?role=<name>]` | - | `200` array ordered by id | `400` invalid role filter or unknown query parameter (`invalid query string`) |
-| `POST /rules` | `{"role", "host_pattern", "path_pattern"?: "*", "methods"?: [], "kind", "target_name", "template", "secret_id"}` | `201` `{"rule": {...}, "ca_changed": bool, "notice": null \| "<text>"}` | `400` with the policy message (for example `unknown role`, `unknown secret`, `host_pattern must be a lowercase hostname or *.hostname (no IPs)`, `domain rejected: <reason>` (the CA cannot permit the host; nothing is created), template and path errors, listed in [policy-and-rules.md](policy-and-rules.md#21-validation-storers-validate)) |
+| `POST /rules` | `{"role", "host_pattern", "path_pattern"?: "*", "methods"?: [], "kind", "target_name", "template", "secret_id"}` | `201` `{"rule": {...}, "ca_changed": bool, "notice": null \| "<text>"}` | `400` with the policy message (for example `unknown role`, `unknown secret`, `host_pattern must be a lowercase hostname or *.hostname (no IPs)`, `domain rejected: <reason>` (the CA cannot permit the host; nothing is created), template and path errors, listed in [policy-and-rules.md](policy-and-rules.md#21-validation-storers-validate)); `409` `an identical rule already exists (rule N)` |
 | `DELETE /rules/{id}` | - | `204`; the CA is re-synced | `400` `invalid rule id` (not a positive integer); `404`; `409` `this is the last rule of its secret: delete the secret instead, or add another rule first` |
 
 Creating the rule and re-deriving the CA's permitted domains happen in one transaction. `ca_changed` is true (and `notice`
@@ -299,7 +299,7 @@ Trades a login token for a session (see above).
 | `403` | Web only: cross-origin write |
 | `404` | Unknown route or object (also `/api/admin/login-token` on the web listener, `GET /login`) |
 | `405` | Wrong method on a known route |
-| `409` | Duplicate name; deleting the last rule of a secret; deleting a role that would leave secrets without rules |
+| `409` | Duplicate name; an identical rule already exists; deleting the last rule of a secret; deleting a role that would leave secrets without rules |
 | `413` | Body over 64 KiB |
 | `415` | Write without `application/json` |
 | `421` | Web only: unexpected `Host` |
