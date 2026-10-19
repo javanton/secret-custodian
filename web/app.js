@@ -679,7 +679,7 @@ let renderSeq = 0;
 
 function renderChrome() {
   $("tabs").replaceChildren(
-    TABS.map(([id, label]) =>
+    ...TABS.map(([id, label]) =>
       el("button", { type: "button", "aria-current": id === current ? "page" : false, onclick: () => selectTab(id) }, label),
     ),
   );
@@ -764,7 +764,7 @@ async function boot() {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo };
+  module.exports = { renderChrome, el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo };
 }
 if (typeof window !== "undefined") {
   boot().catch((e) => showHelp("Unexpected error: " + (e && e.message ? e.message : e)));

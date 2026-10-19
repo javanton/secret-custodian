@@ -96,3 +96,11 @@ test("api sends JSON content type on writes", async () => {
   assert.equal(await app.api("DELETE", "/secrets/x"), null);
   assert.equal(opts.headers["Content-Type"], "application/json");
 });
+
+test("renderChrome puts one real button per section in the nav bar", () => {
+  app.renderChrome();
+  const tabs = document.getElementById("tabs");
+  const labels = tabs.find("button").map((b) => b.textContent);
+  assert.deepEqual(labels, ["Secrets", "Roles & rules", "Tokens", "CA", "Audit"]);
+  assert.equal(tabs.find("button")[0].getAttribute("aria-current"), "page");
+});

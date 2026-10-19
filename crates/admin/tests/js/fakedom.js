@@ -62,10 +62,14 @@ class Element extends Node {
 }
 function install() {
   global.Node = Node;
+  const byId = new Map();
   global.document = {
     createElement: (t) => new Element(t),
     createTextNode: (d) => new Text(String(d)),
-    getElementById: () => new Element("div"),
+    getElementById: (id) => {
+      if (!byId.has(id)) byId.set(id, new Element("div"));
+      return byId.get(id);
+    },
   };
   const store = new Map();
   global.sessionStorage = {
