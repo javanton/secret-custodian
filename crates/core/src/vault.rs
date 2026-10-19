@@ -170,6 +170,20 @@ impl Vault {
         Self::open(path, key)
     }
 
+    /// Runs `f` in one transaction: committed when it returns `Ok`, rolled back on `Err`. The
+    /// connection stays locked for the whole call, so concurrent writers are serialized.
+    pub fn in_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<CoreError>,
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(CoreError::from)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(CoreError::from)?;
+        Ok(out)
+    }
+
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         // Recover from poisoning instead of panicking: a panic while holding the guard cannot
         // leave a half-applied write behind, because rusqlite rolls back any open transaction

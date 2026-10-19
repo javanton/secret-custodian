@@ -83,37 +83,84 @@ fn delete_by_id(conn: &Connection, id: i64) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn insert_secret(
+    vault: &Vault,
+    conn: &Connection,
+    name: &str,
+    value: &str,
+) -> Result<SecretMeta, CoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM secrets WHERE name = ?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if exists {
+        return Err(CoreError::AlreadyExists);
+    }
+    let ts = now();
+    conn.execute(
+        "INSERT INTO secrets (name, value_enc, created_at) VALUES (?1, x'', ?2)",
+        params![name, ts],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE secrets SET value_enc = ?1 WHERE id = ?2",
+        params![vault.seal_value(&aad(id), value.as_bytes()), id],
+    )?;
+    Ok(SecretMeta {
+        id,
+        name: name.into(),
+        created_at: ts,
+        rotated_at: None,
+    })
+}
+
 impl Vault {
     pub fn add_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
+        self.add_secret_with(name, value, |_, _| Ok::<(), CoreError>(()))
+    }
+
+    /// Inserts the secret and runs `extra` in the same transaction; an `Err` from it rolls everything back.
+    pub fn add_secret_with<E, F>(&self, name: &str, value: &str, extra: F) -> Result<SecretMeta, E>
+    where
+        E: From<CoreError>,
+        F: FnOnce(&Connection, &SecretMeta) -> Result<(), E>,
+    {
         validate_name(name)?;
         validate_secret_value(value)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT COUNT(*) FROM secrets WHERE name = ?1",
-            [name],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
-        if exists {
-            return Err(CoreError::AlreadyExists);
-        }
-        let ts = now();
-        tx.execute(
-            "INSERT INTO secrets (name, value_enc, created_at) VALUES (?1, x'', ?2)",
-            params![name, ts],
-        )?;
-        let id = tx.last_insert_rowid();
-        tx.execute(
-            "UPDATE secrets SET value_enc = ?1 WHERE id = ?2",
-            params![self.seal_value(&aad(id), value.as_bytes()), id],
-        )?;
-        tx.commit()?;
-        Ok(SecretMeta {
-            id,
-            name: name.into(),
-            created_at: ts,
-            rotated_at: None,
+        self.in_transaction(|tx| {
+            let meta = insert_secret(self, tx, name, value)?;
+            extra(tx, &meta)?;
+            Ok(meta)
         })
+    }
+
+    /// Deletes the secret together with its rules, then runs `after`, all in one transaction.
+    pub fn remove_secret_cascade_with<E, F>(&self, name: &str, after: F) -> Result<(), E>
+    where
+        E: From<CoreError>,
+        F: FnOnce(&Connection) -> Result<(), E>,
+    {
+        self.in_transaction(|tx| {
+            let meta = lookup(tx, name)?;
+            tx.execute("DELETE FROM rules WHERE secret_id = ?1", [meta.id])
+                .map_err(CoreError::from)?;
+            delete_by_id(tx, meta.id)?;
+            after(tx)
+        })
+    }
+
+    pub fn list_secrets_with_rule_counts(&self) -> Result<Vec<(SecretMeta, i64)>, CoreError> {
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT s.id, s.name, s.created_at, s.rotated_at,
+                    (SELECT COUNT(*) FROM rules r WHERE r.secret_id = s.id)
+             FROM secrets s ORDER BY s.name",
+        )?;
+        let rows = st
+            .query_map([], |r| Ok((row_meta(r)?, r.get::<_, i64>(4)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn rotate_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
@@ -202,5 +249,125 @@ mod tests {
             delete_by_id(&conn, meta.id),
             Err(CoreError::NotFound)
         ));
+    }
+
+    fn seed_rule(v: &Vault, secret_id: i64) {
+        let c = v.conn();
+        c.execute(
+            "INSERT OR IGNORE INTO roles (name, unmatched_policy) VALUES ('r','deny')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO rules (role, host_pattern, path_pattern, methods, injection_kind, target_name, template, secret_id)
+             VALUES ('r','h.com','*','','header','X-K','{secret}',?1)",
+            [secret_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn add_secret_with_rolls_the_secret_back_when_the_hook_fails() {
+        let (_d, v) = vault();
+        let r: Result<SecretMeta, CoreError> =
+            v.add_secret_with("a", "x", |_, _| Err(CoreError::InUse));
+        assert!(matches!(r, Err(CoreError::InUse)));
+        assert!(v.list_secrets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_secret_with_runs_the_hook_in_the_same_transaction() {
+        let (_d, v) = vault();
+        let meta = v
+            .add_secret_with("a", "x", |conn, m| {
+                conn.execute(
+                    "INSERT INTO roles (name, unmatched_policy) VALUES ('r','deny')",
+                    [],
+                )?;
+                assert!(m.id > 0);
+                Ok::<(), CoreError>(())
+            })
+            .unwrap();
+        assert_eq!(meta.name, "a");
+        assert_eq!(
+            v.conn()
+                .query_row("SELECT COUNT(*) FROM roles", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn cascade_removal_deletes_rules_and_runs_the_hook_atomically() {
+        let (_d, v) = vault();
+        let meta = v.add_secret("a", "x").unwrap();
+        seed_rule(&v, meta.id);
+        assert!(matches!(v.remove_secret("a"), Err(CoreError::InUse)));
+        // a failing hook leaves both the secret and its rule in place
+        let r: Result<(), CoreError> =
+            v.remove_secret_cascade_with("a", |_| Err(CoreError::Crypto));
+        assert!(matches!(r, Err(CoreError::Crypto)));
+        assert_eq!(v.list_secrets().unwrap().len(), 1);
+        assert_eq!(
+            v.conn()
+                .query_row("SELECT COUNT(*) FROM rules", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        // success removes both
+        v.remove_secret_cascade_with("a", |_| Ok::<(), CoreError>(()))
+            .unwrap();
+        assert!(v.list_secrets().unwrap().is_empty());
+        assert_eq!(
+            v.conn()
+                .query_row("SELECT COUNT(*) FROM rules", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn rule_counts_are_reported_per_secret() {
+        let (_d, v) = vault();
+        let a = v.add_secret("a", "x").unwrap();
+        v.add_secret("b", "x").unwrap();
+        seed_rule(&v, a.id);
+        let counts: Vec<(String, i64)> = v
+            .list_secrets_with_rule_counts()
+            .unwrap()
+            .into_iter()
+            .map(|(m, n)| (m.name, n))
+            .collect();
+        assert_eq!(counts, vec![("a".to_string(), 1), ("b".to_string(), 0)]);
+    }
+
+    #[test]
+    fn in_transaction_commits_on_ok_and_rolls_back_on_err() {
+        let (_d, v) = vault();
+        let ok: Result<(), CoreError> = v.in_transaction(|c| {
+            c.execute(
+                "INSERT INTO roles (name, unmatched_policy) VALUES ('keep','deny')",
+                [],
+            )?;
+            Ok(())
+        });
+        ok.unwrap();
+        let err: Result<(), CoreError> = v.in_transaction(|c| {
+            c.execute(
+                "INSERT INTO roles (name, unmatched_policy) VALUES ('drop','deny')",
+                [],
+            )?;
+            Err(CoreError::Crypto)
+        });
+        assert!(err.is_err());
+        let names: Vec<String> = {
+            let c = v.conn();
+            let mut st = c.prepare("SELECT name FROM roles").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(names, vec!["keep".to_string()]);
     }
 }
