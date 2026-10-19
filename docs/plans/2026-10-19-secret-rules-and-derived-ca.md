@@ -1,5 +1,7 @@
 # Secretos con reglas obligatorias y CA derivada: plan de implementación
 
+> **Estado:** ejecutado el 2026-10-19 (ver commits de la rama).
+
 > **Para agentes:** SUB-SKILL requerida: `superpowers:subagent-driven-development` (recomendada) o
 > `superpowers:executing-plans`. Los pasos usan casillas `- [ ]`. Antes de empezar, cargar el entorno de Rust:
 > `source ~/.cargo/env` en **cada** llamada de Bash.
@@ -87,7 +89,7 @@ tarea que indica.
 - [x] **Paso 1: enmendar la spec** (regla 8: hueco detectado al planificar). Hecho al escribir este plan: §7.5
   recoge que borrar un rol que dejaría secretos sin reglas responde `409`.
 
-- [ ] **Paso 2: tests que fallan** (en `mod tests` de `crates/core/src/secrets.rs`, que ya tiene el helper `vault()`):
+- [x] **Paso 2: tests que fallan** (en `mod tests` de `crates/core/src/secrets.rs`, que ya tiene el helper `vault()`):
 
 ```rust
     fn seed_rule(v: &Vault, secret_id: i64) {
@@ -178,9 +180,9 @@ tarea que indica.
     }
 ```
 
-- [ ] **Paso 3: ver que falla.** `cargo test -p sg-core --lib secrets` → error de compilación (métodos inexistentes).
+- [x] **Paso 3: ver que falla.** `cargo test -p sg-core --lib secrets` → error de compilación (métodos inexistentes).
 
-- [ ] **Paso 4: implementar.** En `crates/core/src/vault.rs`, junto a `conn()`:
+- [x] **Paso 4: implementar.** En `crates/core/src/vault.rs`, junto a `conn()`:
 
 ```rust
     /// Runs `f` in one transaction: committed when it returns `Ok`, rolled back on `Err`. The
@@ -268,8 +270,8 @@ impl Vault {
   (en `add_secret_with` los `?` sobre `validate_*` y `insert_secret` convierten `CoreError` → `E` con `From`.
   Borrar la implementación anterior de `add_secret`.)
 
-- [ ] **Paso 5: ver que pasa.** `cargo test -p sg-core` → todo en verde (incluye los tests previos de `vault.rs`).
-- [ ] **Paso 6: commit.** `feat(core): transactional hooks for secrets and rules`.
+- [x] **Paso 5: ver que pasa.** `cargo test -p sg-core` → todo en verde (incluye los tests previos de `vault.rs`).
+- [x] **Paso 6: commit.** `feat(core): transactional hooks for secrets and rules`.
 
 ---
 
@@ -291,7 +293,7 @@ impl Vault {
   - `derive_ca_domains(rules: &[Rule]) -> Vec<String>`: hosts sin `*.`, ordenados y sin duplicados.
   - Los envoltorios actuales (`add_rule`, `list_rules`, `remove_rule`, `get_role`, `remove_role`) conservan firma.
 
-- [ ] **Paso 1: tests que fallan.** `crates/policy/src/domains.rs`:
+- [x] **Paso 1: tests que fallan.** `crates/policy/src/domains.rs`:
 
 ```rust
 use crate::model::Rule;
@@ -389,8 +391,8 @@ fn insert_rule_in_still_validates() {
 }
 ```
 
-- [ ] **Paso 2: ver que falla.** `cargo test -p sg-policy` → error de compilación.
-- [ ] **Paso 3: implementar.**
+- [x] **Paso 2: ver que falla.** `cargo test -p sg-policy` → error de compilación.
+- [x] **Paso 3: implementar.**
   - `model.rs`: añadir `RuleSpec` (campos públicos) y
     `impl RuleSpec { pub fn with_secret(self, secret_id: i64) -> NewRule { NewRule { role: self.role, host_pattern: self.host_pattern, path_pattern: self.path_pattern, methods: self.methods, kind: self.kind, target_name: self.target_name, template: self.template, secret_id } } }`.
   - `store.rs`: cambiar `fn validate(v: &Vault, r)` por `fn validate(conn: &Connection, r)`, usando `get_role_in(conn, ..)` y
@@ -424,8 +426,8 @@ pub fn secrets_orphaned_by_role_in(conn: &Connection, role: &str) -> Result<Vec<
 ```
 
   - `lib.rs`: `mod domains;` y `pub use domains::derive_ca_domains;`. `use rusqlite::{params, Connection, OptionalExtension};` en `store.rs`; añadir `rusqlite` a las dependencias de `crates/policy/Cargo.toml` solo si aún no es dependencia directa (ya lo usa `store.rs`, así que lo es).
-- [ ] **Paso 4: ver que pasa.** `cargo test -p sg-policy` (incluye los tests previos; 1 ignorado como siempre) y `cargo clippy -p sg-policy --all-targets -- -D warnings`.
-- [ ] **Paso 5: commit.** `refactor(policy): rule operations on a connection and CA domain derivation`.
+- [x] **Paso 4: ver que pasa.** `cargo test -p sg-policy` (incluye los tests previos; 1 ignorado como siempre) y `cargo clippy -p sg-policy --all-targets -- -D warnings`.
+- [x] **Paso 5: commit.** `refactor(policy): rule operations on a connection and CA domain derivation`.
 
 ---
 
@@ -447,7 +449,7 @@ pub fn secrets_orphaned_by_role_in(conn: &Connection, role: &str) -> Result<Vec<
   - `CaService::install(&self, p: PreparedCa)`: sustituye el estado en memoria y vacía la caché de hojas.
   - `allow_domain` se reescribe sobre estas tres (sin anidar locks) y mantiene su comportamiento y errores.
 
-- [ ] **Paso 1: tests que fallan** (añadir a `crates/ca/tests/ca.rs`):
+- [x] **Paso 1: tests que fallan** (añadir a `crates/ca/tests/ca.rs`):
 
 ```rust
 fn s(v: &[&str]) -> Vec<String> {
@@ -509,8 +511,8 @@ async fn domains_can_be_removed_and_the_ca_returns_to_the_placeholder() {
   `E: From<CoreError>`). Si no existe, añadir `#[error(transparent)] Core(#[from] sg_core::CoreError)` a `CaError`
   (grep `enum CaError`); si ya existe una variante equivalente, usarla.
 
-- [ ] **Paso 2: ver que falla.** `cargo test -p sg-ca --test ca prepare` → no compila.
-- [ ] **Paso 3: implementar** en `service.rs`:
+- [x] **Paso 2: ver que falla.** `cargo test -p sg-ca --test ca prepare` → no compila.
+- [x] **Paso 3: implementar** en `service.rs`:
 
 ```rust
 /// A re-issued CA certificate that is validated but not yet persisted or installed.
@@ -564,9 +566,9 @@ impl CaService {
   Borrar el `allow_domain` anterior (el de la línea ~235) y actualizar el comentario de la cabecera: «el orden de locks es
   siempre conexión → estado → caché; `prepare_domains` solo lee el estado un instante». Re-exportar `PreparedCa` en
   `lib.rs`.
-- [ ] **Paso 4: ver que pasa.** `cargo test -p sg-ca` completo (los tests antiguos de `allow_domain` deben seguir en
+- [x] **Paso 4: ver que pasa.** `cargo test -p sg-ca` completo (los tests antiguos de `allow_domain` deben seguir en
   verde: es la prueba de que la reescritura no cambió el comportamiento) y clippy del crate.
-- [ ] **Paso 5: commit.** `feat(ca): prepare, persist and install CA domain sets separately`.
+- [x] **Paso 5: commit.** `feat(ca): prepare, persist and install CA domain sets separately`.
 
 ---
 
@@ -592,7 +594,7 @@ impl CaService {
   - Se elimina `POST /ca/domains` (pasa a 404). `GET /ca` y `GET /ca/cert` no cambian.
   - `sg_admin::ops::sync_ca(vault: &Vault, ca: &CaService) -> ApiResult<bool>` (pública, la usa `sg serve`).
 
-- [ ] **Paso 1: tests que fallan.** En `crates/admin/tests/api.rs`, añadir helpers y tests nuevos (los existentes
+- [x] **Paso 1: tests que fallan.** En `crates/admin/tests/api.rs`, añadir helpers y tests nuevos (los existentes
   se adaptan en el paso 4):
 
 ```rust
@@ -765,8 +767,8 @@ fn startup_sync_derives_the_ca_from_existing_rules_and_is_stable() {
 }
 ```
 
-- [ ] **Paso 2: ver que falla.** `cargo test -p sg-admin --test api --test ops` → fallan/no compilan.
-- [ ] **Paso 3: implementar `crates/admin/src/ops.rs`:**
+- [x] **Paso 2: ver que falla.** `cargo test -p sg-admin --test api --test ops` → fallan/no compilan.
+- [x] **Paso 3: implementar `crates/admin/src/ops.rs`:**
 
 ```rust
 //! Multi-step admin operations. Each one runs in a single SQLite transaction together with the CA's
@@ -912,7 +914,7 @@ pub fn delete_role(s: &AppState, name: &str) -> ApiResult<()> {
     }
 ```
 
-- [ ] **Paso 4: adaptar los tests existentes** (`crates/admin/tests/api.rs`; ver con
+- [x] **Paso 4: adaptar los tests existentes** (`crates/admin/tests/api.rs`; ver con
   `grep -n '"/secrets"\|/ca/domains\|ca_warning' crates/admin/tests/api.rs`):
   - Sustituir cada alta `POST /secrets {"name","value"}` por `secret_body(name, role, host)` creando antes el rol con
     `role(&app, ..)`; los `secret_id` que antes valían 1 se obtienen de `v["secret"]["id"]`.
@@ -924,9 +926,9 @@ pub fn delete_role(s: &AppState, name: &str) -> ApiResult<()> {
   - `no_route_ever_returns_a_secret_value` y `secret_with_crlf_is_rejected_with_400`: mismo cambio de cuerpo.
   - `deleting_a_role_cascades_its_rules`: ahora el rol de la prueba debe dejar otra regla en otro rol para no huérfanar,
     o cambiar la aserción al 409; ajustar según el test (leerlo antes de editar).
-- [ ] **Paso 5: ver que pasa.** `cargo test -p sg-admin` completo y `cargo test -p sg --lib` (el arranque compila) +
+- [x] **Paso 5: ver que pasa.** `cargo test -p sg-admin` completo y `cargo test -p sg --lib` (el arranque compila) +
   clippy de `sg-admin` y `sg`.
-- [ ] **Paso 6: commit.** `feat(admin): atomic secret creation with rules and CA derived from rules`.
+- [x] **Paso 6: commit.** `feat(admin): atomic secret creation with rules and CA derived from rules`.
 
 ---
 
@@ -943,7 +945,7 @@ pub fn delete_role(s: &AppState, name: &str) -> ApiResult<()> {
   Con `--role` omitido: un único rol existente se usa; ninguno → se crea `default` (`passthrough`) y se avisa por
   stderr; varios → error que lista los roles.
 
-- [ ] **Paso 1: tests que fallan** (en `mod tests` de `commands.rs`, con su helper `parse`):
+- [x] **Paso 1: tests que fallan** (en `mod tests` de `commands.rs`, con su helper `parse`):
 
 ```rust
     #[test]
@@ -1023,8 +1025,8 @@ async fn secret_add_with_several_roles_demands_one_and_never_leaks_the_value() {
   `{"rule":{"id":4},"ca_changed":true,"notice":"..."}` y se espera el aviso en stderr desde `notice`. Eliminar
   `ca_allow_domain_prints_the_notice`.
 
-- [ ] **Paso 2: ver que falla.** `cargo test -p sg-cli` → no compila / falla.
-- [ ] **Paso 3: implementar.**
+- [x] **Paso 2: ver que falla.** `cargo test -p sg-cli` → no compila / falla.
+- [x] **Paso 3: implementar.**
   - `commands.rs`: extraer los argumentos comunes y compartirlos:
 
 ```rust
@@ -1112,12 +1114,12 @@ async fn resolve_role(socket: &Path, io: &mut Io<'_>, role: Option<String>) -> a
     muestra `secret add`, añadir las flags de la regla.
   - Adaptar los tests viejos: `secret_add_has_no_value_argument` y `rule_add_parses_all_flags` acceden a
     `a.host` / `a.path`… → pasan a `a.target.host` etc.
-- [ ] **Paso 4: adaptar `crates/sg/tests/cli_e2e.rs`** (el flujo real contra `sg serve`): sustituir
+- [x] **Paso 4: adaptar `crates/sg/tests/cli_e2e.rs`** (el flujo real contra `sg serve`): sustituir
   `secret add gh` + `ca allow-domain github.com` + `rule add` por
   `secret add gh --role reviewer --host api.github.com --methods GET --header Authorization --template 'Bearer {secret}'`
   (creando antes el rol), y comprobar con `ca status` que aparece `api.github.com`.
-- [ ] **Paso 5: ver que pasa.** `cargo test -p sg-cli` y `cargo test -p sg --test cli_e2e`; clippy de ambos.
-- [ ] **Paso 6: commit.** `feat(cli): secret add takes its first rule; drop ca allow-domain`.
+- [x] **Paso 5: ver que pasa.** `cargo test -p sg-cli` y `cargo test -p sg --test cli_e2e`; clippy de ambos.
+- [x] **Paso 6: commit.** `feat(cli): secret add takes its first rule; drop ca allow-domain`.
 
 ---
 
@@ -1132,7 +1134,7 @@ async fn resolve_role(socket: &Path, io: &mut Io<'_>, role: Option<String>) -> a
 - Produce: formulario «Add a secret» con el bloque de la primera regla (obligatorio) y «Add another rule»; la lista de
   secretos muestra el número de reglas; la pestaña CA queda de solo lectura; `buildRule(values)` exportada para tests.
 
-- [ ] **Paso 1: tests que fallan** (`app.test.js`):
+- [x] **Paso 1: tests que fallan** (`app.test.js`):
 
 ```js
 test("buildRule trims, defaults the path and keeps only checked methods", () => {
@@ -1152,8 +1154,8 @@ test("secretBody never puts the value anywhere but `value` and always carries at
 });
 ```
 
-- [ ] **Paso 2: ver que falla.** `node --test crates/admin/tests/js/app.test.js` → `buildRule is not a function`.
-- [ ] **Paso 3: implementar** en `app.js`:
+- [x] **Paso 2: ver que falla.** `node --test crates/admin/tests/js/app.test.js` → `buildRule is not a function`.
+- [x] **Paso 3: implementar** en `app.js`:
   - Funciones puras (y exportarlas en `module.exports`):
 
 ```js
@@ -1212,14 +1214,14 @@ onsubmit: safe(async () => {
     the CA certificate.» y el estado vacío a «No domains yet: they appear when you add a rule.».
   - `style.css`: `.rule-block { margin: .5rem 0; width: 100%; }` y que `fieldset.rule-block` herede el estilo de tarjeta
     existente (bordes de `fieldset`).
-- [ ] **Paso 4: ver que pasa.** `node --test crates/admin/tests/js/app.test.js` y
+- [x] **Paso 4: ver que pasa.** `node --test crates/admin/tests/js/app.test.js` y
   `cargo test -p sg-admin --test web_assets` (el test de CSP/activos embebidos y de Node).
-- [ ] **Paso 5: comprobar en un navegador real** (lo único que la fase 1 no tuvo): compilar
+- [x] **Paso 5: comprobar en un navegador real** (lo único que la fase 1 no tuvo): compilar
   (`cargo build --release`), arrancar una instancia desechable (`sg keygen --out /tmp/sg-ui.key`, `sg serve --data-dir
   /tmp/sg-ui --key-file /tmp/sg-ui.key --proxy-bind 127.0.0.1:18080 --admin-bind 127.0.0.1:19090 --socket
   /tmp/sg-ui/sg.sock`), abrir el enlace de `sg login-url` con Chromium headless + CDP y capturar: alta de secreto
   con 1 y con 2 reglas, error por regla inválida, pestaña CA. Revisar las capturas (no hay captura automática en CI).
-- [ ] **Paso 6: commit.** `feat(web): add secrets together with their rules; CA view is read-only`.
+- [x] **Paso 6: commit.** `feat(web): add secrets together with their rules; CA view is read-only`.
 
 ---
 
@@ -1229,7 +1231,7 @@ onsubmit: safe(async () => {
 - Modificar: `scripts/e2e.sh`, `scripts/e2e-docker.sh`, `README.md`, `docs/{README,architecture,database-schema,policy-and-rules,tokens-and-ca,cli-reference,admin-api,security-model,operations,testing}.md`
 - Marcar este plan como ejecutado.
 
-- [ ] **Paso 1: scripts.** `e2e.sh`: la primera regla de `api-key` pasa a nacer con el secreto y desaparece
+- [x] **Paso 1: scripts.** `e2e.sh`: la primera regla de `api-key` pasa a nacer con el secreto y desaparece
   `ca allow-domain localhost`:
 
 ```bash
@@ -1246,7 +1248,7 @@ sg rule add --role reviewer   --host localhost --methods GET --header Authorizat
   `e2e-docker.sh`: igual (`docker exec -i "$NAME" sg --socket /data/sg.sock secret add api-key --role developer --host "$UPHOST" --header Authorization --template 'Bearer {secret}'`),
   quitando `ca allow-domain`; los roles se crean antes. Añadir en ambos una comprobación de que `sg ca status` lista el
   host y de que `secret add` sin reglas falla.
-- [ ] **Paso 2: documentación (en inglés, como el resto de `docs/`).**
+- [x] **Paso 2: documentación (en inglés, como el resto de `docs/`).**
   - `README.md`: quickstart con `secret add ... --host ... --header ...` (sin `allow-domain`), explicación de «un
     secreto = valor + primera regla», y el aviso de recargar el PEM al añadir hosts.
   - `cli-reference.md`: nueva sintaxis de `secret add`, `ca` sin `allow-domain`, columna `RULES`, resolución de rol.
@@ -1261,7 +1263,7 @@ sg rule add --role reviewer   --host localhost --methods GET --header Authorizat
     previos siguen válidos y se marcan en la web).
   - `architecture.md`: módulo `ops`, orden de locks conexión → estado → caché.
   - `testing.md`/`README.md`/`docs/README.md`: recuento de tests tras la verificación final.
-- [ ] **Paso 3: verificación (el workspace completo, una sola vez).**
+- [x] **Paso 3: verificación (el workspace completo, una sola vez).**
 
 ```bash
 source ~/.cargo/env
@@ -1276,10 +1278,10 @@ scripts/e2e-docker.sh
 
   Esperado: 0 fallos en el workspace, clippy y fmt limpios, `E2E OK` y `E2E DOCKER OK`. Mostrar la salida. Si algo
   falla, parar y arreglar antes de revisar.
-- [ ] **Paso 4: actualizar los recuentos en `docs/testing.md`, `docs/README.md` y `README.md`** con el número real.
-- [ ] **Paso 5: commit.** `docs: document required rules per secret and the derived CA` (y, si el recuento cambia en
+- [x] **Paso 4: actualizar los recuentos en `docs/testing.md`, `docs/README.md` y `README.md`** con el número real.
+- [x] **Paso 5: commit.** `docs: document required rules per secret and the derived CA` (y, si el recuento cambia en
   otro commit, `docs: refresh test inventory`).
-- [ ] **Paso 6: recordatorio.** Pasada de revisión final (`/ship`): diff completo, revisión de seguridad de lo
+- [x] **Paso 6: recordatorio.** Pasada de revisión final (`/ship`): diff completo, revisión de seguridad de lo
   tocado (autenticación/CA/entrada externa), deriva respecto a la spec; integración la decide el operador.
 
 ---

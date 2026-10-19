@@ -47,7 +47,7 @@ A rule says: for this role, for requests matching host / path / methods, inject 
 | `kind` | `"header"` or `"query"` | required | Where to inject. |
 | `target_name` | string | required | Header name or query parameter name. |
 | `template` | string | required | Value template; must contain `{secret}`. |
-| `secret_id` | integer | required | Must exist; the secret cannot be deleted while a rule uses it. |
+| `secret_id` | integer | required | Must exist. Deleting the secret deletes its rules (section 2.3). |
 
 ### 2.1 Validation (`store.rs`, `validate`)
 
@@ -75,6 +75,25 @@ All of these are checked by `add_rule`; a failure is `PolicyError::Invalid(..)`:
 
 There is no rule update, only add and remove (`remove_rule`); there is no uniqueness constraint. Rule
 ids are autoincrement and used as the final tie-break.
+
+### 2.3 Every secret has at least one rule
+
+A secret that no rule uses can never be injected, so the admin layer (not the SQL schema) enforces the invariant
+**every secret has at least one rule**:
+
+- **Creation.** `POST /secrets` / `sg secret add` creates the secret together with its first rule(s), atomically
+  (`rules` is required and has 1 to 20 items). The rules use the same validation as `add_rule` (section 2.1) through
+  `RuleSpec`, a rule without `secret_id`. Extra rules come from `POST /rules` / `sg rule add`.
+- **Deleting a rule.** Refused with `409` when it is the last rule of its secret: delete the secret instead, or add
+  another rule first.
+- **Deleting a secret.** Deletes its rules in the same transaction (there is no longer a "still referenced" error).
+- **Deleting a role.** Deleting a role deletes its rules; if that would leave some secret with no rule at all it is
+  refused with `409` naming the secrets (up to 5, then `and N more`) and nothing is deleted.
+
+Every one of these operations also re-derives the CA's permitted domains from the rules inside the same transaction
+([tokens-and-ca.md](tokens-and-ca.md#23-the-ca-follows-the-rules)). Secrets created before this invariant existed may have
+no rules; they stay stored, are never injected, and the web UI marks them "none: never injected"
+([operations.md](operations.md#upgrading-from-a-version-without-required-rules)).
 
 ### 2.2 Injection kinds and templates
 
@@ -411,14 +430,15 @@ Principles:
 3. Prefer path prefixes that end in `/*` and start with the API's fixed root; avoid `*` unless the whole host is
    intended.
 4. Do not add a second `*` rule for the same destination on the same host unless you want it to cover everything.
-5. The CA must permit the host (`sg ca allow-domain`, see [tokens-and-ca.md](tokens-and-ca.md)); otherwise the
-   CONNECT for a ruled host answers `502`.
+5. Creating a rule makes the CA permit its host automatically (the CA's domains are derived from the rules, see
+   [tokens-and-ca.md](tokens-and-ca.md)); a wildcard `*.x` permits `x` and everything under it. When the host is new to
+   the CA, agents must reload the CA certificate.
 6. Hosts are exact or one-label wildcards; add separate rules for each hostname (for example `api.github.com`
    and `uploads.github.com` are different hosts).
 
-Examples, as the JSON body of `POST /rules` (secret ids refer to secrets created beforehand with `sg secret add`; with the
-CLI, the first rule below is `sg rule add --role reviewer --host api.github.com --path '/repos/*' --methods GET --header
-Authorization --template 'Bearer {secret}' --secret gh`):
+Examples, as the JSON body of `POST /rules` (secret ids refer to existing secrets; with the CLI, the first rule below is `sg rule add --role reviewer --host
+api.github.com --path '/repos/*' --methods GET --header Authorization --template 'Bearer {secret}' --secret gh`. The *first*
+rule of a secret is created by `sg secret add`, as the `rules` entry of `POST /secrets` without `secret_id`):
 
 GitHub, read-only role and read-write role (`Authorization: Bearer <token>`):
 

@@ -77,7 +77,7 @@ $ curl -s -X POST -H 'Host: localhost:36655' -H 'Content-Type: application/json'
        -d "{\"token\":\"$TOKEN\"}" http://127.0.0.1:36655/login
 {"session":"302bf0737f4bf3c69b31080068a73e2e82cb8396dc04ea5f83edb505f5949be9"}
 $ curl -s -H 'Host: localhost:36655' -H "Authorization: Bearer $SESSION" http://127.0.0.1:36655/api/secrets
-[{"id":2,"name":"second","created_at":1792180581,"rotated_at":1792180581}, ...]
+[{"id":2,"name":"second","created_at":1792180581,"rotated_at":1792180581,"rules":1}, ...]
 ```
 
 ## Guards and their order
@@ -146,22 +146,46 @@ No third-party resources, no inline scripts or styles, and no CORS headers are e
 ### Secrets
 
 Metadata object (`SecretMeta`): `{"id": 3, "name": "api-key", "created_at": 1792180853, "rotated_at": null}`.
+`GET /secrets` adds a `rules` count to each item. A secret is always created together with at least one rule (a
+secret no rule uses can never be injected), so `rules` is at least 1 except for secrets created before that
+invariant existed (see [operations.md](operations.md#upgrading-from-a-version-without-required-rules)).
 
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
-| `GET /secrets` | - | `200` array of `SecretMeta`, sorted by name | - |
-| `POST /secrets` | `{"name": "api-key", "value": "..."}` | `201` `SecretMeta` | `400` `invalid name: use [a-z0-9._-], max 64 chars`, `400` `invalid secret value: empty` / `too long` / `contains control characters`; `409` `already exists` |
+| `GET /secrets` | - | `200` array of `SecretMeta` plus `rules` (count), sorted by name | - |
+| `POST /secrets` | `{"name", "value", "rules": [RuleSpec, ...]}` (`rules` required, 1 to 20 items) | `201` `{"secret": SecretMeta, "rules": [Rule, ...], "ca_changed": bool, "notice": null \| "<text>"}` | `400` `invalid name: use [a-z0-9._-], max 64 chars`; `400` `invalid secret value: empty` / `too long` / `contains control characters`; `400` `a secret needs at least one rule: ...` (missing or empty `rules`); `400` `too many rules for one secret (max 20)`; `400` any rule error (`unknown role`, `host_pattern must be ...`, template and path errors, `domain rejected: <reason>`); `409` `already exists` |
 | `GET /secrets/{name}` | - | `200` `SecretMeta` | `400` invalid name, `404` `not found` |
 | `PUT /secrets/{name}` (rotate) | `{"value": "..."}` | `200` `SecretMeta` with `rotated_at` set | as above, `404` |
-| `DELETE /secrets/{name}` | - | `204` | `404`; `409` `still referenced by a rule` |
+| `DELETE /secrets/{name}` | - | `204`; the secret's rules are deleted with it and the CA is re-synced | `404` |
+
+`RuleSpec` is a rule without `secret_id` (the secret is the one being created): `{"role", "host_pattern",
+"path_pattern"?: "*", "methods"?: [], "kind": "header"|"query", "target_name", "template"}`. Unknown fields are
+rejected. The whole request is atomic: the secret, its rules and the CA certificate it implies are written in one
+SQLite transaction, so any `400`/`409` leaves no secret, no rule and no CA change (and the response never reflects the
+value). `ca_changed` is true when the permitted domains changed and the CA certificate was re-issued; `notice` then says
+agents must reload it.
 
 ```
 $ curl -s -i --unix-socket $SG_SOCKET -X POST -H 'content-type: application/json' \
-       -d '{"name":"api-key","value":"s3cr3t-value"}' http://localhost/secrets
+       -d '{"name":"api-key","value":"s3cr3t-value","rules":[{"role":"reviewer","host_pattern":"api.example.org","methods":["GET"],"kind":"header","target_name":"Authorization","template":"Bearer {secret}"}]}' \
+       http://localhost/secrets
 HTTP/1.1 201 Created
 content-type: application/json
 
-{"id":3,"name":"api-key","created_at":1792180853,"rotated_at":null}
+{"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sg ca export)","rules":[{"host_pattern":"api.example.org","id":7,"kind":"header","methods":["GET"],"path_pattern":"*","role":"reviewer","secret_id":5,"target_name":"Authorization","template":"Bearer {secret}"}],"secret":{"created_at":1792417787,"id":5,"name":"api-key","rotated_at":null}}
+```
+
+Refusals (real responses):
+
+```
+$ curl -s -i ... -d '{"name":"nr","value":"v"}' http://localhost/secrets
+HTTP/1.1 400 Bad Request
+
+{"error":"a secret needs at least one rule: say which role, host and header or parameter it is injected into"}
+$ curl -s -i ... -d '{"name":"nr","value":"v","rules":[{"role":"reviewer","host_pattern":"a.invalid","kind":"header","target_name":"X","template":"{secret}"}]}' http://localhost/secrets
+HTTP/1.1 400 Bad Request
+
+{"error":"domain rejected: reserved"}
 ```
 
 ### Roles
@@ -172,7 +196,7 @@ Role object: `{"name": "reviewer", "unmatched": "deny"}` (`unmatched` is `passth
 |---|---|---|---|
 | `GET /roles` | - | `200` array sorted by name | - |
 | `POST /roles` | `{"name": "reviewer", "unmatched": "deny"}` (both required) | `201` role | `400` `role name must be [a-z0-9_-]`; `400` `invalid JSON body` (including a bad `unmatched`); `409` `already exists` |
-| `DELETE /roles/{name}` | - | `204`; its rules are deleted too | `404` |
+| `DELETE /roles/{name}` | - | `204`; its rules are deleted too and the CA is re-synced | `404`; `409` `deleting this role would leave secrets without rules: <names>; ...` (up to 5 names, then `and N more`; nothing is deleted) |
 
 ### Rules
 
@@ -182,11 +206,26 @@ Rule object: `{"id", "role", "host_pattern", "path_pattern", "methods": [...], "
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
 | `GET /rules[?role=<name>]` | - | `200` array ordered by id | `400` invalid role filter or unknown query parameter (`invalid query string`) |
-| `POST /rules` | `{"role", "host_pattern", "path_pattern"?: "*", "methods"?: [], "kind", "target_name", "template", "secret_id"}` | `201` `{"rule": {...}, "ca_warning": null \| "<text>"}` | `400` with the policy message (for example `unknown role`, `unknown secret`, `host_pattern must be a lowercase hostname or *.hostname (no IPs)`, template and path errors, listed in [policy-and-rules.md](policy-and-rules.md#21-validation-storers-validate)) |
-| `DELETE /rules/{id}` | - | `204` | `400` `invalid rule id` (not a positive integer); `404` |
+| `POST /rules` | `{"role", "host_pattern", "path_pattern"?: "*", "methods"?: [], "kind", "target_name", "template", "secret_id"}` | `201` `{"rule": {...}, "ca_changed": bool, "notice": null \| "<text>"}` | `400` with the policy message (for example `unknown role`, `unknown secret`, `host_pattern must be a lowercase hostname or *.hostname (no IPs)`, `domain rejected: <reason>` (the CA cannot permit the host; nothing is created), template and path errors, listed in [policy-and-rules.md](policy-and-rules.md#21-validation-storers-validate)) |
+| `DELETE /rules/{id}` | - | `204`; the CA is re-synced | `400` `invalid rule id` (not a positive integer); `404`; `409` `this is the last rule of its secret: delete the secret instead, or add another rule first` |
 
-`ca_warning` is non-null when the CA does not permit the host (the rule is created anyway):
-`the CA does not permit example.org: run `sg ca allow-domain example.org` and reload the CA certificate in your agents`.
+Creating the rule and re-deriving the CA's permitted domains happen in one transaction. `ca_changed` is true (and `notice`
+is `the CA certificate changed: agents must reload it (sg ca export)`) when the host was new to the CA. A rule for a host
+the CA already permits returns `"ca_changed": false, "notice": null`. Deleting a rule re-derives the domains too (a host
+no rule uses any more is dropped from the CA), without a notice.
+
+```
+$ curl -s -i --unix-socket $SG_SOCKET -X POST -H 'content-type: application/json' \
+       -d '{"role":"reviewer","host_pattern":"api.example.org","kind":"query","target_name":"k","template":"{secret}","secret_id":5}' \
+       http://localhost/rules
+HTTP/1.1 201 Created
+
+{"ca_changed":false,"notice":null,"rule":{"host_pattern":"api.example.org","id":8,"kind":"query","methods":[],"path_pattern":"*","role":"reviewer","secret_id":5,"target_name":"k","template":"{secret}"}}
+$ curl -s -i --unix-socket $SG_SOCKET -X DELETE http://localhost/roles/default
+HTTP/1.1 409 Conflict
+
+{"error":"deleting this role would leave secrets without rules: gl; delete them or give them rules for another role first"}
+```
 
 ### Tokens
 
@@ -202,11 +241,13 @@ the CLI refuses it.
 
 ### Certificate authority
 
+The CA's permitted domains are **derived from the rules** (`*.x` becomes `x`); they cannot be set through the API.
+`POST /ca/domains` no longer exists (it answers `404`; the web UI and the CLI have no "allow domain" action either).
+
 | Method and path | Body | Success | Errors |
 |---|---|---|---|
-| `GET /ca` | - | `200` `{"domains": ["localhost"]}` | - |
+| `GET /ca` | - | `200` `{"domains": ["api.example.org", "gitlab.com"]}` (read-only, sorted) | - |
 | `GET /ca/cert` | - | `200`, `Content-Type: application/x-pem-file`, the public CA certificate in PEM | - |
-| `POST /ca/domains` | `{"domain": "github.com"}` | `200` `{"domains": [...], "notice": "the CA certificate changed: agents must reload it (sg ca export)"}` (the notice is returned even if the domain was already allowed) | `400` `domain rejected: <reason>` |
 
 ### Audit
 
@@ -251,14 +292,14 @@ Trades a login token for a session (see above).
 | Code | Meaning in this API |
 |---|---|
 | `200` | OK with a JSON body |
-| `201` | Created (secret, role, rule, token) |
+| `201` | Created (secret with its rules, role, rule, token) |
 | `204` | Done, no body (delete, revoke) |
 | `400` | Validation failed or the JSON is malformed |
 | `401` | Web only: no valid session, or bad login token |
 | `403` | Web only: cross-origin write |
 | `404` | Unknown route or object (also `/api/admin/login-token` on the web listener, `GET /login`) |
 | `405` | Wrong method on a known route |
-| `409` | Duplicate name, or a secret still referenced by a rule |
+| `409` | Duplicate name; deleting the last rule of a secret; deleting a role that would leave secrets without rules |
 | `413` | Body over 64 KiB |
 | `415` | Write without `application/json` |
 | `421` | Web only: unexpected `Host` |
@@ -268,5 +309,8 @@ Trades a login token for a session (see above).
 
 - Rule changes, token revocation and new CA domains take effect immediately in the proxy: it reads the database
   on every request (rules) or every tunnel (CA).
+- A write that changes the CA's domains prepares the new certificate (key signing and a self-check) while the vault's
+  database connection is locked, so the proxy waits a few milliseconds on that one request. See
+  [architecture.md](architecture.md#admin-operations-and-the-ca).
 - The API is synchronous SQLite behind one mutex; it is meant for one operator.
 - The web UI is a thin client over exactly these routes; see [README: Web UI](../README.md#web-ui).

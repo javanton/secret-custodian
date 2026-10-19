@@ -3,7 +3,7 @@
 Installing, running and looking after a Secret Guardian instance. Commands were run against the real binary;
 the symptoms in the [troubleshooting table](#troubleshooting) were provoked on purpose and the messages copied.
 Sections: [Installing](#installing) · [Directories and permissions](#directories-and-permissions) ·
-[Key management](#key-management) · [Backups](#backups) · [Upgrades](#upgrades) ·
+[Key management](#key-management) · [Backups](#backups) · [Upgrades](#upgrades) (including the [rules migration](#upgrading-from-a-version-without-required-rules)) ·
 [systemd user service](#running-as-a-systemd-user-service) · [Containers and networking](#containers-and-networking) ·
 [Trusting the CA on agents](#trusting-the-ca-on-agents) · [Routine tasks](#routine-tasks) ·
 [Observability](#observability) · [Troubleshooting](#troubleshooting)
@@ -141,6 +141,24 @@ opened normally). Do this only with the server stopped.
   persist.
 - Docker: rebuild the image, `docker compose up -d --build`; the named volume keeps the data and the key stays a
   secret. `docker stop` sends `SIGTERM` and the server exits cleanly within seconds.
+
+### Upgrading from a version without required rules
+
+Older builds let you store a secret with no rule and widen the CA
+by hand (`sg ca allow-domain`). The schema did not change, so no migration runs, but on **every** start `sg serve`
+makes the CA's permitted domains equal to the set derived from the rules, once (it logs `CA domains re-derived from the
+rules; agents must reload the CA certificate` at info level, so it shows only with `RUST_LOG=info`, when that changed the CA). Consequences on the first start
+after the upgrade:
+
+- Domains that were allowed by hand and that no rule uses are **dropped** from the CA; hosts that rules need but the CA
+  did not permit are added. The CA certificate is re-issued (same key) if the set changed, so agents must reload it
+  (`sg ca export`). A second start changes nothing.
+- Secrets created before the change that have no rules **keep existing** and stay valid, but they are never injected;
+  the web UI marks them "none: never injected" and `sg secret ls` shows `RULES 0`. Give them a rule with `sg rule add`
+  or delete them. (You cannot recreate that state with the current commands.)
+- Nothing else changes: tokens, roles and existing rules are untouched. There is no `sg ca allow-domain` and no
+  `POST /ca/domains` any more; scripts that called them must create the secret with its first rule
+  (`sg secret add NAME --role R --host H --header N`).
 
 ## Running as a systemd user service
 
@@ -282,8 +300,8 @@ cat /etc/pki/tls/certs/ca-bundle.crt sg-ca.pem > combined.pem     # Fedora/RHEL;
 export SSL_CERT_FILE=$PWD/combined.pem CURL_CA_BUNDLE=$PWD/combined.pem REQUESTS_CA_BUNDLE=$PWD/combined.pem
 ```
 
-(Verified: with the combined bundle a passthrough request to `https://example.com` succeeded.) Re-run this after every
-`sg ca allow-domain`.
+(Verified: with the combined bundle a passthrough request to `https://example.com` succeeded.) Re-run this whenever the CA gains a
+domain (the CLI prints `the CA certificate changed: agents must reload it`).
 
 Known client problems: Java uses its own keystore (import the CA with `keytool`, or avoid the MITM for Java tools),
 certificate-pinned programs refuse the proxy, some Go programs ignore the variables. Python 3.13 and later reject the
@@ -309,18 +327,24 @@ Check with `sg secret ls` (the `ROTATED` column).
 - A suspected leak of a *secret* (not a token) means rotating the secret at the provider; revoking tokens does not
   help.
 
-### Adding a domain to the CA, and why agents must reload
+### When the CA gains a domain, and why agents must reload
 
-`sg ca allow-domain api.example.com` re-issues the CA certificate **with the same key** and wider name constraints.
+There is no command to allow a domain: the CA's permitted domains are derived from the rules. Creating a rule (or a secret,
+which always comes with its first rule) for a host the CA does not yet permit, for example
+`sg rule add --role reviewer --host api.example.com ...`, re-issues the CA certificate **with the same key** and wider name
+constraints, and prints `warning: the CA certificate changed: agents must reload it (sg ca export)`.
 Agents that still trust the previous certificate refuse the new name:
 
 ```
 curl: (60) SSL certificate problem: permitted subtree violation
 ```
 
-So after adding a domain: `sg ca export > sg-ca.pem` again, replace the file on every agent (and rebuild the combined
-bundle), then restart or re-run the agent processes. Certificates issued earlier stay valid. Rules for a host the CA
-does not yet permit are accepted but print a warning, and the agent's CONNECT fails with `502` until you allow the domain.
+So when you see that notice: `sg ca export > sg-ca.pem` again, replace the file on every agent (and rebuild the combined
+bundle), then restart or re-run the agent processes. Certificates issued earlier stay valid. `sg ca status` lists what the
+CA permits. Removing the last rule that uses a host (or its secret or role) shrinks the CA again; agents with the old
+certificate keep working, so no reload is needed for removals. A rule for a host that is already permitted (including a
+subdomain of a wildcard `*.x`, which is stored as `x`) changes nothing. While the CA certificate is being prepared the
+proxy may wait a few milliseconds on that one write (see [architecture.md](architecture.md#admin-operations-and-the-ca)).
 
 ### Logging in to the web UI
 
@@ -378,10 +402,10 @@ Messages are copied from real runs. "Agent side" means what the agent's HTTP cli
 | Browser: "Sign in required" / `invalid or already used login token` | Link used twice, older than 10 minutes, or the server restarted | `sg login-url` for a fresh link |
 | Agent: `curl: (56) CONNECT tunnel failed, response 407` | No, wrong, malformed, expired or revoked token | Check `HTTPS_PROXY` (token in the password position); `sg token ls` shows `STATUS` |
 | Agent: `curl: (56) CONNECT tunnel failed, response 403` | Host has no rule for the role and the role is `deny` (audit `unmatched-denied`), the role was deleted (`unknown-role`), or the network policy refused the target (`target-denied`, e.g. loopback or the vault's own port) | `sg audit --limit 5` shows which; add a rule or use a `passthrough` role; `--allow-loopback-targets` for local test targets |
-| Agent: `curl: (56) CONNECT tunnel failed, response 502` and the body or audit says the CA does not permit the host (`ca-not-permitted`) | The role has a rule for a host the CA does not permit | `sg ca allow-domain <domain>`; re-export the certificate to agents |
+| Agent: `curl: (56) CONNECT tunnel failed, response 502` and the body or audit says the CA does not permit the host (`ca-not-permitted`) | The role has a rule for a host the CA does not permit (should not happen: the CA follows the rules and `sg serve` refuses to start if it cannot sync it) | `sg ca status`; delete and re-create the rule (or restart `sg serve`), then re-export the certificate to agents |
 | Agent: `502` with `could not reach the destination` (`tunnel-connect-failed`) | A passthrough target does not resolve or does not answer | DNS/network from the vault's side |
 | Agent: `curl: (60) SSL certificate problem: unable to get local issuer certificate` | The agent does not trust the vault CA, or its bundle lacks the CA | Set the CA variables ([above](#trusting-the-ca-on-agents)) |
-| Agent: `curl: (60) SSL certificate problem: permitted subtree violation` | The agent holds an older CA certificate that predates `allow-domain` for this name | Re-export and replace the CA file |
+| Agent: `curl: (60) SSL certificate problem: permitted subtree violation` | The agent holds an older CA certificate that predates the rule that added this host (the CLI printed the reload notice) | Re-export and replace the CA file |
 | Passthrough hosts fail TLS after pointing `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` at the vault CA | Those variables replace the trust store | Use a combined bundle ([above](#trusting-the-ca-on-agents)) |
 | Agent talks to the API directly, nothing injected | `NO_PROXY=localhost,...` (printed by `token create`) matches the host, or the client ignores `HTTPS_PROXY` (some Go/Java/pinned tools) | Remove the host from `NO_PROXY`; use the client's own proxy setting |
 | Inside the tunnel: `403` body `not allowed for this role` (`forbidden`) | No rule authorises this method or path (including paths the matcher refuses to judge, such as `..;`, malformed `%`, control characters) | `sg rule ls --role <r>`; widen the rule or fix the request. See [policy-and-rules.md](policy-and-rules.md#8-fail-closed-side-effects-operators-should-know) |
@@ -392,10 +416,12 @@ Messages are copied from real runs. "Agent side" means what the agent's HTTP cli
 | `502` body `upstream request failed` (`upstream-error`) | Upstream refused, timed out, or its TLS certificate is not trusted by the vault (a private CA) | Check the vault's `WARN` log line for the cause; for private CAs start with `--upstream-ca <pem>` |
 | `503` body `service unavailable` (`internal-error`) | The vault could not read the role or the rules (database error); the proxy fails closed and forwards nothing | Check the vault `ERROR` log line; restore the database |
 | `502` body `secret unavailable` | The stored secret no longer decrypts (database damaged or tampered) | Restore a backup; re-add the secret |
-| `sg secret rm`: `error: still referenced by a rule` | A rule uses the secret | `sg rule ls` and `sg rule rm <id>` first |
-| `sg rule add`: `warning: the CA does not permit <host>...` | Rule host not in the CA's permitted domains | `sg ca allow-domain <domain>` |
+| `sg rule rm`: `error: this is the last rule of its secret: ...` | Every secret needs at least one rule | `sg secret rm <name>`, or `sg rule add` another rule first |
+| `sg role rm`: `error: deleting this role would leave secrets without rules: ...` | Those secrets only have rules for this role | Delete the secrets, or add rules for another role, then retry |
+| `sg secret add`: `error: several roles exist (a, b): choose one with --role` | More than one role and no `--role` | Add `--role <name>` |
+| `sg secret add` / `sg rule add`: `warning: the CA certificate changed: agents must reload it` | The rule added a host to the CA | Re-export the certificate to agents ([above](#when-the-ca-gains-a-domain-and-why-agents-must-reload)) |
 | `sg token create`: `error: unknown role` | The role does not exist | `sg role ls`; `sg role add` |
-| `sg ca allow-domain`: `domain rejected: too broad: single-label domains are not allowed` | TLD or one-label name | Use a full domain; only `localhost` is accepted as a single label |
+| `sg secret add` / `sg rule add`: `error: domain rejected: reserved` | The host is under the placeholder TLD `invalid` | Use a real host; nothing was created |
 | Container shows `unhealthy` | The admin socket does not answer `sg ca status` | `docker logs`; the usual cause is a start-up error such as the key pitfall above |
 | Requests are slow or hang under load | SQLite is accessed synchronously behind one mutex; a body is stalled (cut after 60 s idle) | Single-operator design; check agent concurrency; look for upstream timeouts |
 

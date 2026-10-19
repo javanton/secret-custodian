@@ -31,7 +31,7 @@ The threat model summary (full table in spec section 2):
 |---|---|
 | The agent, or a prompt injection, tries to read the secret | The library API only exposes secret metadata (`SecretMeta`); the only decrypting call is `Vault::reveal_for_injection` (`crates/core/src/secrets.rs`), called from `crates/proxy/src/forward.rs`. |
 | The database file is stolen | Secret values, the token signing key and the CA private key are AES-256-GCM ciphertext under a key that is not in the DB (see [crypto-and-keys.md](crypto-and-keys.md)). |
-| The CA private key leaks | The CA carries X.509 name constraints, so it can only sign for the domains the operator allowed (see [tokens-and-ca.md](tokens-and-ca.md)). |
+| The CA private key leaks | The CA carries X.509 name constraints, so it can only sign for the hosts the operator's rules name (its domains are derived from the rules; see [tokens-and-ca.md](tokens-and-ca.md)). |
 | An agent token leaks | Optional expiry, immediate revocation, and an audit trail keyed by `jti`. The proxy re-verifies the token before every request inside an open tunnel (`crates/proxy/src/mitm.rs`). |
 | The agent uses the proxy to reach unplanned hosts | Per-role `Unmatched` policy: `passthrough` (opaque tunnel) or `deny` (see [policy-and-rules.md](policy-and-rules.md)). |
 | The agent uses the proxy to reach loopback, cloud metadata or the vault itself | Network policy on the resolved address (`NetPolicy` in `crates/proxy/src/upstream.rs`); the proxy's and web UI's own ports are always denied. See [proxy-internals.md](proxy-internals.md#network-policy). |
@@ -55,11 +55,11 @@ The workspace (`Cargo.toml`) has eight members. Crate names on disk are `crates/
 | Crate | Status | Responsibility | Public API (summary) | Depends on (workspace) |
 |---|---|---|---|---|
 | `core` (`sg-core`) | implemented | Encryption primitives, key derivation, the single SQLite file, schema, secrets, audit log, default paths. | `Vault` (`init`, `open`, `open_or_init`, `conn`, `seal_value`, `open_value`, secret CRUD, `reveal_for_injection`, `record_audit`, `list_audit`), `KeyInput`, `CoreError`, `SecretMeta`, `validate_secret_value`, `now`, modules `crypto` (`seal`, `open`, `random_key`, `kek_from_passphrase`, `kek_from_base64`), `audit` (`AuditEntry`, `AuditFilter`), `paths` (`default_data_dir`, `default_socket`). | none |
-| `policy` (`sg-policy`) | implemented | Roles, rules and their validation; host/path/method matching; rendering the injected value. | `add_role`/`get_role`/`list_roles`/`remove_role`, `add_rule`/`list_rules`/`remove_rule`, `NewRule`, `Rule`, `Role`, `Unmatched`, `InjectionKind`, `PolicyError`, `evaluate`, `has_rules_for_host`, `Decision`, `normalize_host`, `normalize_path`, `is_ip_literal`, `render`. | `core` |
+| `policy` (`sg-policy`) | implemented | Roles, rules and their validation; host/path/method matching; rendering the injected value. | `add_role`/`get_role`/`list_roles`/`remove_role`, `add_rule`/`insert_rule_in`/`list_rules`/`remove_rule`, `derive_ca_domains`, `NewRule`, `RuleSpec`, `Rule`, `Role`, `Unmatched`, `InjectionKind`, `PolicyError`, `evaluate`, `has_rules_for_host`, `Decision`, `normalize_host`, `normalize_path`, `is_ip_literal`, `render`. | `core` |
 | `auth` (`sg-auth`) | implemented | Issues and verifies agent tokens (EdDSA JWT), revocation, parsing of `Proxy-Authorization`. | `TokenService` (`new`, `issue`, `revoke`, `revoke_machine`, `list`), trait `TokenVerifier`, `Identity`, `IssuedToken`, `TokenMeta`, `AuthError`, `extract_proxy_token`. | `core` |
-| `ca` (`sg-ca`) | implemented | The name-constrained CA, leaf certificates, leaf cache. | `CaService` (`init_or_load`, `cert_pem`, `domains`, `allow_domain`, `is_host_permitted`, `server_config_for`), `CaError`, `crypto_provider`. | `core` |
+| `ca` (`sg-ca`) | implemented | The name-constrained CA, leaf certificates, leaf cache. | `CaService` (`init_or_load`, `cert_pem`, `domains`, `domain_guard`, `prepare_domains`, `persist`, `install`, `is_host_permitted`, `server_config_for`; `allow_domain` remains for tests), `PreparedCa`, `CaError`, `crypto_provider`. | `core` |
 | `proxy` (`sg-proxy`) | implemented | Proxy listener, CONNECT handling (MITM and passthrough), plain-HTTP handling (never injected), TLS termination, per-request policy evaluation, injection, upstream relay, network policy, per-identity limits, audit of proxy events. | `serve`, `serve_with`, `ServeOptions`, `ProxyState`, `UpstreamConfig`, `NetPolicy`. | `core`, `policy`, `auth`, `ca` |
-| `admin` (`sg-admin`) | implemented | JSON admin API on two routers (Unix socket without authentication of its own; loopback web with Host/Origin guards, one-time login and bearer sessions), embedded web assets, connection limits. | `api_router`, `socket_router`, `web_router`, `serve_unix(_with)`, `serve_web(_with)`, `bind_unix`, `AppState`, `Sessions`, `AdminServeOptions`. See [admin-api.md](admin-api.md). | `core`, `policy`, `auth`, `ca` |
+| `admin` (`sg-admin`) | implemented | JSON admin API on two routers (Unix socket without authentication of its own; loopback web with Host/Origin guards, one-time login and bearer sessions), embedded web assets, connection limits. The `ops` module holds the multi-step operations (secret with its rules, rule add/delete, secret and role delete, start-up CA sync) that keep the rules and the CA's derived domains in one transaction. | `api_router`, `socket_router`, `web_router`, `serve_unix(_with)`, `serve_web(_with)`, `bind_unix`, `AppState`, `Sessions`, `AdminServeOptions`. See [admin-api.md](admin-api.md). | `core`, `policy`, `auth`, `ca` |
 | `cli` (`sg-cli`) | implemented | The client commands (`secret`, `role`, `rule`, `token`, `ca`, `audit`, `login-url`): `clap` definitions, a Unix-socket HTTP client that checks socket ownership, secret input rules, table and JSON output. See [cli-reference.md](cli-reference.md). | `ClientCommand`, `ClientOpts`, `run_main`, `run_io`, `call`, `call_raw`. | `core` |
 | `sg` | implemented | The single binary: `sg serve` (key sources, data directory, assembly of the three servers, signal handling), `sg keygen`, and the client commands. | binary only (`crates/sg/src/{main,serve,keys}.rs`) | all of the above |
 
@@ -209,8 +209,8 @@ Step notes (all from the cited files):
    `deny` gives `403` (`unmatched-denied`), `passthrough` opens a plain TCP tunnel to the destination and
    only then answers `200` (`passthrough`, or `tunnel-connect-failed` with `502`).
 4. **CA check**: if the host has rules but the CA's name constraints do not permit it
-   (`CaService::is_host_permitted`), the answer is `502` with a hint to run `sg ca allow-domain`
-   (audit `ca-not-permitted`).
+   (`CaService::is_host_permitted`), the answer is `502` with a hint that the CA's domains follow the rules
+   (audit `ca-not-permitted`). The admin keeps the CA in sync with the rules, so this is a safety net.
 5. **TLS termination** (`mitm.rs`): after the `200`, the connection is upgraded, the leaf config for the
    host is obtained from `CaService::server_config_for`, and `hyper_util`'s auto builder serves HTTP/1.1
    or HTTP/2 according to ALPN.
@@ -274,8 +274,9 @@ and 64 concurrent upstream requests per token, 60 s without body progress. The f
   - `Vault::reveal_for_injection` takes the guard only for the `SELECT` (a temporary), and decrypts after
     releasing it.
   - `CaService` has its own mutexes (`state`, `cache`, `cache_ttl`); the lock order is state then cache
-    (`server_config_for` reads the state first, then takes the cache lock; `allow_domain` locks state,
-    then clears the cache). The vault guard is a temporary in each statement.
+    (`server_config_for` reads the state first, then takes the cache lock; `install` locks state,
+    then clears the cache). The vault guard is a temporary in each statement. Admin writes that change rules add
+    one more lock in front of these; see the next subsection.
 - **Crypto calls are synchronous and run on the async worker threads** (AES-GCM and ed25519 are cheap;
   Argon2id only runs at `Vault::init`/`open` with a passphrase). SQLite calls also block the worker
   thread while holding the mutex; the design accepts this because it is a local single-operator tool.
@@ -287,6 +288,35 @@ and 64 concurrent upstream requests per token, 60 s without body progress. The f
   leaf (`server_config_for`).
 - **WAL mode** is enabled at init (`PRAGMA journal_mode=WAL`), but with a single connection per process the
   mutex, not SQLite, serialises access.
+
+### Admin operations and the CA
+
+An admin write that touches rules also changes what the CA may sign for, and the two must never disagree: a rule without
+its domain would make the proxy answer `502`, and a stale domain would leave the CA wider than the rules. The
+`ops` module (`crates/admin/src/ops.rs`) therefore runs each such operation as one unit: create secret with rules, add
+rule, delete rule, delete secret (its rules go too), delete role (refused when it would orphan a secret), and the one-off
+`sync_ca` at `sg serve` start-up.
+
+Each operation does the same four steps:
+
+1. take `CaService::domain_guard()` (a plain mutex that serialises every read-modify-write of the domain set);
+2. open one SQLite transaction (`Vault::in_transaction`, or `add_secret_with` / `remove_secret_cascade_with`), change the
+   rows, derive the domain set from the rules **as seen inside the transaction** (`derive_ca_domains`) and call
+   `CaService::prepare_domains`, which builds and probes the new certificate and returns `None` when nothing changed;
+3. `CaService::persist` the new certificate through the same connection, so it commits or rolls back with the rule change;
+4. after the commit, `CaService::install` swaps it into memory and clears the leaf cache.
+
+**Lock order: guard, then the vault connection, then the CA state, then the leaf cache.** The guard must come first
+because "derive" and "install" are separated by a transaction; without it two requests could each derive a set, then install
+in the wrong order and leave a stale CA. The operations never call `CaService::allow_domain` (it takes the same guard, so
+it would self-deadlock), and closures handed to the vault only use the `&Connection` they are given.
+
+**Trade-off: the proxy waits a few milliseconds.** `prepare_domains` (key signing plus the webpki probe for every domain)
+runs while the vault's single connection is locked inside the transaction. During that time the proxy, which reads rules
+and roles through the same connection, waits, so a rule or secret change that alters the domains stalls proxy requests for a
+few milliseconds. Changes that do not alter the set skip the signing (`None`) and are as cheap as before. This was accepted
+over a design that prepares the certificate outside the lock, which would need a second pass to detect that the rules moved
+underneath it; the tool has a single operator and such writes are rare.
 
 ## 5. Design decisions and rationale
 
@@ -300,10 +330,10 @@ no change to agent code: standard tools honour `HTTPS_PROXY` and a CA bundle var
 
 A MITM CA is dangerous if its key leaks. Two measures bound that: (1) the CA private key is stored
 encrypted under the DEK (AAD `sg:ca-key`), and (2) the CA certificate has X.509 **name constraints**
-(`permitted` DNS subtrees = the allowed domains, `excluded` = all IPv4 and IPv6 ranges), `pathlen:0`,
+(`permitted` DNS subtrees = the domains derived from the rules, `excluded` = all IPv4 and IPv6 ranges), `pathlen:0`,
 and key usage limited to `keyCertSign`/`crlSign` (`crates/ca/src/service.rs`, `ca_params`). A conforming
 client refuses a leaf for any name outside the permitted set even if it was signed by this CA. With no
-allowed domain the CA is limited to the reserved TLD `invalid`, so it is never unconstrained. Details
+rule the CA is limited to the reserved TLD `invalid`, so it is never unconstrained. Details
 and caveats (public suffixes, clients that ignore name constraints) are in
 [tokens-and-ca.md](tokens-and-ca.md).
 

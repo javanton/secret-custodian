@@ -54,7 +54,7 @@ and, at `debug`, dropped connections. There are no `info` messages, and requests
 | `2` | Usage error detected by the argument parser (unknown subcommand, missing or invalid flag value). Message on stderr, followed by a usage hint. |
 | `130` | `sg serve` only: a second `SIGINT`/`SIGTERM` while shutting down forces the exit. |
 
-Messages go to stderr; results go to stdout. `sg rule add` prints its CA warning on stderr.
+Messages go to stderr; results go to stdout. `sg secret add` and `sg rule add` print their CA reload warning on stderr.
 
 ## `sg serve`
 
@@ -113,7 +113,9 @@ A second signal exits immediately with `130`.
 first run: leftovers are removed and the vault is initialised (a database with tables but no `meta` row is corrupt and is
 an error). `vault.db` is created (`0600`), a random data key and the token signing key are generated and
 sealed under the master key, and a CA with no permitted domains is created. Nothing else is created
-automatically: you add roles, secrets, rules and CA domains.
+automatically: you add roles, secrets and rules. The CA's permitted domains are not configured by hand: they are derived
+from the rules (see [tokens-and-ca.md](tokens-and-ca.md#2-the-certificate-authority)). On every start the vault also
+syncs the CA with the stored rules once (see [operations.md](operations.md#upgrading-from-a-version-without-required-rules)).
 
 Warnings printed by a non-loopback `--admin-bind` (real output):
 
@@ -153,12 +155,40 @@ Secrets are **write-only**: no command returns a stored value.
 
 | Command | Meaning |
 |---|---|
-| `sg secret add <NAME>` | Create a secret. Fails with `already exists` if the name is taken. |
+| `sg secret add <NAME> [--role <ROLE>] --host <HOST> [--path <PATH>] [--methods <LIST>] (--header <NAME> \| --query <NAME>) [--template <TEMPLATE>]` | Create a secret **together with its first rule**, in one atomic request. Fails with `already exists` if the name is taken. |
 | `sg secret rotate <NAME>` | Replace the value of an existing secret (`not found` otherwise). Rules keep pointing at it. |
-| `sg secret rm <NAME>` | Delete. Fails with `still referenced by a rule` while any rule uses it. |
-| `sg secret ls` | List metadata: `ID`, `NAME`, `CREATED`, `ROTATED` (`-` if never rotated), sorted by name. |
+| `sg secret rm <NAME>` | Delete the secret **and its rules**. If that removes the last rule that needed a host, the CA is re-issued without it. |
+| `sg secret ls` | List metadata: `ID`, `NAME`, `RULES` (number of rules), `CREATED`, `ROTATED` (`-` if never rotated), sorted by name. |
 
 **Name:** 1 to 64 characters of `[a-z0-9._-]`.
+
+### `secret add` creates the first rule
+
+A secret that no rule uses can never be injected, so `secret add` always creates one rule with it. The rule
+options are the same as `sg rule add` (see [`sg rule`](#sg-rule)) except that the secret is the one being created:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--role <ROLE>` | see below | Role of the first rule. |
+| `--host <HOST>` | required | Exact lowercase hostname or one-label wildcard (`*.example.com`). |
+| `--path <PATH>` | `*` | `*`, an exact path or a prefix ending in `*`. |
+| `--methods <LIST>` | all | Comma-separated, case-insensitive. |
+| `--header <NAME>` or `--query <NAME>` | exactly one required | Where the secret is injected. |
+| `--template <TEMPLATE>` | `{secret}` | For `--query` it must be exactly `{secret}`. |
+
+**Which role.** `--role` if given (it must exist: `unknown role`). Otherwise the only existing role; if there are none,
+a role `default` (unmatched policy `passthrough`) is created first and the CLI prints a `note:` on stderr; if there are
+several roles it fails with `several roles exist (<names>): choose one with --role`. The CLI validates the rule options
+before reading the value or creating anything, so a bad `--query`/`--template` combination leaves no `default` role
+behind. Add more rules (for the same or other roles) with `sg rule add`.
+
+Without `--host` and `--header`/`--query` the argument parser refuses the command (exit code 2) and nothing is
+stored. If the server rejects the rule (for example `unknown role`, a bad host or `domain rejected: reserved`, which
+is what a host under the placeholder TLD `invalid` gets), nothing is stored either: no secret, no rule, no CA change.
+
+When the new rule's host was not yet in the CA, the CA certificate is re-issued and the command prints
+`warning: the CA certificate changed: agents must reload it (sg ca export)` on stderr; with `--json` the same text is in
+the `notice` field.
 
 ### How the value is read
 
@@ -179,45 +209,44 @@ Rules, checked by the CLI before anything is sent and again by the server:
 | valid UTF-8 | `the secret value is not valid UTF-8` |
 | terminal entries match (`add`) | `the two values do not match` |
 
-Error messages never contain the value. The CLI also scrubs the value out of any server message
-before printing it (replacing it with `[redacted]`); for very short values this scrub can also hit
-innocent text (see [Known quirk](#known-quirk-redaction-of-short-values)).
+Error messages never contain the value. The CLI also scrubs the value out of any server message before printing it
+(replacing it with `[redacted]`; see [redaction](#redaction-of-the-value-in-error-messages)).
 
 ```
-$ printf '%s' "$GITHUB_TOKEN" | sg secret add gh
-secret 'gh' stored
+$ sg role add reviewer --unmatched deny
+role 'reviewer' created
+$ printf '%s' "$GITHUB_TOKEN" | sg secret add gh --role reviewer --host api.github.com --methods GET \
+     --path '/repos/*' --header Authorization --template 'Bearer {secret}'
+secret 'gh' stored with rule 1
+warning: the CA certificate changed: agents must reload it (sg ca export)
 $ printf '%s' "$NEW_TOKEN" | sg secret rotate gh
 secret 'gh' rotated
 $ sg secret ls
-ID  NAME  CREATED               ROTATED
-1   gh    2026-10-16T19:55:47Z  2026-10-16T19:58:10Z
+ID  NAME  RULES  CREATED               ROTATED
+1   gh    1      2026-10-16T19:55:47Z  2026-10-16T19:58:10Z
 $ sg --json secret ls
 [
   {
     "created_at": 1792180547,
     "id": 1,
     "name": "gh",
-    "rotated_at": 1792180690
+    "rotated_at": 1792180690,
+    "rules": 1
   }
 ]
 $ sg secret rm gh
-error: still referenced by a rule
+secret 'gh' removed
 ```
 
-`--json` of `add`/`rotate` prints the metadata object; of `rm` prints nothing (the server answers `204`).
+`--json` of `add` prints the server's answer `{"secret": {...}, "rules": [...], "ca_changed": true, "notice": "..."}`
+(see [admin-api.md](admin-api.md#secrets)); of `rotate` the metadata object; of `rm` nothing (the server answers `204`).
 Timestamps are Unix seconds in JSON and UTC RFC 3339 in tables.
 
-### Known quirk: redaction of short values
+### Redaction of the value in error messages
 
-The scrub described above replaces every occurrence of the value in server error messages. With a one-letter
-secret it mangles the message (real output, value `x`):
-
-```
-$ echo 'x' | sg secret add upstream-key     # name already exists
-error: already e[redacted]ists
-```
-
-It is cosmetic and errs on the safe side. Real secrets are not affected.
+The CLI replaces the value with `[redacted]` in any server error message, raw or JSON-escaped, but only when the value
+is at least 8 bytes long: replacing a one-letter value would mangle ordinary words (`already exists` for the value `x`).
+Real secrets are far longer than that. A message that is exactly the value is always replaced.
 
 ## `sg role`
 
@@ -227,7 +256,7 @@ has no rule for the role. See [policy-and-rules.md](policy-and-rules.md#1-roles-
 | Command | Meaning |
 |---|---|
 | `sg role add <NAME> [--unmatched passthrough\|deny]` | Create a role. `--unmatched` defaults to `passthrough`. |
-| `sg role rm <NAME>` | Delete a role **and all its rules**. Existing tokens of that role keep verifying but every request gets `403` (`unknown-role`). |
+| `sg role rm <NAME>` | Delete a role **and all its rules**, unless that would leave a secret without any rule: then it is refused (`409`) with the names of the affected secrets and nothing is deleted. If the role's rules were the only ones needing some hosts, the CA is re-issued without them. Existing tokens of that role keep verifying but every request gets `403` (`unknown-role`). |
 | `sg role ls` | List roles: `NAME`, `UNMATCHED`, sorted by name. |
 
 **Name:** 1 to 64 characters of `[a-z0-9_-]` (no dot, unlike secret names).
@@ -251,8 +280,8 @@ A rule says: for this role, for requests matching host, path and methods, inject
 
 | Command | Meaning |
 |---|---|
-| `sg rule add ...` | Create a rule. Prints `rule <id> created`. |
-| `sg rule rm <ID>` | Delete a rule by numeric id. `not found` if absent. |
+| `sg rule add ...` | Add a rule for an **existing** secret. Prints `rule <id> created`. (The first rule of a secret is created by [`sg secret add`](#sg-secret).) |
+| `sg rule rm <ID>` | Delete a rule by numeric id. `not found` if absent. Refused (`409`) when it is the last rule of its secret: delete the secret instead, or add another rule first. |
 | `sg rule ls [--role <ROLE>]` | List rules (all, or one role's), ordered by id. |
 
 `sg rule add` options:
@@ -270,19 +299,25 @@ A rule says: for this role, for requests matching host, path and methods, inject
 All validation details (header names that cannot be targets, path-pattern rules, specificity and fail-closed
 semantics) are in [policy-and-rules.md](policy-and-rules.md).
 
-If the CA does not yet permit the rule's host, the rule is still created and a warning is printed on stderr:
+If the rule's host was not yet in the CA's permitted domains, the CA is re-issued as part of the same operation (rule and
+CA change together or not at all) and a warning is printed on stderr; the agents must then reload the certificate
+(`sg ca export`). If the host was already permitted, nothing is printed:
 
 ```
 $ sg rule add --role reviewer --host example.org --header X-Key --secret upstream-key
 rule 3 created
-warning: the CA does not permit example.org: run `sg ca allow-domain example.org` and reload the CA certificate in your agents
+warning: the CA certificate changed: agents must reload it (sg ca export)
+$ sg rule add --role developer --host example.org --header X-Other --secret upstream-key
+rule 4 created
 ```
 
-Until you do, a CONNECT to that host fails with `502` (decision `ca-not-permitted`).
+A host the CA cannot permit (for example under the placeholder TLD `invalid`) makes the command fail with
+`domain rejected: reserved` and nothing is created.
 
 ```
 $ sg rule add --role reviewer  --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret upstream-key
 rule 1 created
+warning: the CA certificate changed: agents must reload it (sg ca export)
 $ sg rule add --role developer --host localhost --header Authorization --template 'Bearer {secret}' --secret upstream-key
 rule 2 created
 $ sg rule ls
@@ -291,7 +326,8 @@ ID  ROLE       HOST       PATH  METHODS  KIND    TARGET         TEMPLATE        
 2   developer  localhost  *     *        header  Authorization  Bearer {secret}  1
 $ sg --json rule add --role developer --host example.net --header X-Key --secret upstream-key
 {
-  "ca_warning": null,
+  "ca_changed": true,
+  "notice": "the CA certificate changed: agents must reload it (sg ca export)",
   "rule": {
     "host_pattern": "example.net",
     "id": 5,
@@ -411,28 +447,22 @@ passthrough tunnels when they end (bounded by the idle timeout and lifetime). Se
 ## `sg ca`
 
 The proxy re-signs HTTPS for the hosts that have rules with a local CA whose X.509 name constraints are limited
-to the domains you allow. Details: [tokens-and-ca.md](tokens-and-ca.md).
+to the domains **derived from the rules**. There is no command to add or remove a domain: creating a rule for a new host
+adds it, deleting the last rule that needs it removes it. Details: [tokens-and-ca.md](tokens-and-ca.md).
 
 | Command | Meaning |
 |---|---|
 | `sg ca export` | Print the CA certificate (PEM, public part only) on stdout. |
-| `sg ca allow-domain <DOMAIN>` | Permit a domain and its subdomains. **Re-issues the CA certificate** (same key, new serial and constraints). Allowing a domain that is already allowed succeeds and changes nothing (the notice is printed again). |
-| `sg ca status` | List permitted domains. |
-
-`allow-domain` accepts a plain lowercase domain such as `github.com` (surrounding spaces are trimmed and case
-is folded): letters, digits, `-` and dots, labels of 1 to 63 characters, at most 253 bytes, a last label that is
-not all digits. It rejects wildcards, underscores, IDNs (use punycode), IP addresses, single-label names
-(except `localhost`) and `invalid`. It does **not** consult the Public Suffix List: allowing `github.io` or
-`co.uk` would let the CA sign for every site under them, so allow the exact API host, for example `api.github.com`.
+| `sg ca status` | List the permitted domains (read-only; a wildcard rule `*.x` shows as `x`). |
 
 ```
 $ sg ca status
 permitted domains:
-$ sg ca allow-domain localhost
-the CA certificate changed: agents must reload it (sg ca export)
 $ sg ca status
 permitted domains:
-  localhost
+  api.github.com
+  gitlab.com
+  x.example
 $ sg ca export > sg-ca.pem
 $ head -2 sg-ca.pem
 -----BEGIN CERTIFICATE-----
@@ -445,22 +475,22 @@ $ sg --json ca status
 }
 ```
 
-After every `allow-domain` that adds a domain, **re-export the certificate and restart or reconfigure the
-agents**: a client still holding the previous certificate refuses the newly allowed name, because the old
-certificate has narrower constraints. Leaf certificates issued earlier stay valid.
+(The first `ca status` is a fresh vault; the second comes after `secret add gh --host api.github.com ...`,
+`secret add gl --host '*.gitlab.com' ...` and a rule for `x.example`.)
 
-Real rejections:
+**When agents must reload the certificate.** Every `secret add` or `rule add` whose host is new to the CA prints
+`warning: the CA certificate changed: agents must reload it (sg ca export)`. **Re-export the certificate and restart or
+reconfigure the agents**: a client still holding the previous certificate refuses the newly permitted name, because the
+old certificate has narrower constraints. Leaf certificates issued earlier stay valid. Removing a host (deleting its last
+rule, a secret or a role) re-issues the certificate too, but agents holding the old one keep working, so no reload is
+needed for removals.
 
-```
-$ sg ca allow-domain com
-error: domain rejected: too broad: single-label domains are not allowed
-$ sg ca allow-domain '*.example.com'
-error: domain rejected: use a plain lowercase domain such as github.com
-$ sg ca allow-domain 1.2.3.4
-error: domain rejected: last label must not be all digits
-```
+A wildcard rule `*.example.com` permits `example.com` (and therefore all its subdomains), since that is how X.509 name
+constraints work; the CA does not consult the Public Suffix List, so a rule for `*.github.io` or `*.co.uk` would let the CA
+sign for every site under it. Write rules for exact hosts. When no rule remains the CA falls back to a placeholder
+(`invalid`) that permits nothing real.
 
-There is no command to remove a domain or rotate the CA key.
+There is no command to rotate the CA key.
 
 ## `sg audit`
 
@@ -560,16 +590,20 @@ Copied from real runs. Prefix is always `error: ` on stderr, exit code `1` (or `
 |---|---|
 | `not found` | Unknown secret, role, rule id, token id on `rm`/`rotate`/`revoke`. |
 | `already exists` | Duplicate secret or role name. |
-| `still referenced by a rule` | `secret rm` of a secret a rule uses. Remove the rules first. |
 | `invalid name: use [a-z0-9._-], max 64 chars` | Secret name. |
 | `role name must be [a-z0-9_-]` | Role name. |
-| `unknown role` | `rule add` or `token create` with a role that does not exist. |
+| `unknown role` | `secret add --role`, `rule add` or `token create` with a role that does not exist. |
+| `a secret needs at least one rule: ...` | The server (400) when `POST /secrets` carries no rules. The CLI cannot send this: its parser requires `--host` and `--header`/`--query`. |
+| `several roles exist (<names>): choose one with --role` | `secret add` without `--role` when more than one role exists (CLI). |
+| `this is the last rule of its secret: delete the secret instead, or add another rule first` | `rule rm` of the only rule of a secret (409). |
+| `deleting this role would leave secrets without rules: <names>; ...` | `role rm` of a role whose rules are the only ones of some secrets (409); up to 5 names, then `and N more`. |
+| `too many rules for one secret (max 20)` | `POST /secrets` with more than 20 rules (400; the CLI sends one). |
 | `secret '<name>' not found` | `rule add --secret` (raised by the CLI). |
 | `host_pattern must be a lowercase hostname or *.hostname (no IPs)` | Bad `--host`. |
 | `--query injects the bare secret: the template must be `{secret}` (got `...`)` | `--query` with another template (CLI). |
 | `invalid token id` | `token revoke` argument is not a UUID. |
 | `machine must be 1-128 characters without control characters` | `--machine`. |
-| `domain rejected: <reason>` | `ca allow-domain`; reasons include `too broad: single-label domains are not allowed`, `use a plain lowercase domain such as github.com`, `last label must not be all digits`, `would invalidate the CA name constraints`. |
+| `domain rejected: <reason>` | `secret add` or `rule add` whose host the CA cannot permit (for example `reserved` for the placeholder TLD `invalid`); nothing is created. |
 | `internal error` | The server hit an unexpected condition (details only in its stderr log). |
 
 ### From the argument parser (exit code 2)
@@ -577,6 +611,10 @@ Copied from real runs. Prefix is always `error: ` on stderr, exit code `1` (or `
 ```
 $ sg rule add --role reviewer --host localhost --secret upstream-key
 error: the following required arguments were not provided:
+  <--header <HEADER>|--query <QUERY>>
+$ echo v | sg secret add k
+error: the following required arguments were not provided:
+  --host <HOST>
   <--header <HEADER>|--query <QUERY>>
 $ sg role add x --unmatched foo
 error: invalid value 'foo' for '--unmatched <UNMATCHED>'

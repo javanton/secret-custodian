@@ -162,6 +162,25 @@ needs a man-in-the-middle position on a victim that trusts this CA. Not every TL
 those clients get no protection from them. The CA certificate should be trusted only by the processes that need it,
 through environment variables, not in a system or browser store.
 
+#### The CA follows the rules
+
+The CA is no longer widened by hand: its permitted domains are **derived from the rules** (`*.x` becomes `x`) and
+re-issued whenever that set changes, in the same transaction as the rule change. Two consequences matter for risk:
+
+- **Creating a rule widens what the CA may sign for.** Anyone who can create a rule (the operator, via the socket or a
+  logged-in web session) also decides which names this CA can vouch for; there is no separate approval step any more. A
+  rule for `api.example.com` adds `api.example.com` to the name constraints; a stolen CA key (previous section) is then
+  good for that host as well. Review rule hosts as you would review CA domains.
+- **`*.x` permits `x` and every subdomain.** X.509 name constraints cannot express "subdomains only", so the wildcard rule
+  `*.example.com` adds `example.com` to the constraints, which covers `example.com` and everything under it (the rule
+  itself still matches only subdomains). The CA does not consult the Public Suffix List, so a rule for `*.github.io` or
+  `*.co.uk` lets a stolen CA key sign for every site under that suffix. Write rules for exact hosts.
+
+Removing the last rule that needed a host also removes it from the CA, so the CA shrinks as rules go. Agents that hold
+an older certificate keep working after a removal; after an addition they must reload the certificate (`sg ca export`)
+or they refuse the new name (see [tokens-and-ca.md](tokens-and-ca.md#24-re-issue-with-the-same-key)). Start-up drops
+domains no rule uses.
+
 ### Malicious or compromised upstream network
 
 Upstream TLS is verified with the system roots plus any `--upstream-ca` you added; a certificate failure is a `502`.
@@ -190,7 +209,7 @@ connect is not possible. Private LAN addresses are allowed on purpose (homelab):
 | Tunnel reuse for another host | Host/authority must equal the CONNECT host (`421`) | `crates/proxy/src/forward.rs` |
 | Routing and attribution overrides, reflection | Header strip list, `TRACE`/`TRACK`/`CONNECT` refused, COPY/MOVE need explicit methods | `crates/proxy/src/inject.rs`, `forward.rs` |
 | Resource exhaustion | Connection cap, header and handshake timeouts, idle and lifetime bounds, per-identity caps, global upstream cap, body idle timeout | `crates/proxy/src/lib.rs`, `server.rs`, `mitm.rs`, `body.rs`, `ident.rs`; admin: `crates/admin/src/serve.rs` |
-| Over-broad CA | Name constraints; `invalid` placeholder when empty; IP ranges excluded; webpki-compatible domain validation with a probe; single-label and TLD domains refused | `crates/ca/src/service.rs` |
+| Over-broad CA | Name constraints; `invalid` placeholder when empty; IP ranges excluded; webpki-compatible domain validation with a probe; single-label and TLD domains refused; domains derived from the rules (no manual widening), start-up sync drops domains no rule uses | `crates/ca/src/service.rs`; `crates/admin/src/ops.rs`; `crates/policy/src/domains.rs` |
 | Corrupt or foreign database | Unsupported schema refused after the key is verified; wrong key gives a non-specific error | `crates/core/src/vault.rs`; `crates/sg/src/serve.rs` (`open_error`) |
 
 ## Non-goals and residual risks
@@ -230,8 +249,8 @@ for phase 1.
 - Method overrides carried in the query or body (`_method=`) are not stripped; for explicit COPY/MOVE rules the
   `Destination` header is not validated against the rule's path.
 - Only the id of the first matching rule is audited.
-- The public suffix list is not consulted for CA domains: allowing `github.io` or `co.uk` lets the CA sign for every
-  site under it. Allow exact hosts.
+- The public suffix list is not consulted for CA domains: a rule for `*.github.io` or `*.co.uk` (or for such a host itself
+  being a suffix) lets the CA sign for every site under it. Write rules for exact hosts.
 - Revocation does not cut passthrough tunnels already open (bounded by 10 min idle and 8 h lifetime).
 
 **Cryptography and memory**
@@ -286,7 +305,8 @@ Before giving an agent a token:
 - [ ] Roles use `--unmatched deny` unless the agent genuinely needs unrestricted outbound access; rules name exact
       hosts, narrow path prefixes and the least methods (`GET` for read-only roles).
 - [ ] Credentials injected by header, not query string; upstream keys are scoped to the minimum the role needs.
-- [ ] CA domains are exact hosts you control or trust (`api.github.com`, not `github.io` or `co.uk`).
+- [ ] Rule hosts (which become the CA's domains) are exact hosts you control or trust (`api.github.com`, not `*.github.io` or
+      `*.co.uk`); `sg ca status` shows what the CA currently permits.
 - [ ] The CA certificate is trusted only per agent process through the environment variables, not in a system store
       or browser.
 - [ ] Tokens have a `--ttl`, one token per machine and role; revoke (`sg token revoke`, `revoke-machine`) when a

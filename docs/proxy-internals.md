@@ -101,7 +101,7 @@ tunnelled. The same holds inside a tunnel and for plain HTTP.
 
 | Rules for host? | Role `unmatched` | CA permits host? | Outcome |
 |---|---|---|---|
-| yes | any | no | `502`, body names `sg ca allow-domain`, audit `ca-not-permitted` |
+| yes | any | no | `502`, body says the CA's domains follow the rules, audit `ca-not-permitted` (a safety net: the admin keeps the CA in sync with the rules) |
 | yes | any | yes | per-identity tunnel budget, then `200` and MITM (audit `mitm`) |
 | no | `deny` | - | `403 host not allowed for this role`, audit `unmatched-denied` |
 | no | `passthrough` | - | per-identity tunnel budget, then connect to the target first: network policy refusal `403 destination not allowed` (`target-denied`), connect failure `502 could not reach the destination` (`tunnel-connect-failed`), otherwise `200` (`passthrough`) and an opaque tunnel |
@@ -266,7 +266,7 @@ The last row is why an agent cannot use the proxy to reach the admin web UI or t
 `https://localhost:<proxy port>/` gives `403 destination not allowed` (`target-denied`, inside the tunnel).
 
 `localhost` (the exact name) resolves to `127.0.0.1` and `::1` without consulting the system resolver (RFC 6761);
-`foo.localhost` is not covered by the exception. A rule on `localhost` requires `sg ca allow-domain localhost`.
+`foo.localhost` is not covered by the exception. A rule on `localhost` is enough: it adds `localhost` to the CA's domains.
 
 ## Upstream connection handling
 
@@ -302,7 +302,7 @@ what it means. The host column of an audit row is the CONNECT target or the requ
 | `inject` | upstream status | inside a tunnel | Request judged, credential injected, forwarded; `rule` column = first matching rule |
 | `unmatched-denied` | 403 | CONNECT, plain HTTP | Host has no rule for the role and the role is `deny` |
 | `unknown-role` | 403 | CONNECT, plain HTTP | The token's role no longer exists |
-| `ca-not-permitted` | 502 | CONNECT | The host has rules but the CA does not permit it; run `sg ca allow-domain` |
+| `ca-not-permitted` | 502 | CONNECT | The host has rules but the CA does not permit it (should not happen: the CA follows the rules) |
 | `tunnel-connect-failed` | 502 | CONNECT | Passthrough target not resolvable or not reachable (or timed out) |
 | `target-denied` | 403 | CONNECT, inside a tunnel, plain HTTP | Network policy refused the destination address |
 | `identity-limit` | 429 | CONNECT, inside a tunnel | The token holds the maximum number of tunnels (64) or concurrent upstream requests (64) |
@@ -338,7 +338,7 @@ name or a rule.
 | 407 | `proxy authentication required` | missing, duplicate, oversized, malformed or invalid credentials (with `Proxy-Authenticate`); and token revoked mid-tunnel (no header) | none / `token-invalid` |
 | 421 | `Host does not match the CONNECT target` | host consistency | `host-mismatch` |
 | 429 | `too many open tunnels for this token` / `too many concurrent requests for this token` (with `Retry-After: 1`) | per-identity budgets | `identity-limit` |
-| 502 | `the CA does not permit <host>; run `sg ca allow-domain <domain>` and reload the CA certificate` | CONNECT to a ruled host the CA does not permit | `ca-not-permitted` |
+| 502 | `the CA does not permit <host>; its domains follow the rules: re-create the rule or restart `sg serve`, then reload the CA certificate` | CONNECT to a ruled host the CA does not permit | `ca-not-permitted` |
 | 502 | `could not reach the destination` | passthrough connect failed | `tunnel-connect-failed` |
 | 502 | `upstream request failed` | upstream connect/TLS/I/O/timeout | `upstream-error` |
 | 502 | `secret unavailable` / `invalid injection value` / `could not build the upstream request` / `internal error` | internal failures while preparing the request | `upstream-error` |

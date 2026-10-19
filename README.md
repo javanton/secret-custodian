@@ -27,12 +27,14 @@ secret away and bounds what it can do with it; it does not make a dangerous perm
 
 ## How it works
 
-1. You store a secret (write-only), create a **role** (a policy) and **rules** (host, path, methods, and which header or
-   query parameter carries which secret), then issue a **token** for a `(machine, role)`.
+1. You create a **role** (a policy), store a secret (write-only) **together with its first rule** (host, path, methods, and
+   which header or query parameter carries it), add more rules if you need them, then issue a **token** for a `(machine, role)`.
+   A secret without a rule could never be injected, so the vault does not allow one.
 2. The agent runs with `HTTPS_PROXY=http://machine:TOKEN@vault:8080` and trusts the vault's CA certificate.
 3. The agent sends `CONNECT api.example.com:443`. The proxy checks the token, then asks whether the role has rules for that host.
 4. With rules, the proxy terminates TLS with a short-lived certificate from a **name-constrained CA** that can only sign
-   for the domains you allowed; hosts without rules are tunnelled untouched or refused, per role.
+   for the hosts your rules name (the CA's permitted domains are derived from the rules); hosts without rules are tunnelled
+   untouched or refused, per role.
 5. For every request inside the tunnel the proxy re-checks the token, judges method and path against the rules,
    **removes** any credential the agent supplied, injects the real one and forwards the request over verified TLS.
 6. Every decision is written to an audit log (no secrets, no query strings).
@@ -121,7 +123,7 @@ PROXY="$(sed -n 's/^proxy: http:\/\///p' serve.out)"
 wrote sg.key
 Back this file up: without it the vault cannot be opened.
 proxy: http://127.0.0.1:33691
-admin: http://localhost:45081/#t=9e9f86cc1378bd4246951ee3212002143ca445fd2b5d48432c961c65008e061a
+admin: http://localhost:45081/#t=9e9f86cc1378bd4246951ee3212002143ca445fd2b5d51532c961c65008e061a
 socket: /tmp/tmp.vINqLarwc9/sg.sock
 ready
 ```
@@ -129,33 +131,36 @@ ready
 On a normal run you would write just `sg serve --key-file ~/.config/secret-guardian/sg.key`. The `admin:` line is a
 one-time login link for the [web UI](#web-ui).
 
-**4. Store a secret, create roles and rules.** The secret comes from stdin, never from an argument. `reviewer` may only
-`GET`; `developer` may do anything; both can reach only hosts that have a rule (`--unmatched deny`). The CA must permit
-the host before the proxy can impersonate it.
+**4. Create roles, store a secret with its first rule, add another rule.** The secret comes from stdin, never from an
+argument. A secret is created **together with its first rule** (`--host` and `--header` or `--query` are required), because a
+secret no rule uses can never be injected. `reviewer` may only `GET`; `developer` may do anything; both can reach only hosts
+that have a rule (`--unmatched deny`). The CA's permitted domains come from the rules, so there is no separate "allow this
+domain" step: the first rule for `localhost` is what lets the proxy impersonate it.
 
 ```sh
-printf '%s' 'demo-secret-value' | sg secret add upstream-key
 sg role add reviewer  --unmatched deny
 sg role add developer --unmatched deny
-sg ca allow-domain localhost
-sg rule add --role reviewer  --host localhost --methods GET \
-   --header Authorization --template 'Bearer {secret}' --secret upstream-key
-sg rule add --role developer --host localhost \
+printf '%s' 'demo-secret-value' | sg secret add upstream-key --role developer --host localhost \
+   --header Authorization --template 'Bearer {secret}'
+sg rule add --role reviewer --host localhost --methods GET \
    --header Authorization --template 'Bearer {secret}' --secret upstream-key
 sg rule ls
 ```
 
 ```
-secret 'upstream-key' stored
 role 'reviewer' created
 role 'developer' created
-the CA certificate changed: agents must reload it (sg ca export)
-rule 1 created
+secret 'upstream-key' stored with rule 1
+warning: the CA certificate changed: agents must reload it (sg ca export)
 rule 2 created
 ID  ROLE       HOST       PATH  METHODS  KIND    TARGET         TEMPLATE         SECRET
-1   reviewer   localhost  *     GET      header  Authorization  Bearer {secret}  1
-2   developer  localhost  *     *        header  Authorization  Bearer {secret}  1
+1   developer  localhost  *     *        header  Authorization  Bearer {secret}  1
+2   reviewer   localhost  *     GET      header  Authorization  Bearer {secret}  1
 ```
+
+The warning (on stderr) is the reload note: the CA certificate was re-issued because `localhost` was added, so agents must
+fetch it again (step 5 does, and `sg ca status` lists the domains). Without `--role`, `secret add` uses the only existing
+role, creates a role `default` if there is none, and fails if there are several roles.
 
 **5. Export the CA and issue tokens.** `sg token create` normally prints a ready-made `HTTPS_PROXY` block (see the
 [CLI reference](docs/cli-reference.md#the-environment-block)); `--json` is handier in a script.
@@ -194,11 +199,11 @@ sg audit --limit 6
 GET /repos/demo Authorization: Bearer demo-secret-value
 POST /repos/demo Authorization: Bearer demo-secret-value
 TIME                  MACHINE  ROLE       METHOD   HOST       PATH         DECISION   STATUS  RULE
-2026-10-16T20:10:34Z  laptop   developer  POST     localhost  /repos/demo  inject     200     2
+2026-10-16T20:10:34Z  laptop   developer  POST     localhost  /repos/demo  inject     200     1
 2026-10-16T20:10:34Z  laptop   developer  CONNECT  localhost  /            mitm       200     -
 2026-10-16T20:10:34Z  laptop   reviewer   POST     localhost  /repos/demo  forbidden  403     -
 2026-10-16T20:10:34Z  laptop   reviewer   CONNECT  localhost  /            mitm       200     -
-2026-10-16T20:10:34Z  laptop   reviewer   GET      localhost  /repos/demo  inject     200     1
+2026-10-16T20:10:34Z  laptop   reviewer   GET      localhost  /repos/demo  inject     200     2
 2026-10-16T20:10:34Z  laptop   reviewer   CONNECT  localhost  /            mitm       200     -
 ```
 
@@ -213,9 +218,9 @@ kill "$SERVE_PID"; wait "$SERVE_PID"; kill "$UP_PID"; cd /; rm -rf "$DEMO"
 
 `sg serve` stops cleanly on `SIGINT` or `SIGTERM` (exit code 0) and removes its socket.
 
-**With a real API** (example only, not part of the verified sequence above): `sg ca allow-domain api.github.com`, a role
-with `--unmatched deny`, a rule with `--host api.github.com --methods GET --header Authorization --template 'Bearer {secret}'`,
-the real token on stdin, and `curl https://api.github.com/user` under the printed `HTTPS_PROXY`. Without `--upstream-ca`
+**With a real API** (example only, not part of the verified sequence above): a role with `--unmatched deny`, then
+`sg secret add gh --role reviewer --host api.github.com --methods GET --header Authorization --template 'Bearer {secret}'`
+with the real token on stdin, and `curl https://api.github.com/user` under the printed `HTTPS_PROXY`. Without `--upstream-ca`
 the vault trusts the system root store.
 
 Note for local demos: the block printed by `sg token create` sets `NO_PROXY=localhost,127.0.0.1`. If your test upstream is
@@ -257,8 +262,9 @@ talks to hosts without rules, point the variables at a combined file:
 cat /etc/pki/tls/certs/ca-bundle.crt sg-ca.pem > combined.pem    # Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
 ```
 
-After every `sg ca allow-domain` that adds a domain, export the certificate again and replace the file: a client holding
-the old one refuses the newly allowed name (`permitted subtree violation`).
+Whenever a rule or secret adds a **new host** (the command prints `the CA certificate changed: agents must reload it`),
+export the certificate again and replace the file: a client holding the old one refuses the new name
+(`permitted subtree violation`). Removing a host does not require a reload.
 
 **curl** (verified):
 
@@ -374,10 +380,10 @@ checks `Host` and `Origin`; see [docs/admin-api.md](docs/admin-api.md).
 
 | Tab | What it does |
 |---|---|
-| Secrets | Lists secret names and dates (never values). Add a secret (name and a masked value), rotate one, delete one (blocked while a rule uses it) |
-| Roles & rules | Create and delete roles (with the unmatched policy: `deny` or `passthrough`); add rules with host, path, method checkboxes, header or query target, template and secret; delete rules. Shows the CA warning when a rule's host is not yet permitted |
+| Secrets | Lists secret names, rule counts and dates (never values); a secret with no rules is marked "none: never injected". Add a secret together with its first rule(s) (name, masked value, role, host, target), rotate one, delete one (its rules go with it) |
+| Roles & rules | Create and delete roles (with the unmatched policy: `deny` or `passthrough`; deleting a role that would leave secrets without rules is refused); add rules with host, path, method checkboxes, header or query target, template and secret; delete rules (not a secret's last one). Shows the "agents must reload the CA certificate" notice when a rule adds a host |
 | Tokens | Create a token for a machine, role and optional lifetime (`30m`, `12h`, `7d`); the token and a ready `HTTPS_PROXY` block are shown **once** with a Copy button; revoke one token or every token of a machine; status shows active, expired or revoked |
-| CA | Lists permitted domains, allows a new domain (with the "agents must reload" notice), downloads the CA certificate, and shows the environment variables to trust it |
+| CA | Lists the permitted domains (read-only: they follow from the rules), downloads the CA certificate, and shows the environment variables to trust it |
 | Audit | Newest-first table with filters for role, host, time range (any time, last hour, 24 hours, 7 days) and limit (50, 200, 1000); refusals are highlighted |
 
 **Honest status of the UI: it has not been verified in a real browser by the authors.** It was tested through Rust tests of the
@@ -394,11 +400,11 @@ Full reference with every flag, default, output example and error: [docs/cli-ref
 |---|---|
 | `sg serve` | Run the vault: proxy, admin socket and web UI |
 | `sg keygen --out FILE` | Create a random master key file (mode 0600, never overwrites) |
-| `sg secret add NAME` / `rotate NAME` / `rm NAME` / `ls` | Manage secrets; values come from stdin or a hidden prompt and are write-only |
+| `sg secret add NAME [--role R] --host H [--path P] [--methods M,..] (--header N \| --query N) [--template T]` / `rotate NAME` / `rm NAME` / `ls` | Manage secrets; `add` creates the secret with its first rule; values come from stdin or a hidden prompt and are write-only; `rm` also deletes its rules |
 | `sg role add NAME [--unmatched passthrough\|deny]` / `rm NAME` / `ls` | Manage roles and what happens to hosts without rules |
-| `sg rule add --role R --host H [--path P] [--methods M,..] (--header N \| --query N) [--template T] --secret S` / `rm ID` / `ls [--role R]` | Manage injection rules |
+| `sg rule add --role R --host H [--path P] [--methods M,..] (--header N \| --query N) [--template T] --secret S` / `rm ID` / `ls [--role R]` | Add more rules to an existing secret; the last rule of a secret cannot be removed |
 | `sg token create --machine M --role R [--ttl 12h] [--proxy-url URL]` / `revoke JTI` / `revoke-machine M` / `ls` | Issue and revoke agent tokens |
-| `sg ca export` / `allow-domain DOMAIN` / `status` | Export the CA certificate, permit a domain, list permitted domains |
+| `sg ca export` / `status` | Export the CA certificate, list the domains it permits (derived from the rules) |
 | `sg audit [--role R] [--host H] [--since TS] [--limit N]` | Show the audit log, newest first |
 | `sg login-url` | Print a fresh single-use link to the web UI |
 
@@ -441,7 +447,7 @@ Guaranteed (by design and by tests):
 - Credentials are only ever injected over TLS, never into plain `http://`.
 - The proxy refuses loopback, link-local and cloud-metadata targets and its own ports; revoking a token stops an open
   tunnel at the next request.
-- The CA can only sign for the domains you allow (X.509 name constraints) and never for IP addresses.
+- The CA can only sign for the hosts your rules name (X.509 name constraints derived from the rules) and never for IP addresses.
 - The web UI uses no cookies, checks `Host` and `Origin`, requires a bearer session obtained with a one-time token, and ships a
   strict CSP.
 
@@ -468,7 +474,8 @@ Read these before relying on it:
 - **Query injection** appends `name=value` (percent-encoded) at the end and removes the agent's own copies of that parameter;
   prefer header injection whenever the API allows it. Method overrides carried in the query or body (`_method=`) are not stripped.
 - **The port is not part of a rule:** a rule for `api.example.com` applies to every port of that host. Not a security boundary.
-- **No public-suffix check:** `sg ca allow-domain github.io` or `co.uk` would let the CA sign for every site under it. Allow exact hosts.
+- **No public-suffix check:** a rule for `*.github.io` or `*.co.uk` would let the CA sign for every site under it (a wildcard rule `*.x`
+  permits `x` and all its subdomains). Write rules for exact hosts.
 - **Rotation of the master key, token signing key and CA key is not implemented.** Rotating a secret value is.
 - **Loopback targets are denied** unless you pass `--allow-loopback-targets`; the only built-in exception is TLS to the exact host
   `localhost` with an applicable rule. Private LAN addresses (RFC 1918, ULA, CGNAT) are reachable on purpose.
@@ -503,7 +510,7 @@ Running the checks (details and inventory in [docs/testing.md](docs/testing.md))
 
 ```sh
 cargo test -p sg-policy                                  # scoped, while developing
-cargo test --workspace                                   # everything (484 tests pass, 1 ignored; about 4 minutes cold)
+cargo test --workspace                                   # everything (515 tests pass, 1 ignored; about 4 minutes cold)
 cargo test -p sg-policy --release -- --include-ignored   # + the exhaustive path oracle (1.5 million paths, about 40 s)
 node --test crates/admin/tests/js/app.test.js            # JavaScript logic tests (also run by cargo test)
 scripts/e2e.sh                                           # real curl through the real proxy

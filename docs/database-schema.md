@@ -66,7 +66,7 @@ erDiagram
     }
 
     roles ||--o{ rules : "ON DELETE CASCADE"
-    secrets ||--o{ rules : "ON DELETE RESTRICT"
+    secrets ||--o{ rules : "ON DELETE RESTRICT (rules deleted first by the admin)"
 ```
 
 `tokens`, `audit` and `meta` have no foreign keys. `tokens.role`, `audit.role`, `audit.jti` and
@@ -96,7 +96,11 @@ every `Vault::init` and `Vault::open`.
 - Writers: `Vault::add_secret` (insert with `value_enc = x''`, then update with the real ciphertext in
   the same transaction, because the AAD needs the generated `id`), `rotate_secret` (updates
   `value_enc`, `rotated_at`), `remove_secret` (delete; refused with `CoreError::InUse` while any rule
-  references the secret).
+  references the secret), `add_secret_with` and `remove_secret_cascade_with` (used by the admin: the secret and its rules
+  are inserted, or deleted rules first, in one transaction together with the CA update).
+- Invariant kept by the admin layer, not by a constraint: every secret has at least one rule (secrets from before the
+  invariant may have none; see [operations.md](operations.md#upgrading-from-a-version-without-required-rules)).
+  `list_secrets_with_rule_counts` gives the `rules` count that `GET /secrets` returns.
 - Readers: `list_secrets` and `get_secret_meta` (metadata only, never `value_enc`),
   `reveal_for_injection` (decrypts; the proxy only), `sg_policy` validation (`SELECT COUNT(*) ... WHERE id`).
 - Value constraints (`validate_secret_value`): non-empty, at most 8192 bytes, no control characters (bytes below 0x20 except TAB, and 0x7F); non-ASCII UTF-8 is allowed.
@@ -108,7 +112,8 @@ every `Vault::init` and `Vault::open`.
 | `name` | `TEXT PRIMARY KEY` | Role name; `add_role` allows 1 to 64 bytes of `[a-z0-9_-]`. |
 | `unmatched_policy` | `TEXT NOT NULL CHECK (IN ('passthrough','deny'))` | What to do for hosts with no rule (see [policy-and-rules.md](policy-and-rules.md)). |
 
-- Writers: `sg_policy::add_role`, `remove_role` (deleting a role cascades to its rules).
+- Writers: `sg_policy::add_role`, `remove_role` (deleting a role cascades to its rules; the admin refuses it, with `409`, when
+  that would leave a secret with no rule).
 - Readers: `get_role`, `list_roles` (policy); the proxy calls `get_role` at every CONNECT.
 - There is no `UPDATE` path for a role's policy in the code.
 
@@ -126,7 +131,9 @@ every `Vault::init` and `Vault::open`.
 | `template` | `TEXT NOT NULL` | Contains `{secret}`; for `query` it is exactly `{secret}`. |
 | `secret_id` | `INTEGER NOT NULL REFERENCES secrets(id) ON DELETE RESTRICT` | The secret to inject. |
 
-- Writers: `sg_policy::add_rule` (after `validate`), `remove_rule`; cascade deletes via `remove_role`.
+- Writers: `sg_policy::add_rule` and `insert_rule_in` (after `validate`; the latter inside the caller's transaction, used
+  by `POST /secrets`), `remove_rule` (the admin refuses to remove the last rule of a secret, `409`); cascade deletes via
+  `remove_role` and by `remove_secret_cascade_with`.
 - Readers: `list_rules` (the proxy loads the role's rules at CONNECT and again for every request);
   `Vault::remove_secret` (`COUNT(*) ... WHERE secret_id`).
 - Validation rules are in [policy-and-rules.md](policy-and-rules.md).
@@ -178,9 +185,11 @@ every `Vault::init` and `Vault::open`.
 | `id` | `INTEGER PRIMARY KEY CHECK (id = 1)` | Exactly one row. |
 | `cert_pem` | `TEXT NOT NULL` | The public CA certificate in PEM. |
 | `key_enc` | `BLOB NOT NULL` | CA private key (PKCS#8 PEM text) sealed under the DEK, AAD `sg:ca-key`. |
-| `domains` | `TEXT NOT NULL` | JSON array of allowed domains (`[]` initially). |
+| `domains` | `TEXT NOT NULL` | JSON array of permitted domains: the set derived from the rules (`[]` initially; `*.x` is stored as `x`). |
 
-- Writer: `CaService::init_or_load` (insert on first run), `CaService::allow_domain` (updates `cert_pem`, `domains`).
+- Writers: `CaService::init_or_load` (insert on first run) and `CaService::persist` (updates `cert_pem`, `domains`), which the
+  admin calls inside the same transaction as the rule change that implies it (and once at `sg serve` start-up). The row is
+  never edited by hand.
 - Reader: `CaService::init_or_load`.
 
 ## 3. `meta` key inventory
