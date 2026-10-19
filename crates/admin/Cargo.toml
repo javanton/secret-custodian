@@ -1,0 +1,30 @@
+[package]
+name = "sg-admin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sg-core.workspace = true
+sg-policy.workspace = true
+sg-auth.workspace = true
+sg-ca.workspace = true
+rusqlite.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust-embed.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["service"] }
+tower.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+bytes.workspace = true
+tempfile.workspace = true

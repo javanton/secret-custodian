@@ -1,0 +1,21 @@
+[package]
+name = "sg-ca"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sg-core.workspace = true
+rusqlite.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+time.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-rustls.workspace = true
+tempfile.workspace = true
+x509-parser = "0.16"

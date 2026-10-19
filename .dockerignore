@@ -1,0 +1,12 @@
+target
+.git
+.claude
+docs
+scripts
+*.key
+*.db*
+*.sock
+*.pem
+rust-toolchain.toml
+Dockerfile
+docker-compose*.yml

@@ -23,11 +23,11 @@
 - Ninguna ruta de API, CLI ni web devuelve el valor de un secreto guardado. Los valores secretos y los tokens nunca se registran en logs. El audit no guarda query strings.
 - Los valores de secreto no pueden contener CR, LF ni NUL; en `query` se codifican en porcentaje.
 - Las reglas comparan hostname normalizado (minúsculas, sin punto final, sin puerto); no admiten IPs. El path se normaliza y se reenvía normalizado.
-- Inyección sobre HTTP en claro: `403` salvo host `localhost`.
+- Inyección sobre HTTP en claro: nunca; `403` (`plaintext-refused`) sin excepciones. La excepción de loopback de `NetPolicy` solo aplica a peticiones reenviadas por TLS al host exacto `localhost` con regla.
 - CA con name constraints siempre presentes (`invalid` si no hay dominios); `allow-domain` rechaza TLDs y dominios de una etiqueta (salvo `localhost`).
 - CLI por socket Unix `$XDG_RUNTIME_DIR/secret-guardian.sock` con permisos `0600`; los valores de secreto se leen de stdin o de un prompt sin eco, nunca de argumentos.
-- Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host`; cookie `HttpOnly` + `SameSite=Strict`; cabecera anti-CSRF en escrituras; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
-- Rama de trabajo: `feature/phase1-core`. Commits Conventional Commits por tarea. **Altitud de tests:** cada tarea ejecuta solo los tests de su crate; la suite completa corre una única vez en `/ship`.
+- Web: solo `127.0.0.1` salvo `--admin-bind` explícito (con aviso); validación de `Host` y `Origin`; sesión por `Authorization: Bearer` (sin cookies: no se aíslan por puerto en `localhost`), token de login en el fragmento `#t=`; CSP restrictiva sin recursos de terceros; el frontend no usa `innerHTML`.
+- Rama de trabajo: `feature/phase1-core`. Commits Conventional Commits por tarea. **Altitud de tests:** cada tarea ejecuta solo los tests de su crate; la suite completa corre una única vez en `/ship`. En `/ship` se ejecuta además `cargo test --workspace --release -- --include-ignored` (incluye el test exhaustivo de rutas de `policy`, ~40 s).
 
 ## Review Focus
 
@@ -36,8 +36,8 @@ Entradas que la spec implica y que ninguna tarea de "camino feliz" cubriría. Ca
 1. Secreto o plantilla con CR/LF/NUL (inyección de cabeceras): rechazado al guardar y al renderizar. Tareas 2 y 3.
 2. El agente envía por su cuenta la cabecera o el parámetro que el vault inyecta (variantes de mayúsculas, valores duplicados): el valor del agente se descarta. Tarea 8.
 3. Host con mayúsculas, punto final, puerto, forma de IP, o `Host` distinto del destino del `CONNECT`: normalizado o rechazado (`421`), nunca una regla equivocada. Tareas 3 y 8.
-4. Path con `..`, `%2e%2e`, `//`: se normaliza antes de comparar y se envía normalizado; una regla `GET /repos/*` no autoriza `/repos/../admin`. Tareas 3 y 8.
-5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red. Tarea 9.
+4. Path con reglas de path distintas de `*`: **cerrado por construcción**. Se juzgan todas las lecturas `R_d` (decodificación porcentual 0..8 veces) y se exige que NINGUNA contenga un segmento punto (`.`, `..`, `...`, `.. `, `..+`, solo puntos/espacios/tab/`+`) separando por `/`, `\`, `;`, `?` y `#` a la vez; así resolver segmentos punto es la identidad en cualquier modelo de origen y ningún orden de operaciones (decodificar, quitar `;params`, cortar en `?`/`#`, `\` como `/`) puede salir del prefijo. Cada `R_d` debe empezar por el prefijo del patrón decodificado `d` veces (igualdad exacta para patrones sin `*`). Lo no juzgable falla cerrado con `403` (solo `*` lo admite): `%` mal formado en el path crudo, `%uXXXX`, UTF-8 inválido, NUL/controles C0/DEL, confusables Unicode de `.`/`/`/`\`, espacios y caracteres invisibles no ASCII (NBSP, U+200B, U+FF1F, U+FE68...), más de 8 capas, más de 8 KiB. Los patrones que podrían ensancharse a sí mismos se rechazan al crear la regla. Una regla `GET /repos/*` no autoriza `/repos/../admin`, `/repos/..%2fadmin` ni `/repos/a%2F..%2Fb` (los `..`/`%2e%2e` simples los resuelve `normalize_path` antes de juzgar), pero sí `/repos/a%2Fb`. `/repos/a\..%3B\k/../admin` NO es un `403`: `normalize_path` lo reduce a `/repos/admin`, que cae dentro del prefijo y se reenvía normalizado. Una regla más específica con método excluido da `403` (no cae a una más amplia del mismo destino; otro destino, p. ej. un parámetro de query, sí puede aportar). Tareas 3 y 8.
+5. Petición `http://` en claro a un host con reglas: no se envía el secreto por la red, ni siquiera a `localhost` (un agente podría abrir su propio listener). Tarea 9.
 
 ---
 
@@ -111,7 +111,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 argon2 = "0.5"
 rand = "0.8"
 zeroize = "1"
@@ -204,7 +204,7 @@ git add -A && git commit -m "chore: scaffold cargo workspace for phase 1"
   - `pub fn kek_from_base64(s: &str) -> Result<Key32, CoreError>`
   - `pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8>` (formato `nonce(12) || ciphertext+tag`)
   - `pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, CoreError>`
-  - `pub enum CoreError { WrongKey, KeySourceMismatch, InvalidKey, InvalidSecretValue(&'static str), InvalidName(&'static str), NotFound, AlreadyExists, InUse, Crypto, Db(rusqlite::Error), Io(std::io::Error) }`
+  - `pub enum CoreError { WrongKey, KeySourceMismatch, UnsupportedSchema { found: i64, supported: i64 }, InvalidKey, InvalidSecretValue(&'static str), InvalidName(&'static str), NotFound, AlreadyExists, InUse, Crypto, Db(rusqlite::Error), Io(std::io::Error) }`
 
 - [ ] **Step 1: Escribir los tests que fallan** (en `crypto.rs`, módulo `tests`)
 
@@ -282,6 +282,8 @@ pub enum CoreError {
     WrongKey,
     #[error("the vault was created with a different key source")]
     KeySourceMismatch,
+    #[error("database schema version {found} is not supported by this build (supports {supported})")]
+    UnsupportedSchema { found: i64, supported: i64 },
     #[error("invalid key material")]
     InvalidKey,
     #[error("invalid secret value: {0}")]
@@ -308,7 +310,7 @@ pub enum CoreError {
 use crate::error::CoreError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -330,9 +332,15 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+/// Explicit Argon2id cost parameters: a future crate default change must never alter existing vaults.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(19 * 1024, 2, 1, Some(KEY_LEN)).expect("valid argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 pub fn kek_from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Result<Key32, CoreError> {
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    Argon2::default()
+    argon2id()
         .hash_password_into(passphrase.as_bytes(), salt, &mut *out)
         .map_err(|_| CoreError::Crypto)?;
     Ok(out)
@@ -570,13 +578,21 @@ CREATE TABLE ca (
 use crate::crypto::{self, Key32};
 use crate::error::CoreError;
 use crate::schema::{SCHEMA, SCHEMA_VERSION};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
 const DEK_AAD: &[u8] = b"sg:dek";
+
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(p);
+    }
+}
 
 fn meta_get(conn: &Connection, key: &str) -> Result<Vec<u8>, CoreError> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -596,7 +612,25 @@ pub struct Vault {
 
 impl Vault {
     pub fn init(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
+        Self::init_with(path, key, |_| Ok(()))
+    }
+
+    /// `before_commit` runs inside the init transaction; tests use it to inject a failure.
+    fn init_with(
+        path: &Path,
+        key: KeyInput,
+        before_commit: impl FnOnce(&Connection) -> Result<(), CoreError>,
+    ) -> Result<Self, CoreError> {
         std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        // Any failure after the file exists removes path, path-wal and path-shm.
+        Self::init_created(path, key, before_commit).inspect_err(|_| remove_db_files(path))
+    }
+
+    fn init_created(
+        path: &Path,
+        key: KeyInput,
+        before_commit: impl FnOnce(&Connection) -> Result<(), CoreError>,
+    ) -> Result<Self, CoreError> {
         let (kdf, salt, kek) = match key {
             KeyInput::Raw(k) => ("raw", Vec::new(), k),
             KeyInput::Passphrase(p) => {
@@ -606,21 +640,30 @@ impl Vault {
         };
         let dek = crypto::random_key();
         let wrapped = crypto::seal(&kek, DEK_AAD, &*dek);
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        let mut put = conn.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
-        put.execute(params!["schema_version", SCHEMA_VERSION.to_string().into_bytes()])?;
-        put.execute(params!["kdf", kdf.as_bytes()])?;
-        put.execute(params!["salt", salt])?;
-        put.execute(params!["dek_wrapped", wrapped])?;
-        drop(put);
+        // Schema and meta rows land atomically.
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        {
+            let mut put = tx.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
+            put.execute(params!["schema_version", SCHEMA_VERSION.to_string().into_bytes()])?;
+            put.execute(params!["kdf", kdf.as_bytes()])?;
+            put.execute(params!["salt", salt])?;
+            put.execute(params!["dek_wrapped", wrapped])?;
+        }
+        before_commit(&tx)?;
+        tx.commit()?;
         Ok(Self { conn: Mutex::new(conn), dek })
     }
 
     pub fn open(path: &Path, key: KeyInput) -> Result<Self, CoreError> {
-        let conn = Connection::open(path)?;
+        if !path.try_exists()? {
+            return Err(CoreError::Io(std::io::ErrorKind::NotFound.into()));
+        }
+        // No CREATE flag: opening must never create a file.
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let kdf = meta_get(&conn, "kdf")?;
         let kek = match (kdf.as_slice(), key) {
@@ -634,6 +677,14 @@ impl Vault {
         let wrapped = meta_get(&conn, "dek_wrapped")?;
         let dek_bytes = crypto::open(&kek, DEK_AAD, &wrapped).map_err(|_| CoreError::WrongKey)?;
         let dek: [u8; 32] = dek_bytes.as_slice().try_into().map_err(|_| CoreError::WrongKey)?;
+        // Checked only after the key is verified, so a wrong key never learns the version.
+        let found: i64 = std::str::from_utf8(&meta_get(&conn, "schema_version")?)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or(CoreError::UnsupportedSchema { found: -1, supported: SCHEMA_VERSION })?;
+        if found != SCHEMA_VERSION {
+            return Err(CoreError::UnsupportedSchema { found, supported: SCHEMA_VERSION });
+        }
         Ok(Self { conn: Mutex::new(conn), dek: Zeroizing::new(dek) })
     }
 
@@ -642,7 +693,9 @@ impl Vault {
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("vault mutex poisoned")
+        // Recover from poisoning: rusqlite rolls back any open transaction when it is dropped
+        // during unwinding, so a panic cannot leave a half-applied write behind.
+        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn seal_value(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -699,6 +752,31 @@ fn row_meta(r: &rusqlite::Row) -> rusqlite::Result<SecretMeta> {
     Ok(SecretMeta { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, rotated_at: r.get(3)? })
 }
 
+fn lookup(conn: &Connection, name: &str) -> Result<SecretMeta, CoreError> {
+    conn.query_row("SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1", [name], row_meta)
+        .optional()?
+        .ok_or(CoreError::NotFound)
+}
+
+/// UPDATE/DELETE by id map "0 rows affected" to `NotFound`.
+fn update_value(conn: &Connection, id: i64, blob: &[u8], ts: i64) -> Result<(), CoreError> {
+    let n = conn.execute(
+        "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
+        params![blob, ts, id],
+    )?;
+    if n == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
+fn delete_by_id(conn: &Connection, id: i64) -> Result<(), CoreError> {
+    if conn.execute("DELETE FROM secrets WHERE id = ?1", [id])? == 0 {
+        return Err(CoreError::NotFound);
+    }
+    Ok(())
+}
+
 impl Vault {
     pub fn add_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_name(name)?;
@@ -719,24 +797,22 @@ impl Vault {
 
     pub fn rotate_secret(&self, name: &str, value: &str) -> Result<SecretMeta, CoreError> {
         validate_secret_value(value)?;
-        let meta = self.get_secret_meta(name)?;
+        // One guard for lookup and write so the row cannot vanish in between.
+        let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let ts = now();
-        self.conn().execute(
-            "UPDATE secrets SET value_enc = ?1, rotated_at = ?2 WHERE id = ?3",
-            params![self.seal_value(&aad(meta.id), value.as_bytes()), ts, meta.id],
-        )?;
+        update_value(&conn, meta.id, &self.seal_value(&aad(meta.id), value.as_bytes()), ts)?;
         Ok(SecretMeta { rotated_at: Some(ts), ..meta })
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<(), CoreError> {
-        let meta = self.get_secret_meta(name)?;
         let conn = self.conn();
+        let meta = lookup(&conn, name)?;
         let used: i64 = conn.query_row("SELECT COUNT(*) FROM rules WHERE secret_id = ?1", [meta.id], |r| r.get(0))?;
         if used > 0 {
             return Err(CoreError::InUse);
         }
-        conn.execute("DELETE FROM secrets WHERE id = ?1", [meta.id])?;
-        Ok(())
+        delete_by_id(&conn, meta.id)
     }
 
     pub fn list_secrets(&self) -> Result<Vec<SecretMeta>, CoreError> {
@@ -747,10 +823,7 @@ impl Vault {
     }
 
     pub fn get_secret_meta(&self, name: &str) -> Result<SecretMeta, CoreError> {
-        self.conn()
-            .query_row("SELECT id, name, created_at, rotated_at FROM secrets WHERE name = ?1", [name], row_meta)
-            .optional()?
-            .ok_or(CoreError::NotFound)
+        lookup(&self.conn(), name)
     }
 
     /// Decrypts a secret for injection. ONLY the proxy may call this; no admin API, CLI or web path may.
@@ -767,22 +840,44 @@ impl Vault {
 }
 ```
 
+Tests añadidos tras la revisión (en el código): `init` fallido limpia ficheros y permite reintento (`vault::tests`), 0-filas => `NotFound` (`secrets::tests`), `paths::tests` con variables vacías, y en `tests/vault.rs` rotate con CR/LF/NUL/vacío, raw-vault con passphrase, límite 8192/8193 y modo 0600 de `-wal`/`-shm`.
+
 `paths.rs`:
 ```rust
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn default_data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(d).join("secret-guardian");
+/// Absolute fallback when neither XDG_DATA_HOME nor HOME gives an absolute path.
+const FALLBACK_DIR: &str = "/tmp/secret-guardian";
+
+fn absolute(v: Option<OsString>) -> Option<PathBuf> {
+    v.map(PathBuf::from).filter(|p| p.is_absolute())
+}
+
+fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(d) = absolute(xdg_data_home) {
+        return d.join("secret-guardian");
     }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/secret-guardian")
+    if let Some(h) = absolute(home) {
+        return h.join(".local/share/secret-guardian");
+    }
+    PathBuf::from(FALLBACK_DIR)
+}
+
+fn socket_from(xdg_runtime_dir: Option<OsString>, data_dir: PathBuf) -> PathBuf {
+    match absolute(xdg_runtime_dir) {
+        Some(d) => d.join("secret-guardian.sock"),
+        None => data_dir.join("sg.sock"),
+    }
+}
+
+/// Always absolute: empty/relative env vars are ignored.
+pub fn default_data_dir() -> PathBuf {
+    data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
 pub fn default_socket() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) => PathBuf::from(d).join("secret-guardian.sock"),
-        None => default_data_dir().join("sg.sock"),
-    }
+    socket_from(std::env::var_os("XDG_RUNTIME_DIR"), default_data_dir())
 }
 ```
 
@@ -1173,7 +1268,7 @@ fn decode_unreserved(segment: &str) -> String {
     out
 }
 
-/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded.
+/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded (forma reenviada). Para comparar reglas con path se usa `judge_readings` (más abajo), nunca la forma reenviada.
 pub fn normalize_path(path: &str) -> String {
     let mut segs: Vec<String> = Vec::new();
     for raw in path.split('/') {
@@ -1191,10 +1286,161 @@ pub fn normalize_path(path: &str) -> String {
     }
     out
 }
+
+const MAX_DECODE_ROUNDS: usize = 8;
+
+/// One percent-decoding round. `first` is the round applied to the raw path: there a `%` that is
+/// not followed by two hex digits makes the path unjudgeable. Later rounds only see `%` that
+/// earlier decoding produced (e.g. `%25` -> `%`), which stay literal, except `%u`/`%U` (the
+/// IIS-style `%uXXXX` escape some origins honour), which is never judgeable.
+fn decode_round(input: &str, first: bool) -> Option<String> {
+    let b = input.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            match (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+                _ => {
+                    if first || matches!(b.get(i + 1), Some(b'u' | b'U')) {
+                        return None;
+                    }
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    let text = String::from_utf8(out).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text)
+}
+
+/// `[P, decode(P), decode(decode(P)), ...]` until the string stops changing. `None` when the path
+/// cannot be judged safely: malformed `%`, NUL, invalid UTF-8, or more than 8 decoding layers.
+pub(crate) fn decode_chain(p: &str) -> Option<Vec<String>> {
+    if p.contains('\0') {
+        return None;
+    }
+    let mut chain = vec![p.to_string()];
+    for round in 0..=MAX_DECODE_ROUNDS {
+        let next = decode_round(chain.last().expect("chain is never empty"), round == 0)?;
+        if &next == chain.last().expect("chain is never empty") {
+            return Some(chain);
+        }
+        if round == MAX_DECODE_ROUNDS {
+            return None;
+        }
+        chain.push(next);
+    }
+    None
+}
+
+/// Longest path (bytes) a restricted rule will judge; anything longer is unjudgeable.
+pub(crate) const MAX_JUDGED_PATH_LEN: usize = 8192;
+
+/// Code points that some origin may fold, normalize or trim into `.`, `/`, `\`, `?`, `#`, a
+/// space, or nothing (NFKC/NFKD look-alikes, invisible and format characters).
+fn is_forbidden_unicode(c: char) -> bool {
+    matches!(c,
+        '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{037E}' | '\u{1680}' | '\u{180E}'
+        | '\u{2000}'..='\u{200F}'
+        | '\u{2024}'..='\u{2026}'
+        | '\u{2028}'..='\u{202F}'
+        | '\u{2044}'
+        | '\u{2047}'..='\u{2049}'
+        | '\u{205F}'..='\u{2064}'
+        | '\u{2215}' | '\u{2216}' | '\u{29F8}' | '\u{3000}'
+        | '\u{FE50}'..='\u{FE6B}'
+        | '\u{FEFF}'
+        | '\u{FF01}'..='\u{FF65}')
+}
+
+/// Control characters (C0, DEL), separator/dot look-alikes and non-ASCII whitespace: never
+/// judgeable. Ordinary non-ASCII letters (accents, CJK, emoji) are fine.
+fn has_forbidden_char(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_ascii_control() || is_forbidden_unicode(c) || (!c.is_ascii() && c.is_whitespace())
+    })
+}
+
+/// A segment such as `.`, `..`, `...`, `.. `, `..+`: non-empty, has a `.`, only dots, spaces,
+/// tabs and `+` (form-style space).
+fn is_dot_like(seg: &str) -> bool {
+    seg.contains('.') && seg.chars().all(|c| matches!(c, '.' | ' ' | '\t' | '+'))
+}
+
+/// True when any segment is dot-like under EVERY separator model at once (`/ \ ; ? #`), so that
+/// resolving dot segments is the identity however an origin splits the path.
+fn has_dot_segment(s: &str) -> bool {
+    s.split(['/', '\\', ';', '?', '#']).any(is_dot_like)
+}
+
+/// Every reading `R_0..R_n` (percent-decoded 0..n times, until stable) of a path, used ONLY for
+/// matching a restricted rule (the proxy forwards `normalize_path`). `None` means the path
+/// cannot be judged: too long, undecodable, or some reading holds a control character, a
+/// confusable, or a dot segment under any separator model. When this returns `Some`, there is
+/// nothing to resolve, so no ordering of origin operations (decode, `;` strip, `?`/`#` cut,
+/// `\` mapping, dot resolution) can move the request out of a prefix.
+pub(crate) fn judge_readings(p: &str) -> Option<Vec<String>> {
+    if p.len() > MAX_JUDGED_PATH_LEN {
+        return None;
+    }
+    let chain = decode_chain(p)?;
+    if chain
+        .iter()
+        .any(|c| has_forbidden_char(c) || has_dot_segment(c))
+    {
+        return None;
+    }
+    Some(chain)
+}
+
+/// True when any segment ends with `.` or a space (Windows-style trimming drops them).
+fn has_trimmable_segment(s: &str) -> bool {
+    s.split(['/', '\\', ';', '?', '#'])
+        .any(|seg| seg.ends_with(['.', ' ']))
+}
+
+/// Pattern prefix/body readings: decoded until stable (same cap as paths).
+pub(crate) fn pattern_readings(body: &str) -> Option<Vec<String>> {
+    decode_chain(body)
+}
+
+/// True when a path PATTERN could widen itself: at any decoding depth its text contains `;`,
+/// `\`, `?`, `#`, NUL or any control character, a forbidden Unicode character, a dot segment
+/// (under any separator model), a segment ending in `.` or a space (origins that trim those
+/// would reinterpret the prefix), or it cannot be decoded safely or is too long.
+pub(crate) fn pattern_is_self_widening(body: &str) -> bool {
+    if body.len() > MAX_JUDGED_PATH_LEN {
+        return true;
+    }
+    let Some(chain) = decode_chain(body) else {
+        return true;
+    };
+    chain.iter().any(|c| {
+        c.contains([';', '\\', '?', '#'])
+            || has_forbidden_char(c)
+            || has_dot_segment(c)
+            || has_trimmable_segment(c)
+    })
+}
 ```
 `matcher.rs` (encima de los tests):
 ```rust
 use crate::model::{InjectionKind, Rule};
+use crate::normalize::{judge_readings, pattern_readings};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 pub enum Decision<'a> {
@@ -1217,18 +1463,50 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+/// Path matching, closed by construction. `readings` are the judged readings `R_0..R_n` of the
+/// request path (`judge_readings`; `None` = unjudgeable, never matches a restricted rule). They
+/// contain no dot segment under any separator model, so there is nothing for an origin to
+/// resolve. A prefix pattern then needs `R_d` to start with the pattern prefix decoded `d` times
+/// (its fixed point past its own chain), an exact pattern needs equality at every depth. `*`
+/// matches everything.
+fn path_matches(pattern: &str, readings: Option<&[String]>) -> bool {
     if pattern == "*" {
         return true;
     }
-    match pattern.strip_suffix('*') {
-        Some(prefix) => path.starts_with(prefix),
-        None => pattern == path,
-    }
+    let Some(readings) = readings else {
+        return false;
+    };
+    let (body, prefix) = match pattern.strip_suffix('*') {
+        Some(p) => (p, true),
+        None => (pattern, false),
+    };
+    let Some(pat) = pattern_readings(body) else {
+        return false;
+    };
+    let depths = readings.len().max(pat.len());
+    (0..depths).all(|d| {
+        let got = &readings[d.min(readings.len() - 1)];
+        let want = &pat[d.min(pat.len() - 1)];
+        if prefix {
+            got.starts_with(want.as_str())
+        } else {
+            got == want
+        }
+    })
 }
 
-fn specificity(r: &Rule, host: &str) -> (u8, usize) {
-    (u8::from(r.host_pattern == host), r.path_pattern.len())
+/// (exact host, wildcard suffix length, exact path, path pattern length): higher wins.
+fn specificity(r: &Rule, host: &str) -> (bool, usize, bool, usize) {
+    (
+        r.host_pattern == host,
+        if r.host_pattern.starts_with("*.") {
+            r.host_pattern.len()
+        } else {
+            0
+        },
+        !r.path_pattern.ends_with('*'),
+        r.path_pattern.len(),
+    )
 }
 
 pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
@@ -1236,28 +1514,46 @@ pub fn has_rules_for_host(rules: &[Rule], host: &str) -> bool {
 }
 
 pub fn evaluate<'a>(rules: &'a [Rule], host: &str, method: &str, path: &str) -> Decision<'a> {
-    let for_host: Vec<&Rule> = rules.iter().filter(|r| host_matches(&r.host_pattern, host)).collect();
-    if for_host.is_empty() {
+    if !has_rules_for_host(rules, host) {
         return Decision::NoRuleForHost;
     }
-    let mut best: HashMap<(InjectionKind, String), &Rule> = HashMap::new();
-    for r in for_host {
-        let method_ok = r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method));
-        if !method_ok || !path_matches(&r.path_pattern, path) {
-            continue;
-        }
-        let key = (r.kind, r.target_name.to_ascii_lowercase());
-        match best.get(&key) {
-            Some(cur) if specificity(cur, host) >= specificity(r, host) => {}
-            _ => { best.insert(key, r); }
+    // Judged lazily and once per call, only if a host-matching rule is path-restricted.
+    let judged: OnceCell<Option<Vec<String>>> = OnceCell::new();
+    // Candidates match host and path; methods are applied only AFTER the
+    // specificity comparison so a narrower rule is never shadowed by a broader one.
+    let mut groups: HashMap<(InjectionKind, String), Vec<&Rule>> = HashMap::new();
+    for r in rules {
+        if host_matches(&r.host_pattern, host)
+            && (r.path_pattern == "*"
+                || path_matches(&r.path_pattern, judged.get_or_init(|| judge_readings(path)).as_deref()))
+        {
+            groups
+                .entry((r.kind, r.target_name.to_ascii_lowercase()))
+                .or_default()
+                .push(r);
         }
     }
-    if best.is_empty() {
+    let mut chosen: Vec<&Rule> = Vec::new();
+    for cands in groups.values() {
+        let Some(top) = cands.iter().map(|r| specificity(r, host)).max() else {
+            continue;
+        };
+        let winner = cands
+            .iter()
+            .filter(|r| specificity(r, host) == top)
+            .filter(|r| {
+                r.methods.is_empty() || r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+            })
+            .min_by_key(|r| r.id);
+        if let Some(r) = winner {
+            chosen.push(r);
+        }
+    }
+    if chosen.is_empty() {
         return Decision::Forbidden;
     }
-    let mut v: Vec<&Rule> = best.into_values().collect();
-    v.sort_by_key(|r| r.id);
-    Decision::Inject(v)
+    chosen.sort_by_key(|r| r.id);
+    Decision::Inject(chosen)
 }
 ```
 `render.rs` (encima de los tests):
@@ -1282,7 +1578,7 @@ Nota: `NON_ALPHANUMERIC` codifica también `-._~`; es seguro y aceptable (el des
 `store.rs`:
 ```rust
 use crate::model::*;
-use crate::normalize::is_ip_literal;
+use crate::normalize::{is_ip_literal, pattern_is_self_widening};
 use rusqlite::{params, OptionalExtension};
 use sg_core::Vault;
 
@@ -1300,8 +1596,9 @@ fn validate(v: &Vault, r: &NewRule) -> Result<(), PolicyError> {
     if !valid_host_pattern(&r.host_pattern) {
         return Err(PolicyError::Invalid("host_pattern must be a lowercase hostname or *.hostname (no IPs)"));
     }
-    if !(r.path_pattern == "*" || r.path_pattern.starts_with('/')) {
-        return Err(PolicyError::Invalid("path_pattern must be * or start with /"));
+    // `*`, o path normalizado con `*` final opcional que no pueda ensancharse a sí mismo (ver `valid_path_pattern` en el código: hex en mayúsculas, sin `;?#\`, sin segmentos punto ni confusables ni segmentos que terminen en `.` o espacio en ninguna profundidad).
+    if !(r.path_pattern == "*" || (r.path_pattern.starts_with('/') && !pattern_is_self_widening(r.path_pattern.strip_suffix('*').unwrap_or(&r.path_pattern)))) {
+        return Err(PolicyError::Invalid("path_pattern must be * or a normalized path starting with / (optional trailing *)"));
     }
     if r.methods.iter().any(|m| m.is_empty() || !m.bytes().all(|b| b.is_ascii_alphabetic())) {
         return Err(PolicyError::Invalid("methods must be alphabetic HTTP methods"));
@@ -1447,7 +1744,7 @@ git add -A && git commit -m "feat(policy): add roles, rules, matching and normal
   - `struct TokenService` con `new(Arc<Vault>) -> Result<Self, AuthError>`, `issue(&self, machine: &str, role: &str, ttl: Option<Duration>) -> Result<IssuedToken, AuthError>`, `revoke(&self, jti: &str) -> Result<(), AuthError>`, `revoke_machine(&self, machine: &str) -> Result<usize, AuthError>`, `list(&self) -> Result<Vec<TokenMeta>, AuthError>`; `impl TokenVerifier for TokenService`
   - `struct IssuedToken { token: String, jti: String }`, `struct TokenMeta { jti, machine, role, created_at, expires_at: Option<i64>, revoked_at: Option<i64> }` (`Serialize`)
   - `fn extract_proxy_token(header: &str) -> Option<String>`
-  - `enum AuthError { Invalid, Expired, Revoked, Core(CoreError), Db(rusqlite::Error) }`
+  - `enum AuthError { Invalid, Expired, Revoked, InvalidTtl, Core(CoreError), Db(rusqlite::Error) }`
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -1619,6 +1916,8 @@ pub enum AuthError {
     Expired,
     #[error("token revoked")]
     Revoked,
+    #[error("ttl out of range")]
+    InvalidTtl,
     #[error(transparent)]
     Core(#[from] CoreError),
     #[error("database error: {0}")]
@@ -2000,18 +2299,27 @@ fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "Secret Guardian CA");
     p.distinguished_name = dn;
+    // serial aleatorio positivo de 16 bytes (las reemisiones no deben repetir emisor+serie)
+    let mut serial: [u8; 16] = sg_core::crypto::random_bytes();
+    serial[0] &= 0x7f;
+    p.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let names: Vec<String> = if domains.is_empty() { vec![PLACEHOLDER_TLD.into()] } else { domains.to_vec() };
     p.name_constraints = Some(NameConstraints {
         permitted_subtrees: names.into_iter().map(GeneralSubtree::DnsName).collect(),
-        excluded_subtrees: vec![],
+        // las restricciones DNS no limitan los SAN IP: se excluyen todas las IP
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(rcgen::CidrSubnet::V4([0; 4], [0; 4])),
+            GeneralSubtree::IpAddress(rcgen::CidrSubnet::V6([0; 16], [0; 16])),
+        ],
     });
     p.not_before = OffsetDateTime::now_utc() - TDuration::days(1);
     p.not_after = OffsetDateTime::now_utc() + TDuration::days(3650);
     Ok(p)
 }
 
+// Además de lo siguiente: etiquetas de 1..=63 sin `-` inicial/final, longitud <= 253 y última etiqueta no numérica (reglas de webpki).
 fn validate_domain(d: &str) -> Result<(), CaError> {
     let ok_chars = d.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
     if d.is_empty() || !ok_chars || d.starts_with('.') || d.ends_with('.') || d.contains("..") {
@@ -2071,7 +2379,11 @@ impl CaService {
     }
 
     /// Re-issues the CA certificate with the same key and a wider permitted set. Agents must reload the certificate.
+    /// Recorta y pasa a minúsculas; no consulta la Public Suffix List. Antes de persistir, una sonda
+    /// (hoja `probe.<dominio>` verificada contra el nuevo certificado) debe pasar para todos los dominios.
     pub fn allow_domain(&self, domain: &str) -> Result<(), CaError> {
+        let domain = domain.trim().to_ascii_lowercase();
+        let domain = domain.as_str();
         validate_domain(domain)?;
         let mut st = self.state.lock().unwrap();
         if st.domains.iter().any(|d| d == domain) {
@@ -2299,8 +2611,8 @@ git add -A && git commit -m "feat(core): add audit log without query strings"
 - Consumes: `sg_core::{Vault, audit::AuditEntry}`, `sg_policy::{get_role, list_rules, has_rules_for_host, normalize_host, Unmatched}`, `sg_auth::{TokenVerifier, extract_proxy_token, Identity}`, `sg_ca::CaService`.
 - Produces:
   - `struct ProxyState { vault: Arc<Vault>, verifier: Arc<dyn TokenVerifier>, ca: Arc<CaService>, upstream: UpstreamConfig }`
-  - `struct UpstreamConfig { tls: Arc<rustls::ClientConfig>, resolve_override: HashMap<String, SocketAddr> }` con `UpstreamConfig::new(extra_roots: Vec<CertificateDer<'static>>) -> Self`
-  - `async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> std::io::Result<()>`
+  - `struct UpstreamConfig { tls, resolve_override: HashMap<String, SocketAddr>, connect_timeout, response_header_timeout (120 s por defecto; cubre también subidas lentas si el origen espera el cuerpo completo), net_policy: NetPolicy, max_upstream_connections (256) }`; se construye con `UpstreamConfig::new(extra_roots: Vec<CertificateDer<'static>>) -> Self` y se ajusta por campos. `NetPolicy { allow_loopback, allow_link_local, allow_unspecified, denied: Vec<SocketAddr> }` (por defecto todo `false`/vacío; multicast, broadcast y `denied` siempre se rechazan; el destino se resuelve una vez y se conecta a la dirección ya validada)
+  - `async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> std::io::Result<()>` y `serve_with(listener, state, ServeOptions)`, con `ServeOptions { max_connections, header_read_timeout, tunnel_idle_timeout (10 min), tunnel_max_lifetime (8 h) }`. El permiso de conexión vive mientras viva el túnel.
   - Helpers de test en `tests/common`: `Env::new(upstream_host) -> Env`, `Env::token(role) -> String`, `Env::proxy_addr`, `raw_connect(addr, authority, proxy_auth: Option<&str>) -> String` (devuelve la línea de estado).
 
 - [ ] **Step 1: Escribir `tests/common/mod.rs` y los tests que fallan**
@@ -3045,7 +3357,7 @@ async fn disallowed_method_is_403_and_never_reaches_upstream() {
 async fn path_traversal_cannot_escape_a_restricted_rule() {
     let (env, up, t) = setup(&["GET"], "/repos/*").await;
     assert_eq!(proxy_request(&env, &t, HOST, "GET", "/repos/ok", &[], vec![], false).await.status, 200);
-    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/other"] {
+    for p in ["/repos/../admin", "/repos/%2e%2e/admin", "/repos/..%2fadmin", "/repos/..;/admin", "/repos/%252e%252e%252fadmin", "/repos/x%252F..%252F..%252Frepos%252Fz%252Fw%2F..%2F..%2Fadmin", "/repos/..;%2Frepos%2Fx/..;/admin", "/repos/..%2F..%2Fadmin%3F%2F..%2F..%2Frepos%2Fy", "/repos/%u002e%u002e/admin", "/repos/a;%2Fk/..%3B/..%3B/admin", "/repos/..%20/admin", "/repos/.../admin", "/repos/%E2%80%A5/admin", "/repos/%EF%BC%8E%EF%BC%8E/admin", "/repos/a%09b", "/repos/a%0Ab", "/other"] {
         assert_eq!(proxy_request(&env, &t, HOST, "GET", p, &[], vec![], false).await.status, 403, "{p}");
     }
     assert_eq!(up.received.lock().unwrap().len(), 1);
@@ -3194,7 +3506,7 @@ pub async fn forward(req: Request<Incoming>, ctx: &Ctx) -> Response<ProxyBody> {
     let rules = list_rules(&st.vault, Some(&id.role)).unwrap_or_default();
     let (matched, rule_id) = match evaluate(&rules, &ctx.host, &method, &path) {
         Decision::Inject(m) => {
-            if !ctx.tls && ctx.host != "localhost" {
+            if !ctx.tls {
                 audit(st, id, &ctx.host, &method, &raw_target, "plaintext-refused", Some(403), None);
                 return text(StatusCode::FORBIDDEN, "refusing to inject credentials over plain HTTP\n");
             }
@@ -3287,7 +3599,7 @@ git add -A && git commit -m "feat(proxy): terminate TLS and inject credentials p
 
 **Interfaces:**
 - Consumes: `forward::{forward, Ctx}`.
-- Produces: soporte de `GET http://host/path` a través del proxy, con política por rol y rechazo de inyección sin TLS (excepto `localhost`).
+- Produces: soporte de `GET http://host/path` a través del proxy, con política por rol y rechazo de inyección sin TLS (sin excepciones: ni `localhost`).
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -3332,7 +3644,7 @@ async fn plain_http_to_a_host_with_rules_never_gets_the_secret() {
 }
 
 #[tokio::test]
-async fn plain_http_to_localhost_with_a_rule_is_allowed() {
+async fn plain_http_to_localhost_with_a_rule_is_refused_never_injected() {
     let up = spawn_plain_upstream().await;
     let mut cfg = no_extra_roots();
     cfg.resolve_override.insert("localhost".into(), up.addr);
@@ -3345,8 +3657,9 @@ async fn plain_http_to_localhost_with_a_rule_is_allowed() {
     }).unwrap();
     let t = env.token("m", "developer");
     let raw = plain_get(&env, &t, "http://localhost/ping", "localhost").await;
-    assert!(status(&raw).contains("200"), "{raw}");
-    assert_eq!(up.header(0, "x-api-key"), vec!["LOCAL-SECRET".to_string()]);
+    // No plaintext exception: an agent could run its own listener on any port of `localhost`.
+    assert!(status(&raw).contains("403"), "{raw}");
+    assert!(up.received.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -3448,11 +3761,13 @@ git add -A && git commit -m "feat(proxy): handle plain http requests and refuse 
 **Interfaces:**
 - Consumes: `sg_core::Vault`, `sg_policy::*`, `sg_auth::TokenService`, `sg_ca::CaService`.
 - Produces:
-  - `struct AppState { vault: Arc<Vault>, tokens: Arc<TokenService>, ca: Arc<CaService>, sessions: Arc<Sessions>, allowed_hosts: Vec<String> }` (`Clone`)
-  - `fn api_router(state: AppState) -> Router` (sin guarda; para el socket Unix)
-  - `fn web_router(state: AppState) -> Router` (guarda de `Host`, `/login`, `/api` con sesión + CSRF, estáticos con CSP)
-  - `struct Sessions` con `new() -> Self`, `new_login_token(&self) -> String`, `exchange(&self, token: &str) -> Option<String>`, `is_valid(&self, session: &str) -> bool`
-  - `async fn serve_unix(path: &Path, state: AppState) -> io::Result<()>`, `async fn serve_web(addr: SocketAddr, state: AppState) -> io::Result<()>`
+  - `struct AppState { vault: Arc<Vault>, tokens: Arc<TokenService>, ca: Arc<CaService>, sessions: Arc<Sessions>, allowed_hosts: Vec<String>, web_base_url: Option<String> }` (`Clone`)
+  - `fn api_router(state: AppState) -> Router` (sin guarda; no se sirve por HTTP)
+  - `fn socket_router(state: AppState) -> Router` (`api_router` + `POST /admin/login-token` -> `{token, url?}`; solo para el socket Unix)
+  - `fn web_router(state: AppState) -> Router` (guarda de `Host`, `POST /login`, `/api` con `Authorization: Bearer` + `Origin`, estáticos con CSP; sin cookies ni `GET /login`)
+  - `struct AdminServeOptions { max_connections: 256, header_read_timeout: 10 s, max_connection_lifetime: 1 h }` (`Default`)
+  - `struct Sessions` con `new() -> Self`, `with_limits(ttl, max_sessions, max_login_tokens, login_ttl)` (tokens y sesiones guardados como SHA-256; tokens de login caducan a los 10 min), `new_login_token(&self) -> String`, `exchange(&self, token: &str) -> Option<String>`, `is_valid(&self, session: &str) -> bool`
+  - `async fn serve_unix(path, state)`, `serve_unix_with(path, state, opts)`, `serve_web(listener, state)`, `serve_web_with(listener, state, opts)` (hyper directo con timeout de cabeceras, vida máxima y tope de conexiones con `Semaphore` adquirido antes de `accept`); `bind_unix` exige directorio padre y socket propiedad del usuario actual y padre `0700`
   - Rutas JSON: `GET|POST /secrets`, `GET|PUT|DELETE /secrets/{name}`, `GET|POST /roles`, `DELETE /roles/{name}`, `GET|POST /rules`, `DELETE /rules/{id}`, `GET|POST /tokens`, `DELETE /tokens/{jti}`, `POST /machines/{machine}/revoke`, `GET /ca`, `GET /ca/cert`, `POST /ca/domains`, `GET /audit`
 
 - [ ] **Step 1: Escribir los tests que fallan**
@@ -3578,59 +3893,75 @@ fn app() -> (tempfile::TempDir, Router, Arc<Sessions>) {
         tokens: Arc::new(TokenService::new(vault.clone()).unwrap()),
         ca: Arc::new(CaService::init_or_load(vault.clone()).unwrap()),
         vault, sessions: sessions.clone(), allowed_hosts: vec!["localhost:9090".into(), "127.0.0.1:9090".into()],
+        web_base_url: Some("http://localhost:9090".into()),
     };
     (dir, web_router(state), sessions)
 }
 
-fn req(method: &str, uri: &str, host: &str, cookie: Option<&str>, csrf: bool) -> Request<Body> {
+fn req(method: &str, uri: &str, host: &str, bearer: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method(method).uri(uri).header(header::HOST, host);
-    if let Some(c) = cookie { b = b.header(header::COOKIE, format!("sg_session={c}")); }
-    if csrf { b = b.header("x-sg-csrf", "1"); }
+    if let Some(c) = bearer { b = b.header(header::AUTHORIZATION, format!("Bearer {c}")); }
     b.body(Body::empty()).unwrap()
+}
+
+fn login_req(token: &str) -> Request<Body> {
+    Request::builder().method("POST").uri("/login").header(header::HOST, "localhost:9090")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"token":"{token}"}}"#))).unwrap()
 }
 
 #[tokio::test]
 async fn wrong_host_header_is_rejected_everywhere() {
     let (_d, app, _s) = app();
-    for uri in ["/", "/login?t=x", "/api/secrets"] {
-        let r = app.clone().oneshot(req("GET", uri, "evil.com", None, false)).await.unwrap();
+    for uri in ["/", "/login", "/api/secrets"] {
+        let r = app.clone().oneshot(req("GET", uri, "evil.com", None)).await.unwrap();
         assert_eq!(r.status(), StatusCode::MISDIRECTED_REQUEST, "{uri}");
     }
 }
 
 #[tokio::test]
-async fn api_requires_a_session() {
-    let (_d, app, _s) = app();
-    let r = app.oneshot(req("GET", "/api/secrets", "localhost:9090", None, false)).await.unwrap();
+async fn api_requires_a_bearer_session_and_ignores_cookies() {
+    let (_d, app, sessions) = app();
+    let r = app.clone().oneshot(req("GET", "/api/secrets", "localhost:9090", None)).await.unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let sid = sessions.exchange(&sessions.new_login_token()).unwrap();
+    let mut stolen = req("GET", "/api/secrets", "localhost:9090", None);
+    stolen.headers_mut().insert(header::COOKIE, format!("sg_session={sid}").parse().unwrap());
+    assert_eq!(app.oneshot(stolen).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn login_token_is_single_use_and_sets_a_strict_cookie() {
+async fn login_token_is_single_use_and_returns_a_no_store_session() {
     let (_d, app, sessions) = app();
     let t = sessions.new_login_token();
-    let r = app.clone().oneshot(req("GET", &format!("/login?t={t}"), "localhost:9090", None, false)).await.unwrap();
-    assert_eq!(r.status(), StatusCode::SEE_OTHER);
-    let cookie = r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
-    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
-    let again = app.oneshot(req("GET", &format!("/login?t={t}"), "localhost:9090", None, false)).await.unwrap();
+    let r = app.clone().oneshot(login_req(&t)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+    let body = r.into_body().collect().await.unwrap().to_bytes();
+    let sid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session"].as_str().unwrap().to_string();
+    assert_eq!(sid.len(), 64);
+    let ok = app.clone().oneshot(req("GET", "/api/secrets", "localhost:9090", Some(&sid))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let again = app.clone().oneshot(login_req(&t)).await.unwrap();
     assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    // GET /login no longer exists
+    let get = app.oneshot(req("GET", "/login", "localhost:9090", None)).await.unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn writes_need_the_csrf_header() {
-    let (_d, app, sessions) = app();
-    let s = sessions.exchange(&sessions.new_login_token()).unwrap();
-    let no = app.clone().oneshot(req("POST", "/api/roles", "localhost:9090", Some(&s), false)).await.unwrap();
-    assert_eq!(no.status(), StatusCode::FORBIDDEN);
-    let get = app.oneshot(req("GET", "/api/secrets", "localhost:9090", Some(&s), false)).await.unwrap();
-    assert_eq!(get.status(), StatusCode::OK);
+async fn unauthenticated_writes_get_401_before_415() {
+    let (_d, app, _s) = app();
+    let r = app.oneshot(Request::builder().method("POST").uri("/api/roles").header(header::HOST, "localhost:9090")
+        .header(header::CONTENT_TYPE, "text/plain").body(Body::from("x")).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn static_pages_carry_a_strict_csp() {
     let (_d, app, _s) = app();
-    let r = app.oneshot(req("GET", "/", "localhost:9090", None, false)).await.unwrap();
+    let r = app.oneshot(req("GET", "/", "localhost:9090", None)).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let csp = r.headers().get("content-security-policy").unwrap().to_str().unwrap();
     assert!(csp.contains("default-src 'self'") && csp.contains("frame-ancestors 'none'"));
@@ -3646,43 +3977,39 @@ Expected: FAIL (no compila).
 
 `sessions.rs`:
 ```rust
-use std::{collections::{HashMap, HashSet}, sync::Mutex, time::{Duration, Instant}};
+use sha2::{Digest as _, Sha256};
+use std::{collections::{HashMap, VecDeque}, sync::Mutex, time::{Duration, Instant}};
 
-const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+type Digest = [u8; 32];
 
-#[derive(Default)]
+/// Solo se guardan hashes SHA-256: ningún secreto en claro en memoria y la búsqueda
+/// por hash no depende de cuánto acierte un intento. Tope de 8 tokens y 16 sesiones.
 pub struct Sessions {
-    login: Mutex<HashSet<String>>,
-    active: Mutex<HashMap<String, Instant>>,
+    ttl: Duration,        // sesión: 8 h
+    login_ttl: Duration,  // token de login pendiente: 10 min
+    max_sessions: usize,
+    max_login: usize,
+    login: Mutex<VecDeque<(Digest, Instant)>>,
+    active: Mutex<HashMap<Digest, Instant>>,
 }
 
-fn random_hex() -> String {
-    hex::encode(sg_core::crypto::random_bytes::<32>())
-}
+fn random_hex() -> String { hex::encode(sg_core::crypto::random_bytes::<32>()) }
+fn digest(s: &str) -> Digest { Sha256::digest(s.as_bytes()).into() }
 
 impl Sessions {
-    pub fn new() -> Self { Self::default() }
+    pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+    pub const DEFAULT_LOGIN_TTL: Duration = Duration::from_secs(600);
+    pub fn new() -> Self { Self::with_limits(Self::DEFAULT_SESSION_TTL, 16, 8, Self::DEFAULT_LOGIN_TTL) }
+    pub fn with_limits(ttl: Duration, max_sessions: usize, max_login: usize, login_ttl: Duration) -> Self { /* ... */ }
 
-    pub fn new_login_token(&self) -> String {
-        let t = random_hex();
-        self.login.lock().unwrap().insert(t.clone());
-        t
-    }
+    /// Token de login de 256 bits y un solo uso; al llegar al tope se descarta el más antiguo.
+    pub fn new_login_token(&self) -> String { /* poda caducados, encola digest(t) */ }
 
-    pub fn exchange(&self, token: &str) -> Option<String> {
-        if !self.login.lock().unwrap().remove(token) {
-            return None;
-        }
-        let s = random_hex();
-        self.active.lock().unwrap().insert(s.clone(), Instant::now());
-        Some(s)
-    }
+    /// Consume el token bajo un único lock (de N intentos concurrentes gana exactamente uno)
+    /// y devuelve un id de sesión de 256 bits (hex).
+    pub fn exchange(&self, token: &str) -> Option<String> { /* ... */ }
 
-    pub fn is_valid(&self, session: &str) -> bool {
-        let mut a = self.active.lock().unwrap();
-        a.retain(|_, at| at.elapsed() < SESSION_TTL);
-        a.contains_key(session)
-    }
+    pub fn is_valid(&self, session: &str) -> bool { /* busca digest(session), poda caducadas */ }
 }
 ```
 
@@ -3701,6 +4028,7 @@ pub struct AppState {
     pub ca: Arc<CaService>,
     pub sessions: Arc<Sessions>,
     pub allowed_hosts: Vec<String>,
+    pub web_base_url: Option<String>, // p. ej. http://localhost:9090, para construir la URL de login
 }
 ```
 
@@ -3725,6 +4053,7 @@ impl From<sg_core::CoreError> for ApiError {
             InvalidSecretValue(_) | InvalidName(_) | InvalidKey => StatusCode::BAD_REQUEST,
             NotFound => StatusCode::NOT_FOUND,
             AlreadyExists | InUse => StatusCode::CONFLICT,
+            // includes UnsupportedSchema: internal error by default
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -3748,6 +4077,7 @@ impl From<sg_auth::AuthError> for ApiError {
     fn from(e: sg_auth::AuthError) -> Self {
         match e {
             sg_auth::AuthError::Core(c) => c.into(),
+            sg_auth::AuthError::InvalidTtl => ApiError(StatusCode::BAD_REQUEST, "ttl out of range".into()),
             other => ApiError(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
     }
@@ -3859,6 +4189,9 @@ async fn create_token(State(s): State<AppState>, Json(b): Json<NewToken>) -> Api
     if b.machine.trim().is_empty() || sg_policy::get_role(&s.vault, &b.role)?.is_none() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "machine is required and the role must exist".into()));
     }
+    if b.ttl_secs.is_some_and(|t| t > 315_360_000) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "ttl_secs must be at most 10 years (315360000)".into()));
+    }
     let t = s.tokens.issue(&b.machine, &b.role, b.ttl_secs.map(Duration::from_secs))?;
     Ok((StatusCode::CREATED, Json(json!({ "token": t.token, "jti": t.jti, "machine": b.machine, "role": b.role }))))
 }
@@ -3896,14 +4229,15 @@ async fn audit(State(s): State<AppState>, Query(f): Query<AuditFilter>) -> ApiRe
 
 `web.rs`:
 ```rust
-use crate::{api::api_router, state::AppState};
+use crate::{api::{api_router, write_guard}, error::ApiError, state::AppState};
 use axum::{
-    extract::{Query, Request, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{from_fn_with_state, Next},
-    response::{IntoResponse, Redirect, Response},
-    routing::get,
-    Router,
+    middleware::{from_fn, from_fn_with_state, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -3916,13 +4250,19 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-
 
 pub fn web_router(state: AppState) -> Router {
     let api = api_router(state.clone()).layer(from_fn_with_state(state.clone(), session_guard));
+    // POST /login: solo JSON (415), Origin comprobado, cuerpo <= 64 KiB; GET/HEAD -> 404 (no consumen nada)
+    let login_route = post(login)
+        .fallback(|| async { ApiError::not_found() })
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(from_fn(write_guard))
+        .layer(from_fn_with_state(state.clone(), origin_guard));
     Router::new()
-        .route("/login", get(login))
-        .nest("/api", api)
+        .route("/login", login_route)
         .fallback(static_asset)
-        .layer(from_fn_with_state(state.clone(), host_guard))
+        .with_state(state.clone())
+        .nest("/api", api)
+        .layer(from_fn_with_state(state, host_guard))
         .layer(axum::middleware::map_response(security_headers))
-        .with_state(state)
 }
 
 async fn security_headers(mut resp: Response) -> Response {
@@ -3947,35 +4287,40 @@ async fn host_guard(State(s): State<AppState>, req: Request, next: Next) -> Resp
     next.run(req).await
 }
 
-fn session_cookie(req: &Request) -> Option<String> {
-    let raw = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|p| p.trim().strip_prefix("sg_session=").map(String::from))
+/// Exactamente una cabecera `Authorization: Bearer <id>` (esquema sin distinguir mayúsculas).
+/// Las cookies se ignoran: no se aíslan por puerto en localhost.
+fn bearer_session(req: &Request) -> Option<&str> {
+    let mut all = req.headers().get_all(header::AUTHORIZATION).iter();
+    let value = all.next()?.to_str().ok()?;
+    if all.next().is_some() { return None; }
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.contains(' ')).then_some(token)
 }
 
+/// Un `Origin` presente debe ser exactamente `http://<host permitido>`.
+fn origin_allowed(req: &Request, s: &AppState) -> bool { /* ... */ }
+
 async fn session_guard(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    match session_cookie(&req) {
-        Some(c) if s.sessions.is_valid(&c) => {}
-        _ => return (StatusCode::UNAUTHORIZED, "login required: use the URL printed by `sg serve`").into_response(),
+    match bearer_session(&req) {          // 401 primero: antes que 415/400
+        Some(id) if s.sessions.is_valid(id) => {}
+        _ => return unauthorized(),
     }
     let is_write = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if is_write && req.headers().get("x-sg-csrf").is_none() {
-        return (StatusCode::FORBIDDEN, "missing X-SG-CSRF header").into_response();
-    }
-    next.run(req).await
+    if is_write && !origin_allowed(&req, &s) { return cross_origin(); }   // 403
+    next.run(req).await                    // sin cabecera CSRF: la credencial no es ambiental
 }
 
 #[derive(Deserialize)]
-struct LoginQuery { t: String }
+struct LoginBody { token: String }
 
-async fn login(State(s): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
-    match s.sessions.exchange(&q.t) {
-        Some(session) => {
-            let cookie = format!("sg_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
-            let mut r = Redirect::to("/").into_response();
-            r.headers_mut().insert(header::SET_COOKIE, cookie.parse().unwrap());
-            r
-        }
-        None => (StatusCode::UNAUTHORIZED, "invalid or already used login link").into_response(),
+/// El mismo 401 para token desconocido, usado, caducado o malformado; nunca se repite el token.
+async fn login(State(s): State<AppState>, body: Bytes) -> Response {
+    let Ok(LoginBody { token }) = serde_json::from_slice(&body) else {
+        return ApiError::bad_request("invalid JSON body").into_response();
+    };
+    match s.sessions.exchange(&token) {
+        Some(session) => ([(header::CACHE_CONTROL, "no-store")], Json(json!({ "session": session }))).into_response(),
+        None => ApiError(StatusCode::UNAUTHORIZED, "invalid or already used login token".into()).into_response(),
     }
 }
 
@@ -3989,28 +4334,27 @@ async fn static_asset(req: Request) -> Response {
 }
 ```
 
-`serve.rs`:
+`serve.rs` (resumen; el código completo está en el repositorio):
 ```rust
-use crate::{api::api_router, state::AppState, web::web_router};
-use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::Path};
-use tokio::net::{TcpListener, UnixListener};
+pub struct AdminServeOptions { pub max_connections: usize, pub header_read_timeout: Duration, pub max_connection_lifetime: Duration } // 256 / 10 s / 1 h
 
-pub async fn serve_unix(path: &Path, state: AppState) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    axum::serve(listener, api_router(state)).await
-}
+/// Bucle propio sobre hyper: el permiso del `Semaphore` se toma ANTES de `accept` (los clientes
+/// de más esperan en el backlog); `http1::Builder` con `TokioTimer` y `header_read_timeout`;
+/// `timeout(max_connection_lifetime, conn)`; el router es el servicio (`TowerToHyperService`).
+async fn serve_loop<S, F, Fut>(accept: F, app: Router, opts: AdminServeOptions) -> io::Result<()> { /* ... */ }
 
-pub async fn serve_web(listener: TcpListener, state: AppState) -> std::io::Result<()> {
-    axum::serve(listener, web_router(state)).await
-}
+pub async fn bind_unix(path: &Path) -> io::Result<UnixListener>; // padre propio y 0700; socket obsoleto propio; 0600
+pub async fn serve_unix(path: &Path, state: AppState) -> io::Result<()>;      // socket_router
+pub async fn serve_unix_with(path: &Path, state: AppState, opts: AdminServeOptions) -> io::Result<()>;
+pub async fn serve_web(listener: TcpListener, state: AppState) -> io::Result<()>;   // web_router
+pub async fn serve_web_with(listener: TcpListener, state: AppState, opts: AdminServeOptions) -> io::Result<()>;
 
 pub fn allowed_hosts_for(addr: SocketAddr) -> Vec<String> {
     let p = addr.port();
     vec![format!("localhost:{p}"), format!("127.0.0.1:{p}"), format!("[::1]:{p}")]
 }
 ```
+
 (Para `--admin-bind` no-loopback se añade en la Tarea 13 el aviso y, si procede, el host publicado.)
 
 `lib.rs`:
@@ -4022,8 +4366,8 @@ mod sessions;
 mod state;
 mod web;
 
-pub use api::api_router;
-pub use serve::{allowed_hosts_for, serve_unix, serve_web};
+pub use api::{api_router, socket_router};
+pub use serve::{allowed_hosts_for, bind_unix, serve_unix, serve_unix_with, serve_web, serve_web_with, AdminServeOptions};
 pub use sessions::Sessions;
 pub use state::AppState;
 pub use web::web_router;
@@ -4422,7 +4766,7 @@ git add -A && git commit -m "feat(cli): add unix-socket admin client and command
 - Test: `crates/admin/tests/web_assets.rs`
 
 **Interfaces:**
-- Consumes: la API `/api/*` (Tarea 10) con la cookie de sesión y la cabecera `X-SG-CSRF: 1` en escrituras.
+- Consumes: la API `/api/*` (Tarea 10) con `Authorization: Bearer <sesión>`. Al cargar lee el token del fragmento (`#t=`), lo borra con `history.replaceState`, hace `POST /login` (JSON `{"token"}`) y guarda la sesión devuelta en `sessionStorage` (aislado por origen, puerto incluido). Sin cookies ni cabecera `X-SG-CSRF`; `fetch` con `credentials: "omit"`.
 - Produces: SPA estática con pestañas Secretos, Roles y reglas, Tokens, CA, Audit.
 
 - [ ] **Step 1: Escribir el test que falla** (`crates/admin/tests/web_assets.rs`)
@@ -4469,9 +4813,12 @@ async fn frontend_never_uses_dangerous_dom_sinks_or_external_resources() {
 }
 
 #[tokio::test]
-async fn frontend_sends_the_csrf_header_on_writes() {
+async fn frontend_uses_fragment_session_storage_and_bearer() {
     let (_, js) = get("/app.js").await;
-    assert!(js.contains("X-SG-CSRF"));
+    assert!(js.contains("Authorization") && js.contains("Bearer"));
+    assert!(js.contains("sessionStorage") && js.contains("replaceState") && js.contains("location.hash"));
+    assert!(js.contains("credentials: \"omit\""));
+    assert!(!js.contains("X-SG-CSRF") && !js.contains("document.cookie"));
 }
 ```
 
@@ -4535,10 +4882,20 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
+// Token de login: viene en el fragmento (#t=...), que el navegador nunca envía al servidor.
+async function login() {
+  const m = /(?:^#|&)t=([0-9a-f]+)/.exec(location.hash);
+  if (!m) return;
+  history.replaceState(null, "", location.pathname + location.search); // fuera de la barra y del historial
+  const resp = await fetch("/login", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: m[1] }), credentials: "omit" });
+  if (!resp.ok) throw new Error("login link invalid or already used; run `sg login-url`");
+  sessionStorage.setItem("sg_session", (await resp.json()).session);
+}
+
 async function api(method, path, body) {
-  const headers = { "Content-Type": "application/json" };
-  if (method !== "GET") headers["X-SG-CSRF"] = "1";
-  const resp = await fetch("/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" });
+  const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + (sessionStorage.getItem("sg_session") || "") };
+  const resp = await fetch("/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: "omit" });
   const text = await resp.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -4652,11 +5009,11 @@ async function show(name) {
   try {
     view.replaceChildren(...(await tabs[name]()));
   } catch (err) {
-    view.replaceChildren(el("div", { class: "error" }, err.message, " (open the login URL printed by `sg serve` if your session expired)"));
+    view.replaceChildren(el("div", { class: "error" }, err.message, " (run `sg login-url` and open the URL if your session expired)"));
   }
 }
 
-show("Secrets");
+login().then(() => show("Secrets"), (err) => view.replaceChildren(el("div", { class: "error" }, err.message)));
 ```
 
 - [ ] **Step 4: Ejecutar y ver que pasa**
@@ -4681,10 +5038,16 @@ git add -A && git commit -m "feat(web): add embedded admin UI without dom inject
 **Interfaces:**
 - Consumes: todos los crates.
 - Produces:
-  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>]` (variable `SG_MASTER_KEY` como tercera fuente)
+  - `sg serve [--data-dir] [--socket] [--proxy-bind] [--admin-bind] [--admin-allowed-host <host:puerto>]... [--key-file|SG_KEY_FILE] [--passphrase] [--upstream-ca <pem>] [--allow-loopback-targets]` (variable `SG_MASTER_KEY` como tercera fuente)
   - `sg keygen [--out <fichero>]`
   - Subcomandos de cliente aplanados (`sg secret ...`, `sg --socket <ruta> ...`)
   - `keys::resolve_key(args: &KeySource, interactive_confirm: bool) -> anyhow::Result<KeyInput>`
+
+**Notas de seguridad para esta tarea (revisión de la Tarea 10):**
+- `allowed_hosts_for(addr)` solo admite el puerto de bind. En contenedores el puerto publicado del host debe ser igual al del contenedor (`127.0.0.1:9090:9090`); para otras asignaciones se usa `--admin-allowed-host <host:puerto>` (repetible, se añade a `allowed_hosts`).
+- `bind_unix` rechaza un directorio padre accesible por grupo/otros o ajeno. El directorio de datos y sus padres bajo `$HOME` se crean con `DirBuilder::new().recursive(true).mode(0o700)`, y el socket por defecto vive en `$XDG_RUNTIME_DIR` (0700).
+- El límite de 256 conexiones por listener (`AdminServeOptions`) no sustituye a `RLIMIT_NOFILE`; subirlo queda fuera de alcance (documentarlo si el despliegue espera muchos clientes).
+- La URL de login impresa usa el fragmento `#t=`; `sg login-url` (solo por el socket Unix, ruta `POST /admin/login-token`) emite otra sin reiniciar.
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -4764,7 +5127,10 @@ fn sg(s: &Server, args: &[&str], stdin: Option<&str>) -> (bool, String) {
 #[test]
 fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
     let s = start();
-    assert!(s.login.contains("/login?t="));
+    assert!(s.login.contains("/#t="));
+    // `sg login-url` mints another single-use URL without restarting
+    let (ok, url) = sg(&s, &["login-url"], None);
+    assert!(ok && url.contains("/#t="), "{url}");
     assert!(sg(&s, &["secret", "add", "gh"], Some("E2E-PLAINTEXT-MARKER\n")).0);
     assert!(sg(&s, &["role", "add", "reviewer", "--unmatched", "deny"], None).0);
     assert!(sg(&s, &["ca", "allow-domain", "github.com"], None).0);
@@ -4850,7 +5216,7 @@ use sg_admin::{allowed_hosts_for, serve_unix, serve_web, AppState, Sessions};
 use sg_auth::TokenService;
 use sg_ca::CaService;
 use sg_core::{paths, Vault};
-use sg_proxy::{ProxyState, UpstreamConfig};
+use sg_proxy::{NetPolicy, ProxyState, UpstreamConfig};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
 
@@ -4864,6 +5230,8 @@ pub struct ServeArgs {
     #[arg(long)] passphrase: bool,
     /// Extra PEM CA bundle trusted for upstream TLS (internal services with a private CA)
     #[arg(long, env = "SG_UPSTREAM_CA")] upstream_ca: Vec<PathBuf>,
+    /// Allow the proxy to tunnel/forward to loopback addresses (off by default: SSRF defence)
+    #[arg(long)] allow_loopback_targets: bool,
 }
 
 pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
@@ -4883,22 +5251,27 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
             roots.push(CertificateDer::from(c?.to_vec()));
         }
     }
-    let proxy_state = Arc::new(ProxyState { vault: vault.clone(), verifier: tokens.clone(), ca: ca.clone(), upstream: UpstreamConfig::new(roots) });
-
     let proxy_listener = TcpListener::bind(args.proxy_bind).await.context("cannot bind the proxy address")?;
     let admin_listener = TcpListener::bind(args.admin_bind).await.context("cannot bind the admin address")?;
     let proxy_addr = proxy_listener.local_addr()?;
     let admin_addr = admin_listener.local_addr()?;
+    // The proxy and admin bind addresses are never valid tunnel/forward targets.
+    let mut upstream = UpstreamConfig::new(roots);
+    upstream.net_policy = NetPolicy::new(vec![proxy_addr, admin_addr]).with_allow_loopback(args.allow_loopback_targets);
+    let proxy_state = Arc::new(ProxyState { vault: vault.clone(), verifier: tokens.clone(), ca: ca.clone(), upstream });
     if !admin_addr.ip().is_loopback() {
         eprintln!("WARNING: the admin interface is bound to {admin_addr}, which is not loopback. Publish it only to 127.0.0.1 of the host; there is no remote login in this version.");
     }
 
     let sessions = Arc::new(Sessions::new());
     let login = sessions.new_login_token();
-    let app = AppState { vault, tokens, ca, sessions, allowed_hosts: allowed_hosts_for(admin_addr) };
+    let mut allowed_hosts = allowed_hosts_for(admin_addr);
+    allowed_hosts.extend(args.admin_allowed_host.iter().cloned()); // --admin-allowed-host <host:port>, repeatable
+    let web_base_url = Some(format!("http://localhost:{}", admin_addr.port()));
+    let app = AppState { vault, tokens, ca, sessions, allowed_hosts, web_base_url };
 
     println!("proxy: http://{proxy_addr}");
-    println!("admin: http://localhost:{}/login?t={login}", admin_addr.port());
+    println!("admin: http://localhost:{}/#t={login}", admin_addr.port()); // fragmento: nunca viaja al servidor
     println!("socket: {}", socket.display());
 
     tokio::select! {
