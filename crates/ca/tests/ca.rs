@@ -894,9 +894,12 @@ async fn domains_can_be_removed_and_the_ca_returns_to_the_placeholder() {
     ca.persist(&v.conn(), &p).unwrap();
     ca.install(p);
     assert!(ca.domains().is_empty());
+    assert_eq!(permitted_dns(&ca.cert_pem()), vec!["invalid".to_string()]);
     assert!(handshake(&ca, "a.com").await.is_err());
-    assert!(CaService::init_or_load(v.clone())
-        .unwrap()
-        .domains()
-        .is_empty());
+    let reloaded = CaService::init_or_load(v.clone()).unwrap();
+    assert!(reloaded.domains().is_empty());
+    assert_eq!(
+        permitted_dns(&reloaded.cert_pem()),
+        vec!["invalid".to_string()]
+    );
 }

@@ -145,6 +145,9 @@ pub fn add_role(v: &Vault, name: &str, unmatched: Unmatched) -> Result<Role, Pol
     })
 }
 
+// The `*_in` functions below run inside `Vault::in_transaction` with the connection already locked;
+// they must not call Vault methods or wrappers that lock the connection (non-reentrant mutex).
+
 pub fn get_role(v: &Vault, name: &str) -> Result<Option<Role>, PolicyError> {
     get_role_in(&v.conn(), name)
 }

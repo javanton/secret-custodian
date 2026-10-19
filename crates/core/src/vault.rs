@@ -172,6 +172,8 @@ impl Vault {
 
     /// Runs `f` in one transaction: committed when it returns `Ok`, rolled back on `Err`. The
     /// connection stays locked for the whole call, so concurrent writers are serialized.
+    ///
+    /// Reentrancy: the closure receives the already-locked connection and must only use it: it must not call `Vault` methods or wrappers that lock the connection (the mutex is not reentrant, that would deadlock).
     pub fn in_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<CoreError>,

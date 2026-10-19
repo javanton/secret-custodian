@@ -121,6 +121,9 @@ impl Vault {
     }
 
     /// Inserts the secret and runs `extra` in the same transaction; an `Err` from it rolls everything back.
+    ///
+    /// Reentrancy: `extra` must only use the `&Connection` it receives and must not call `Vault` methods or
+    /// wrappers that lock the connection (non-reentrant mutex).
     pub fn add_secret_with<E, F>(&self, name: &str, value: &str, extra: F) -> Result<SecretMeta, E>
     where
         E: From<CoreError>,
@@ -136,6 +139,9 @@ impl Vault {
     }
 
     /// Deletes the secret together with its rules, then runs `after`, all in one transaction.
+    ///
+    /// Reentrancy: `after` must only use the `&Connection` it receives and must not call `Vault` methods or
+    /// wrappers that lock the connection (non-reentrant mutex).
     pub fn remove_secret_cascade_with<E, F>(&self, name: &str, after: F) -> Result<(), E>
     where
         E: From<CoreError>,

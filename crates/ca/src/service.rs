@@ -48,7 +48,7 @@ pub fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 struct State {
     cert_pem: String,
     domains: Vec<String>,
-    /// The CA certificate object used as issuer for leaves; built once per load / `allow_domain`.
+    /// The CA certificate object used as issuer for leaves; built on load and on `install`.
     signer: Arc<rcgen::Certificate>,
 }
 
@@ -62,13 +62,14 @@ pub struct PreparedCa {
     domains: Vec<String>,
 }
 
-/// Lock order is always allow_lock -> vault connection -> state -> cache; `prepare_domains` only reads the
-/// state for an instant and `allow_domain` never holds one lock while taking another.
+/// Lock order is always allow_lock -> vault connection -> state -> cache. Apart from the outermost
+/// `allow_lock`, no method holds one lock while taking another: `prepare_domains` only reads the state for an
+/// instant, and `allow_domain` takes the vault connection and the state one after the other.
 pub struct CaService {
     vault: Arc<Vault>,
     key: KeyPair,
     state: Mutex<State>,
-    /// Serialises `allow_domain` read-modify-write cycles (outermost lock; never taken by `prepare_domains`).
+    /// Serialises every read-modify-write of the domain set (outermost lock; never taken by `prepare_domains`).
     allow_lock: Mutex<()>,
     cache: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
     cache_ttl: Mutex<Duration>,
@@ -235,6 +236,13 @@ impl CaService {
         lock(&self.state).domains.clone()
     }
 
+    /// Serializes every read-modify-write of the domain set: acquire it BEFORE `Vault::in_transaction` and hold
+    /// it until after `install`; never call `allow_domain` while holding it (it takes the same lock, so it
+    /// would self-deadlock).
+    pub fn domain_guard(&self) -> MutexGuard<'_, ()> {
+        lock(&self.allow_lock)
+    }
+
     /// Re-issues the CA certificate with the same key and a wider permitted set. Agents must reload the certificate.
     ///
     /// The input is trimmed and lowercased first. There is deliberately no Public Suffix List
@@ -244,7 +252,7 @@ impl CaService {
     /// Before anything is persisted, a throw-away leaf for the new domain and for every already
     /// allowed domain is verified against the new certificate; if any fails the call is rejected.
     pub fn allow_domain(&self, domain: &str) -> Result<(), CaError> {
-        let _serial = lock(&self.allow_lock);
+        let _serial = self.domain_guard();
         let mut domains = self.domains();
         domains.push(domain.to_string());
         if let Some(p) = self.prepare_domains(&domains)? {
