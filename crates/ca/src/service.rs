@@ -56,10 +56,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A re-issued CA certificate that is validated but not yet persisted or installed.
+pub struct PreparedCa {
+    cert: rcgen::Certificate,
+    domains: Vec<String>,
+}
+
+/// Lock order is always allow_lock -> vault connection -> state -> cache; `prepare_domains` only reads the
+/// state for an instant and `allow_domain` never holds one lock while taking another.
 pub struct CaService {
     vault: Arc<Vault>,
     key: KeyPair,
     state: Mutex<State>,
+    /// Serialises `allow_domain` read-modify-write cycles (outermost lock; never taken by `prepare_domains`).
+    allow_lock: Mutex<()>,
     cache: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
     cache_ttl: Mutex<Duration>,
     ca_cert_builds: AtomicUsize,
@@ -192,6 +202,7 @@ impl CaService {
             vault,
             key,
             state: Mutex::new(state),
+            allow_lock: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             cache_ttl: Mutex::new(DEFAULT_LEAF_CACHE_TTL),
             // the certificate in `state` was built by the caller
@@ -233,29 +244,59 @@ impl CaService {
     /// Before anything is persisted, a throw-away leaf for the new domain and for every already
     /// allowed domain is verified against the new certificate; if any fails the call is rejected.
     pub fn allow_domain(&self, domain: &str) -> Result<(), CaError> {
-        let domain = domain.trim().to_ascii_lowercase();
-        validate_domain(&domain)?;
-        let mut st = lock(&self.state);
-        if st.domains.contains(&domain) {
-            return Ok(());
+        let _serial = lock(&self.allow_lock);
+        let mut domains = self.domains();
+        domains.push(domain.to_string());
+        if let Some(p) = self.prepare_domains(&domains)? {
+            self.persist(&self.vault.conn(), &p)?;
+            self.install(p);
         }
-        let mut domains = st.domains.clone();
-        domains.push(domain);
+        Ok(())
+    }
+
+    /// Builds and probes the CA certificate for exactly `domains` (trimmed, lowercased, sorted,
+    /// deduplicated). Returns `None` when the set is unchanged. Nothing is persisted or installed:
+    /// the caller runs `persist` (possibly inside its own transaction) and then `install`.
+    /// It only reads the state for an instant, so it never nests locks.
+    pub fn prepare_domains(&self, domains: &[String]) -> Result<Option<PreparedCa>, CaError> {
+        let mut domains: Vec<String> = domains
+            .iter()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .collect();
         domains.sort();
+        domains.dedup();
+        for d in &domains {
+            validate_domain(d)?;
+        }
+        if lock(&self.state).domains == domains {
+            return Ok(None);
+        }
         let cert = ca_params(&domains)?.self_signed(&self.key).map_err(tls)?;
         self.ca_cert_builds.fetch_add(1, Ordering::SeqCst);
         self.probe(&cert, &domains)?;
-        self.vault.conn().execute(
+        Ok(Some(PreparedCa { cert, domains }))
+    }
+
+    /// Writes a prepared CA through `conn` (so it can take part in the caller's transaction).
+    pub fn persist(&self, conn: &rusqlite::Connection, p: &PreparedCa) -> Result<(), CaError> {
+        conn.execute(
             "UPDATE ca SET cert_pem = ?1, domains = ?2 WHERE id = 1",
-            rusqlite::params![cert.pem(), serde_json::to_string(&domains).map_err(tls)?],
+            rusqlite::params![
+                p.cert.pem(),
+                serde_json::to_string(&p.domains).map_err(tls)?
+            ],
         )?;
-        *st = State {
-            cert_pem: cert.pem(),
-            domains,
-            signer: Arc::new(cert),
+        Ok(())
+    }
+
+    /// Swaps the in-memory CA for a prepared one and drops every cached leaf.
+    pub fn install(&self, p: PreparedCa) {
+        *lock(&self.state) = State {
+            cert_pem: p.cert.pem(),
+            domains: p.domains,
+            signer: Arc::new(p.cert),
         };
         lock(&self.cache).clear();
-        Ok(())
     }
 
     /// Verifies a throw-away leaf for every domain against `cert` as the only trust anchor.
@@ -333,7 +374,7 @@ impl CaService {
         if !self.is_host_permitted(&host) {
             return Err(CaError::NotPermitted);
         }
-        // Read the state before taking the cache lock (allow_domain locks state, then cache).
+        // Read the state before taking the cache lock (`install` locks state, then cache).
         let signer = lock(&self.state).signer.clone();
         let ttl = *lock(&self.cache_ttl);
         // The cache lock is held while issuing so concurrent callers for one host share a single leaf.

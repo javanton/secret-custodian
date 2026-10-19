@@ -825,3 +825,78 @@ fn openssl_strict_verification_accepts_leaves() {
         }
     }
 }
+
+fn s(v: &[&str]) -> Vec<String> {
+    v.iter().map(|d| d.to_string()).collect()
+}
+
+#[test]
+fn prepare_has_no_effect_until_persisted_and_installed() {
+    let (_d, v, ca) = ca();
+    let p = ca
+        .prepare_domains(&s(&["b.com", "a.com", "a.com"]))
+        .unwrap()
+        .unwrap();
+    assert!(
+        ca.domains().is_empty(),
+        "nothing changes while only prepared"
+    );
+    ca.persist(&v.conn(), &p).unwrap();
+    ca.install(p);
+    assert_eq!(ca.domains(), s(&["a.com", "b.com"]));
+    assert!(ca.is_host_permitted("x.a.com"));
+    // the same set again is a no-op
+    assert!(ca
+        .prepare_domains(&s(&["a.com", "b.com"]))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn rejected_domains_leave_the_ca_untouched() {
+    let (_d, _v, ca) = ca();
+    for bad in ["com", "x.invalid", "1.2.3.4", "UPPER case"] {
+        assert!(
+            matches!(
+                ca.prepare_domains(&s(&["ok.com", bad])),
+                Err(CaError::DomainRejected(_))
+            ),
+            "{bad}"
+        );
+    }
+    assert!(ca.domains().is_empty());
+}
+
+#[test]
+fn persist_inside_a_rolled_back_transaction_is_not_kept() {
+    let (_d, v, ca) = ca();
+    let p = ca.prepare_domains(&s(&["a.com"])).unwrap().unwrap();
+    let r: Result<(), CaError> = v.in_transaction(|c| {
+        ca.persist(c, &p)?;
+        Err(CaError::NotPermitted)
+    });
+    assert!(r.is_err());
+    // a restart sees the old (empty) state
+    assert!(CaService::init_or_load(v.clone())
+        .unwrap()
+        .domains()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn domains_can_be_removed_and_the_ca_returns_to_the_placeholder() {
+    let (_d, v, ca) = ca();
+    let p = ca.prepare_domains(&s(&["a.com"])).unwrap().unwrap();
+    ca.persist(&v.conn(), &p).unwrap();
+    ca.install(p);
+    handshake(&ca, "a.com").await.unwrap();
+    let p = ca.prepare_domains(&[]).unwrap().unwrap();
+    ca.persist(&v.conn(), &p).unwrap();
+    ca.install(p);
+    assert!(ca.domains().is_empty());
+    assert!(handshake(&ca, "a.com").await.is_err());
+    assert!(CaService::init_or_load(v.clone())
+        .unwrap()
+        .domains()
+        .is_empty());
+}
