@@ -236,6 +236,11 @@ impl CaService {
         lock(&self.state).domains.clone()
     }
 
+    /// Whether `domain` (already trimmed and lowercased) passes the CA's domain validation.
+    pub fn domain_is_acceptable(&self, domain: &str) -> bool {
+        validate_domain(domain).is_ok()
+    }
+
     /// Serializes every read-modify-write of the domain set: acquire it BEFORE `Vault::in_transaction` and hold
     /// it until after `install`; never call `allow_domain` while holding it (it takes the same lock, so it
     /// would self-deadlock).

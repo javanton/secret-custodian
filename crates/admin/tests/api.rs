@@ -16,6 +16,7 @@ struct Env {
     _dir: tempfile::TempDir,
     app: Router,
     tokens: Arc<TokenService>,
+    vault: Arc<Vault>,
 }
 
 fn env() -> Env {
@@ -31,7 +32,7 @@ fn env() -> Env {
     let state = AppState {
         tokens: tokens.clone(),
         ca: Arc::new(CaService::init_or_load(vault.clone()).unwrap()),
-        vault,
+        vault: vault.clone(),
         sessions: Arc::new(Sessions::new()),
         allowed_hosts: vec!["localhost:9090".into()],
         web_base_url: None,
@@ -40,6 +41,7 @@ fn env() -> Env {
         _dir: dir,
         app: api_router(state),
         tokens,
+        vault,
     }
 }
 
@@ -781,6 +783,7 @@ async fn a_host_the_ca_rejects_creates_nothing() {
     let marker = "SECRET-MARKER-123456";
     let mut body = secret_body("gh", "dev", "x.invalid");
     body["value"] = json!(marker);
+    // rejected earlier, by the rule validation, with a 400
     let (st, text) = call(&app, "POST", "/secrets", Some(body)).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(!text.contains(marker), "the value must never be echoed");
@@ -945,4 +948,40 @@ async fn concurrent_creations_keep_every_domain() {
         domains(&app).await,
         vec!["a.com", "b.com", "c.com", "d.com"]
     );
+}
+
+#[tokio::test]
+async fn a_legacy_rule_with_a_host_the_ca_rejects_does_not_block_new_secrets() {
+    let e = env();
+    let app = &e.app;
+    role(app, "dev").await;
+    let v = json_of(
+        &call(
+            app,
+            "POST",
+            "/secrets",
+            Some(secret_body("old", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    // a row created before hosts were checked against the CA rules
+    e.vault
+        .conn()
+        .execute(
+            "INSERT INTO rules (role, host_pattern, path_pattern, methods, injection_kind, target_name, template, secret_id)
+             VALUES ('dev', 'x.invalid', '*', '[]', 'header', 'X', '{secret}', ?1)",
+            [sid],
+        )
+        .unwrap();
+    let (st, body) = call(
+        app,
+        "POST",
+        "/secrets",
+        Some(secret_body("new", "dev", "b.com")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(domains(app).await, vec!["a.com", "b.com"]);
 }

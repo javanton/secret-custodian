@@ -134,7 +134,7 @@ fn valid_edge_rules_are_accepted() {
     };
     ok(|r| r.host_pattern = "*.example.com".into());
     ok(|r| r.host_pattern = "localhost".into());
-    ok(|r| r.host_pattern = "my-api_1.example.co.uk".into());
+    ok(|r| r.host_pattern = "my-api-1.example.co.uk".into());
     ok(|r| r.methods = vec![]);
     ok(|r| r.path_pattern = "/repos/*".into());
     ok(|r| {
@@ -415,4 +415,29 @@ fn query_template_must_be_exactly_secret() {
     r.target_name = "api_key".into();
     r.template = "{secret}".into();
     assert!(add_rule(&v, r).is_ok());
+}
+
+#[test]
+fn hosts_the_ca_would_reject_are_rejected_by_the_rule_validation() {
+    let (_d, v, sid) = setup();
+    let long_label = format!("{}.example.com", "a".repeat(64));
+    let too_long = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+    for host in [
+        "my_svc.example.com",
+        "a-.example.com",
+        "-a.example.com",
+        "foo.123",
+        "x.invalid",
+        "*.invalid",
+        "invalid",
+        &long_label,
+        &too_long,
+    ] {
+        let mut r = new_rule(sid);
+        r.host_pattern = host.into();
+        assert!(add_rule(&v, r).is_err(), "{host} should be rejected");
+    }
+    let mut r = new_rule(sid);
+    r.host_pattern = format!("{}.example.com", "a".repeat(63));
+    add_rule(&v, r).unwrap();
 }

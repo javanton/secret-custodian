@@ -29,7 +29,21 @@ pub struct Created {
 
 /// Recomputes the CA domains from the rules visible on `conn` and persists them there.
 fn plan_ca(ca: &CaService, conn: &Connection) -> ApiResult<Option<PreparedCa>> {
-    let domains = derive_ca_domains(&list_rules_in(conn, None)?);
+    let mut domains = derive_ca_domains(&list_rules_in(conn, None)?);
+    // Rows stored before hosts were checked against the CA's rules may hold hosts it cannot accept. Skipping
+    // them only narrows the CA (those hosts cannot be intercepted), so it fails closed and startup survives.
+    let skipped: Vec<String> = domains
+        .iter()
+        .filter(|d| !ca.domain_is_acceptable(d))
+        .cloned()
+        .collect();
+    if !skipped.is_empty() {
+        tracing::warn!(
+            hosts = %skipped.join(", "),
+            "rule hosts the CA cannot accept were left out of its permitted domains"
+        );
+        domains.retain(|d| ca.domain_is_acceptable(d));
+    }
     let prepared = ca.prepare_domains(&domains)?;
     if let Some(p) = &prepared {
         ca.persist(conn, p)?;

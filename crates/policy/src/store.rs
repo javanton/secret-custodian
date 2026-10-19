@@ -56,6 +56,25 @@ fn valid_host_pattern(p: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         })
         && p == p.to_ascii_lowercase()
+        && ca_compatible(body)
+}
+
+/// The DNS rules the CA enforces on its permitted domains (kept in step with `sg_ca`'s domain validation,
+/// which a test in sg-admin cross-checks): a rule host the CA would refuse must never be stored.
+fn ca_compatible(body: &str) -> bool {
+    let labels_ok = body.len() <= 253
+        && body.split('.').all(|l| {
+            l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+    let last_numeric = body
+        .rsplit('.')
+        .next()
+        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+    labels_ok && !last_numeric && body != "invalid" && !body.ends_with(".invalid")
 }
 
 fn validate(conn: &Connection, r: &NewRule) -> Result<(), PolicyError> {
