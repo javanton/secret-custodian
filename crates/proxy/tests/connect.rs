@@ -246,13 +246,28 @@ async fn audit_rows_exist_before_the_response_for_deny_ca_and_passthrough() {
     assert_eq!(rows[0].machine.as_deref(), Some("m1"));
 
     let open = env.tokens.issue("m2", "open", None).unwrap();
-    let (line, _) = raw_connect(
+    let (line, mut refused) = raw_connect(
         env.proxy_addr,
         "api.github.com:443",
         Some(&basic(&open.token)),
     )
     .await;
     assert!(line.contains("502"));
+    // The hint must not point at a command that no longer exists.
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read(&mut refused, &mut buf),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let body = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        body.contains("the CA does not permit api.github.com"),
+        "{body}"
+    );
+    assert!(!body.contains("allow-domain"), "{body}");
     let rows = env.vault.list_audit(&Default::default()).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(
