@@ -1,0 +1,131 @@
+stages:
+  - test
+  - build
+  - release
+
+# Security scan templates (SAST, secret detection, dependency scanning); results appear in the Security tab.
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: always
+  # Only tags like v1.2.3 produce a release.
+  RELEASE_TAG_PATTERN: '/^v\d+\.\d+\.\d+$/'
+
+.rust:
+  image: rust:1-bookworm
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/
+      - target/
+
+# ---------------------------------------------------------------------------
+# Test stage: branches and merge requests (not tag pipelines)
+# ---------------------------------------------------------------------------
+check:
+  extends: .rust
+  stage: test
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+  before_script:
+    # node runs the JS tests of the web UI (they are skipped when node is missing).
+    - apt-get update -qq && apt-get install -y -qq nodejs
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo test --workspace --locked
+
+# Real curl through the real proxy to a local TLS upstream (36 checks, no Docker needed).
+e2e:
+  extends: .rust
+  stage: test
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl openssl python3
+  script:
+    - scripts/e2e.sh
+
+# ---------------------------------------------------------------------------
+# Release: a tag vX.Y.Z builds the static binary, publishes it to the package registry,
+# creates a GitLab Release and pushes the Docker image.
+# ---------------------------------------------------------------------------
+release-binary:
+  extends: .rust
+  stage: build
+  rules:
+    - if: $CI_COMMIT_TAG =~ $RELEASE_TAG_PATTERN
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq musl-tools
+    - rustup target add x86_64-unknown-linux-musl
+  script:
+    - scripts/package-release.sh "$CI_COMMIT_TAG"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+publish-package:
+  stage: release
+  image: curlimages/curl:latest
+  needs: [release-binary]
+  rules:
+    - if: $CI_COMMIT_TAG =~ $RELEASE_TAG_PATTERN
+  script:
+    - |
+      set -eu
+      VERSION="${CI_COMMIT_TAG#v}"
+      for f in dist/*; do
+        curl --fail --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-guardian/${VERSION}/$(basename "$f")"
+        echo "uploaded $(basename "$f")"
+      done
+
+create-release:
+  stage: release
+  image:
+    name: registry.gitlab.com/gitlab-org/release-cli:latest
+    entrypoint: [""]
+  needs: [publish-package]
+  rules:
+    - if: $CI_COMMIT_TAG =~ $RELEASE_TAG_PATTERN
+  script:
+    - |
+      set -eu
+      VERSION="${CI_COMMIT_TAG#v}"
+      BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-guardian/${VERSION}"
+      ARCHIVE="sg-${CI_COMMIT_TAG}-x86_64-linux.tar.gz"
+      release-cli create \
+        --name "Secret Guardian ${CI_COMMIT_TAG}" \
+        --tag-name "$CI_COMMIT_TAG" \
+        --description "Static Linux x86_64 binary (musl). Verify the download with SHA256SUMS (sha256sum -c SHA256SUMS). Container image: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}" \
+        --assets-link "{\"name\":\"${ARCHIVE}\",\"url\":\"${BASE}/${ARCHIVE}\",\"link_type\":\"package\"}" \
+        --assets-link "{\"name\":\"SHA256SUMS\",\"url\":\"${BASE}/SHA256SUMS\",\"link_type\":\"other\"}"
+
+# Needs a runner that exposes the Docker socket, like the other projects of this group.
+publish-image:
+  stage: release
+  image: docker:27
+  variables:
+    DOCKER_HOST: "unix:///var/run/docker.sock"
+  rules:
+    - if: $CI_COMMIT_TAG =~ $RELEASE_TAG_PATTERN
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" -t "$CI_REGISTRY_IMAGE:latest" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+    - docker push "$CI_REGISTRY_IMAGE:latest"

@@ -6,7 +6,7 @@ key into the request on the way out. The agent never holds the key, never sees i
 Rust binary (or one Docker image) with a CLI, an admin API and a small local web UI, and it keeps everything in a single
 encrypted SQLite file.
 
-Status: phase 1 is complete and tested ([Status](#status)). There is no license file yet ([License](#license)).
+Status: phase 1 is complete and tested ([Status](#status)). Licensed under the [MIT License](LICENSE). Linux only.
 
 ## Why
 
@@ -50,6 +50,30 @@ flowchart LR
     P -->|"response"| A
     P -.->|"decision"| L["Audit log"]
 ```
+
+## Install
+
+Pre-built binaries are attached to each [release](https://gitlab.habbi.cc/own-projects/secret-guardian/-/releases): a
+**static Linux x86_64 binary** (musl), so it runs on any Linux distribution, including Alpine and minimal containers.
+Other platforms are not built; compile from source (next section).
+
+```sh
+VERSION=0.1.0   # see the releases page for the latest
+BASE="https://gitlab.habbi.cc/api/v4/projects/own-projects%2Fsecret-guardian/packages/generic/secret-guardian/$VERSION"
+curl -fLO "$BASE/sg-v$VERSION-x86_64-linux.tar.gz"
+curl -fLO "$BASE/SHA256SUMS"
+sha256sum -c SHA256SUMS                       # must print: sg-v0.1.0-x86_64-linux.tar.gz: OK
+tar xzf "sg-v$VERSION-x86_64-linux.tar.gz"
+install -m 0755 "sg-v$VERSION-x86_64-linux/sg" ~/.local/bin/sg
+```
+
+Most Linux systems already ship an unrelated `/usr/bin/sg` (from shadow-utils: "run a command with another group").
+Make sure `~/.local/bin` comes first in your `PATH` (check with `which -a sg`), or install the binary under another
+name such as `sgv`.
+
+The release also publishes the Docker image to the project's Container Registry as `:vX.Y.Z` and `:latest` (see
+[Docker](#docker)). The checksum file protects against a corrupted download, not against a compromised release page:
+for that, build from source and compare.
 
 ## Quick start from source
 
@@ -535,6 +559,7 @@ the reference pages under `docs/` describe the code.
 | [docs/security-model.md](docs/security-model.md) | Assets, attackers, mitigations, residual risks, hardening history, checklist |
 | [docs/operations.md](docs/operations.md) | Install, permissions, keys, backups, upgrades, systemd, containers, troubleshooting |
 | [docs/testing.md](docs/testing.md) | Test strategy, inventory, end-to-end scripts, known gaps |
+| [docs/releasing.md](docs/releasing.md) | CI pipeline, publishing a version, the static binary, package registry and Docker image |
 | [docs/architecture.md](docs/architecture.md) | Crates, request sequence, concurrency, design decisions |
 | [docs/database-schema.md](docs/database-schema.md) | Tables, columns, permissions, WAL, backup |
 | [docs/crypto-and-keys.md](docs/crypto-and-keys.md) | Key hierarchy, encryption format, AADs, zeroization, failure modes |
@@ -553,5 +578,4 @@ injection into request bodies and request signing (SigV4 and similar).
 
 ## License
 
-There is no `LICENSE` file in this repository yet, so no license is granted: all rights are reserved by default until the author
-adds one. If you want to use or contribute to the project, ask first.
+[MIT](LICENSE), copyright (c) 2026 Javier Anton.
