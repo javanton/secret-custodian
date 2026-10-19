@@ -85,18 +85,20 @@ LOGIN_TOKEN="$(sed -n 's/^admin: .*#t=//p' "$W/serve.out")"
 echo "vault: proxy=$PROXY admin_port=$ADMIN_PORT upstream_port=$UPPORT"
 
 # 3. Configuration through the CLI.
-printf '%s' "$SECRET" | sg secret add api-key >/dev/null || die "secret add"
 sg role add developer --unmatched deny >/dev/null
 sg role add reviewer --unmatched deny >/dev/null
 sg role add restricted --unmatched deny >/dev/null
 sg role add querier --unmatched deny >/dev/null
 sg role add keyer --unmatched deny >/dev/null
-sg ca allow-domain localhost >/dev/null
-sg rule add --role developer  --host localhost --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
+# A secret is created together with its first rule; the CA permits the rule's host from then on.
+if printf '%s' "$SECRET" | sg secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
+sg secret ls | grep -q norule-key && fail "rejected secret was stored" || pass "rejected secret was not stored"
+printf '%s' "$SECRET" | sg secret add api-key --role developer --host localhost --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
 sg rule add --role reviewer   --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
 sg rule add --role restricted --host localhost --methods GET --path '/repos/*' --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
 sg rule add --role querier    --host localhost --query api_key --secret api-key >/dev/null
 sg rule add --role keyer      --host localhost --header X-Api-Key --secret api-key >/dev/null
+sg ca status | grep -q localhost && pass "ca status lists the rule host" || fail "ca status does not list localhost"
 sg ca export >"$W/ca.pem"
 tokjson() { sg --json token create --machine e2e --role "$1" --proxy-url "http://$PROXY"; }
 jget() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }

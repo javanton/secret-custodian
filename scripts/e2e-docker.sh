@@ -104,12 +104,14 @@ check "admin: Host localhost:<port> serves the page" 200 "$(curl -s -o /dev/null
 
 echo "== configure through docker exec =="
 SECRET="E2E-DOCKER-SECRET-$RANDOM$RANDOM"
-printf '%s' "$SECRET" | docker exec -i "$NAME" sg --socket /data/sg.sock secret add api-key >/dev/null || die "secret add"
 dsg --socket /data/sg.sock role add developer --unmatched deny >/dev/null
 dsg --socket /data/sg.sock role add reviewer --unmatched deny >/dev/null
-dsg --socket /data/sg.sock ca allow-domain "$UPHOST" >/dev/null
-dsg --socket /data/sg.sock rule add --role developer --host "$UPHOST" --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
+# A secret is created together with its first rule; the CA permits the rule's host from then on.
+if printf '%s' "$SECRET" | docker exec -i "$NAME" sg --socket /data/sg.sock secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
+dsg --socket /data/sg.sock secret ls | grep -q norule-key && fail "rejected secret was stored" || pass "rejected secret was not stored"
+printf '%s' "$SECRET" | docker exec -i "$NAME" sg --socket /data/sg.sock secret add api-key --role developer --host "$UPHOST" --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
 dsg --socket /data/sg.sock rule add --role reviewer --host "$UPHOST" --methods GET --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
+dsg --socket /data/sg.sock ca status | grep -q "$UPHOST" && pass "ca status lists the rule host" || fail "ca status does not list $UPHOST"
 dsg --socket /data/sg.sock ca export >"$W/ca.pem"
 jget() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 DEV="$(dsg --socket /data/sg.sock --json token create --machine e2e --role developer | jget token)"
