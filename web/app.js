@@ -82,6 +82,25 @@ function tokenStatus(t, now) {
   return "active";
 }
 
+/** The wire form of one rule from raw form values (see `ruleFields`). */
+function buildRule(v) {
+  return {
+    role: v.role,
+    host_pattern: v.host.trim(),
+    path_pattern: v.path.trim() || "*",
+    methods: v.methods,
+    kind: v.kind,
+    target_name: v.target.trim(),
+    template: v.template,
+  };
+}
+
+/** Body for `POST /secrets`: a secret is only useful with at least one rule. */
+function secretBody(name, value, rules) {
+  if (!rules.length) throw new Error("a secret needs at least one rule");
+  return { name, value, rules };
+}
+
 // ---- session and API ------------------------------------------------------------------------
 
 let onExpired = () => {};
@@ -246,34 +265,67 @@ function confirmButton(label, confirmLabel, onConfirm) {
 // ---- views: secrets -------------------------------------------------------------------------
 
 async function viewSecrets(root) {
-  const secrets = await api("GET", "/secrets");
+  const [secrets, roles] = await Promise.all([api("GET", "/secrets"), api("GET", "/roles")]);
   root.append(
     el("h2", {}, "Secrets"),
     el("p", { class: "help" }, "Secret values are write-only: you can add or rotate them, but they are never shown again, not even here."),
   );
-  const rows = secrets.map((s) => [s.name, fmtTime(s.created_at), fmtTime(s.rotated_at), secretActions(s)]);
+  const rows = secrets.map((s) => [
+    s.name,
+    s.rules ? String(s.rules) : el("span", { class: "bad" }, "none: never injected"),
+    fmtTime(s.created_at),
+    fmtTime(s.rotated_at),
+    secretActions(s),
+  ]);
   root.append(
-    rows.length ? table(["Name", "Created", "Rotated", "Actions"], rows, "Stored secrets (metadata only)") : el("p", { class: "muted" }, "No secrets yet."),
+    rows.length ? table(["Name", "Rules", "Created", "Rotated", "Actions"], rows, "Stored secrets (metadata only)") : el("p", { class: "muted" }, "No secrets yet."),
   );
 
   const name = input("text", { required: true, autocomplete: "off", maxlength: "64", pattern: "[a-z0-9._\\-]+", spellcheck: "false" });
   const value = input("password", { required: true, autocomplete: "off" });
+  const blocks = [];
+  const list = el("div", { class: "rule-list" });
+  const addBlock = (removable) => {
+    const b = ruleFields(roles, removable ? { onRemove: () => remove(b) } : undefined);
+    blocks.push(b);
+    list.append(b.node);
+    return b;
+  };
+  const remove = (b) => {
+    blocks.splice(blocks.indexOf(b), 1);
+    b.node.remove();
+  };
+  addBlock(false);
   root.append(
     el("h3", {}, "Add a secret"),
     el(
       "form",
       {
         onsubmit: safe(async () => {
-          const body = { name: name.value, value: value.value };
+          const rules = blocks.map((b) => b.read());
+          const body = secretBody(name.value, value.value, rules);
           value.value = ""; // clear immediately: the value must not linger in the page
-          await api("POST", "/secrets", body);
-          notify(`Secret "${body.name}" added.`);
+          if (!roles.length) {
+            try {
+              await api("POST", "/roles", { name: "default", unmatched: "passthrough" });
+            } catch (e) {
+              if (!/already exists/.test(e.message)) throw e;
+            }
+          }
+          const res = await api("POST", "/secrets", body);
           await refresh();
+          if (res && res.notice) notify(`Secret "${body.name}" added. ${res.notice}`, "notice");
+          else notify(`Secret "${body.name}" added.`);
         }),
       },
       field("Name", name, "lowercase letters, digits, . _ -"),
       field("Value (write-only)", value),
-      el("button", { type: "submit", class: "primary" }, "Add secret"),
+      el("p", { class: "help rule-intro" }, "A secret is injected only where a rule says so. Add at least one rule."),
+      list,
+      el("div", { class: "row-actions rule-actions" },
+        el("button", { type: "button", onclick: () => addBlock(true) }, "Add another rule"),
+        el("button", { type: "submit", class: "primary" }, "Add secret"),
+      ),
     ),
   );
 }
@@ -388,18 +440,15 @@ async function viewRoles(root) {
   root.append(ruleForm(roles, secrets));
 }
 
-function ruleForm(roles, secrets) {
-  if (!roles.length || !secrets.length) {
-    return el("p", { class: "notice" }, "Add at least one role and one secret before creating a rule.");
-  }
-  const role = select(roles.map((r) => [r.name]));
+/** The fields of one rule. `read()` returns the wire form; `onRemove` adds a remove button. */
+function ruleFields(roles, opts) {
+  const role = select(roles.length ? roles.map((r) => [r.name]) : [["default", "default (created automatically)"]]);
   const host = input("text", { required: true, autocomplete: "off", placeholder: "api.example.com or *.example.com" });
   const path = input("text", { required: true, autocomplete: "off", value: "*" });
   const kind = select([["header"], ["query"]]);
   const target = input("text", { required: true, autocomplete: "off", placeholder: "Authorization or api_key" });
   const template = input("text", { required: true, autocomplete: "off", value: "Bearer {secret}" });
-  const secret = select(secrets.map((s) => [String(s.id), s.name]));
-  const checks = METHODS.map((m) => ({ m, box: el("input", { type: "checkbox", id: "m-" + m, value: m }) }));
+  const checks = METHODS.map((m) => ({ m, box: el("input", { type: "checkbox", id: "f" + ++idSeq, value: m }) }));
   const syncKind = () => {
     if (kind.value === "query") {
       template.value = "{secret}";
@@ -410,26 +459,10 @@ function ruleForm(roles, secrets) {
     }
   };
   kind.addEventListener("change", syncKind);
-  return el(
-    "form",
-    {
-      onsubmit: safe(async () => {
-        const res = await api("POST", "/rules", {
-          role: role.value,
-          host_pattern: host.value.trim(),
-          path_pattern: path.value.trim() || "*",
-          methods: checks.filter((c) => c.box.checked).map((c) => c.m),
-          kind: kind.value,
-          target_name: target.value.trim(),
-          template: template.value,
-          secret_id: Number(secret.value),
-        });
-        if (res && res.ca_warning) notify(res.ca_warning, "notice");
-        else notify("Rule added.");
-        await refresh();
-      }),
-    },
-    el("h3", {}, "Add a rule"),
+  const node = el(
+    "fieldset",
+    { class: "rule-block" },
+    el("legend", {}, "Rule"),
     field("Role", role),
     field("Host pattern", host),
     field("Path pattern", path),
@@ -437,11 +470,44 @@ function ruleForm(roles, secrets) {
       "fieldset",
       {},
       el("legend", {}, "Methods (none checked = any method)"),
-      checks.map((c) => el("label", {}, c.box, " " + c.m)),
+      checks.map((c) => el("label", { for: c.box.getAttribute("id") }, c.box, " " + c.m)),
     ),
     field("Inject into", kind),
     field("Header or parameter name", target),
     field("Template", template, "{secret} is replaced by the secret value; it is read-only for query parameters."),
+    opts && opts.onRemove ? el("button", { type: "button", class: "danger", onclick: opts.onRemove }, "Remove this rule") : null,
+  );
+  const read = () =>
+    buildRule({
+      role: role.value,
+      host: host.value,
+      path: path.value,
+      methods: checks.filter((c) => c.box.checked).map((c) => c.m),
+      kind: kind.value,
+      target: target.value,
+      template: template.value,
+    });
+  return { node, read };
+}
+
+function ruleForm(roles, secrets) {
+  if (!roles.length || !secrets.length) {
+    return el("p", { class: "notice" }, "Add at least one role and one secret before creating a rule.");
+  }
+  const secret = select(secrets.map((s) => [String(s.id), s.name]));
+  const fields = ruleFields(roles);
+  return el(
+    "form",
+    {
+      onsubmit: safe(async () => {
+        const res = await api("POST", "/rules", { ...fields.read(), secret_id: Number(secret.value) });
+        await refresh();
+        if (res && res.notice) notify(res.notice, "notice");
+        else notify("Rule added.");
+      }),
+    },
+    el("h3", {}, "Add a rule"),
+    fields.node,
     field("Secret", secret),
     el("button", { type: "submit", class: "primary" }, "Add rule"),
   );
@@ -557,23 +623,11 @@ async function viewCa(root) {
   root.append(
     el("h2", {}, "CA"),
     el("p", { class: "help" }, "The local CA signs certificates for the permitted domains so the proxy can inject credentials into HTTPS requests. Agents must trust its certificate."),
+    el("p", { class: "help" }, "Domains are derived from your rules: adding a rule for a new host permits it here. When the list changes, agents must reload the CA certificate."),
     el("h3", {}, "Permitted domains"),
-    ca.domains.length ? el("ul", {}, ca.domains.map((d) => el("li", {}, el("code", {}, d)))) : el("p", { class: "muted" }, "No domains permitted yet."),
+    ca.domains.length ? el("ul", {}, ca.domains.map((d) => el("li", {}, el("code", {}, d)))) : el("p", { class: "muted" }, "No domains yet: they appear when you add a rule."),
   );
-  const domain = input("text", { required: true, autocomplete: "off", placeholder: "example.com" });
   root.append(
-    el(
-      "form",
-      {
-        onsubmit: safe(async () => {
-          const res = await api("POST", "/ca/domains", { domain: domain.value.trim() });
-          await refresh();
-          if (res && res.notice) notify(res.notice, "notice");
-        }),
-      },
-      field("Allow domain", domain),
-      el("button", { type: "submit", class: "primary" }, "Allow domain"),
-    ),
     el("h3", {}, "Certificate"),
     el(
       "p",
@@ -764,7 +818,7 @@ async function boot() {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { renderChrome, el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo };
+  module.exports = { renderChrome, el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo, buildRule, secretBody };
 }
 if (typeof window !== "undefined") {
   boot().catch((e) => showHelp("Unexpected error: " + (e && e.message ? e.message : e)));

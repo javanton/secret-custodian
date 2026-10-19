@@ -112,3 +112,8 @@ td[class^="status-"], span[class^="status-"] { font-weight: 600; }
 }
 form h3 { width: 100%; margin: 0; }
 form > button:not(:only-child) { margin-top: 1.4rem; }
+.rule-block { margin: .5rem 0; width: 100%; display: flex; flex-wrap: wrap; gap: .7rem 1rem; align-items: flex-start; }
+.rule-block > legend { padding: 0 .4rem; }
+.rule-list { width: 100%; }
+.rule-intro { width: 100%; margin: 0; }
+.rule-actions { width: 100%; }

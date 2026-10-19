@@ -104,3 +104,19 @@ test("renderChrome puts one real button per section in the nav bar", () => {
   assert.deepEqual(labels, ["Secrets", "Roles & rules", "Tokens", "CA", "Audit"]);
   assert.equal(tabs.find("button")[0].getAttribute("aria-current"), "page");
 });
+
+test("buildRule trims, defaults the path and keeps only checked methods", () => {
+  const r = app.buildRule({ role: "dev", host: " api.github.com ", path: "", methods: ["GET", "HEAD"], kind: "header", target: " Authorization ", template: "Bearer {secret}" });
+  assert.deepEqual(r, {
+    role: "dev", host_pattern: "api.github.com", path_pattern: "*", methods: ["GET", "HEAD"],
+    kind: "header", target_name: "Authorization", template: "Bearer {secret}",
+  });
+});
+
+test("secretBody never puts the value anywhere but `value` and always carries at least one rule", () => {
+  const rule = { role: "dev", host_pattern: "a.com", path_pattern: "*", methods: [], kind: "header", target_name: "X", template: "{secret}" };
+  const b = app.secretBody("gh", "s3cr3t", [rule]);
+  assert.deepEqual(Object.keys(b), ["name", "value", "rules"]);
+  assert.equal(JSON.stringify(b.rules).includes("s3cr3t"), false);
+  assert.throws(() => app.secretBody("gh", "s3cr3t", []), /at least one rule/);
+});
