@@ -2,6 +2,7 @@
 name = "sg"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 sg-core.workspace = true
