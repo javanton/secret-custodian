@@ -63,6 +63,33 @@ pub struct Rule {
     pub secret_id: i64,
 }
 
+/// A rule without its secret: the secret is attached with `with_secret` once it exists.
+#[derive(Debug, Clone)]
+pub struct RuleSpec {
+    pub role: String,
+    pub host_pattern: String,
+    pub path_pattern: String,
+    pub methods: Vec<String>,
+    pub kind: InjectionKind,
+    pub target_name: String,
+    pub template: String,
+}
+
+impl RuleSpec {
+    pub fn with_secret(self, secret_id: i64) -> NewRule {
+        NewRule {
+            role: self.role,
+            host_pattern: self.host_pattern,
+            path_pattern: self.path_pattern,
+            methods: self.methods,
+            kind: self.kind,
+            target_name: self.target_name,
+            template: self.template,
+            secret_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewRule {
     pub role: String,
