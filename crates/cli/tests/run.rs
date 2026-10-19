@@ -918,3 +918,43 @@ async fn secret_add_with_several_roles_demands_one_and_never_leaks_the_value() {
         "nothing is created"
     );
 }
+
+#[tokio::test]
+async fn secret_add_with_an_invalid_target_fails_before_any_request() {
+    let f = secrets_fake(serde_json::json!([]));
+    let r = cli(
+        &f,
+        &[
+            "secret",
+            "add",
+            "gh",
+            "--host",
+            "a.com",
+            "--query",
+            "k",
+            "--template",
+            "Bearer {secret}",
+        ],
+        b"valuevalue\n",
+    )
+    .await;
+    assert!(r.err_msg().contains("template"), "{}", r.err_msg());
+    assert!(f.log().is_empty(), "no request at all: {:?}", f.log().len());
+    assert!(!r.err.contains("created role"));
+}
+
+#[tokio::test]
+async fn secret_add_with_an_explicit_role_does_not_list_roles() {
+    let f = secrets_fake(serde_json::json!([]));
+    cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"valuevalue\n",
+    )
+    .await
+    .res
+    .unwrap();
+    assert!(!f.log().iter().any(|r| r.uri == "/roles"));
+}

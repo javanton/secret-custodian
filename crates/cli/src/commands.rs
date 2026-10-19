@@ -461,9 +461,11 @@ async fn secret(
 ) -> anyhow::Result<()> {
     match c {
         SecretCmd::Add { name, role, target } => {
+            // Validate the target before reading the value or making any request.
+            let mut rule = rule_json("", &target)?;
             let value = read_value(io.stdin, io.tty, true)?;
-            let role = resolve_role(socket, io, role).await?;
-            let rules = json!([rule_json(&role, &target)?]);
+            rule["role"] = json!(resolve_role(socket, io, role).await?);
+            let rules = json!([rule]);
             let v = send_secret(
                 socket,
                 Method::POST,
