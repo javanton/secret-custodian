@@ -395,6 +395,8 @@ bloque de su primera regla (obligatorio) y «Add another rule».
 - **Reglas adicionales.** `POST /rules` sigue existiendo. Borrar la última regla de un secreto
   responde `409` (hay que borrar el secreto). Borrar un secreto borra sus reglas en la misma
   transacción.
+- **Borrar un rol** borra sus reglas (cascada del esquema). Si eso dejara algún secreto sin reglas, responde `409`
+  con los nombres de los secretos afectados y no borra nada; en caso contrario la CA se resincroniza.
 - **Secretos anteriores a la enmienda** sin reglas siguen siendo válidos (nunca se inyectan); el
   listado informa del número de reglas y la web los marca con un aviso.
 - **Rol por defecto.** Si solo existe un rol, el formulario y la CLI lo preseleccionan. Si no
