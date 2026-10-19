@@ -185,8 +185,11 @@ Both adding and removing a domain re-issue the certificate; an unchanged set is 
 - not an IP address; not `invalid` or `*.invalid` (`reserved`: that TLD is the placeholder);
 - single-label names are rejected (TLDs such as `com`), except `localhost`.
 
-Rule hosts are already restricted by the rule validation (`host_pattern must be a lowercase hostname or *.hostname`), so
-in practice the CA validation is the second line of defence (and the source of `reserved` for `x.invalid`).
+Rule validation applies the same DNS rules to `host_pattern` (with a leading `*.` removed; `localhost` is allowed), so a
+new rule can never name a host the CA would refuse and such a request gets a `400`. The CA validation remains as a
+safety net. Rules stored by older builds may still hold such hosts: when the CA domains are derived (every rule
+operation and `sg serve` startup) those hosts are skipped with a `warn` log line naming them, which only narrows the CA
+(they cannot be intercepted) instead of failing the operation.
 
 **The probe** (`probe`): with the new certificate as the only trust anchor and rustls-webpki's verifier, a
 throw-away leaf is issued and verified for `probe.<domain>` for **every** domain of the new set (or the bare domain if

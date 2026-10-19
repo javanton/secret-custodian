@@ -412,7 +412,7 @@ bloque de su primera regla (obligatorio) y «Add another rule».
   deben recargar el certificado; la CLI y la web lo indican junto con la ruta o el comando para
   obtener el PEM vigente. Tras retirar un dominio no es urgente.
 - **Se eliminan** `sg ca allow-domain` y su endpoint (cambio incompatible aceptado: la rama no se
-  ha publicado). La librería conserva `CaService::allow_domain` y añade `set_domains`.
+  ha publicado). La librería conserva `CaService::allow_domain` y añade `prepare_domains`/`persist`/`install` y `domain_guard` (se adquiere antes de la transacción y se mantiene hasta después de `install`).
 - **Pruebas:** API (atomicidad, `400`, `409`, cascada), sincronización de la CA (añadir, retirar,
   comodín, rechazo sin efectos, reinicio), CLI y web.
 

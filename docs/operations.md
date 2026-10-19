@@ -147,7 +147,7 @@ opened normally). Do this only with the server stopped.
 Older builds let you store a secret with no rule and widen the CA
 by hand (`sg ca allow-domain`). The schema did not change, so no migration runs, but on **every** start `sg serve`
 makes the CA's permitted domains equal to the set derived from the rules, once (it logs `CA domains re-derived from the
-rules; agents must reload the CA certificate` at info level, so it shows only with `RUST_LOG=info`, when that changed the CA). Consequences on the first start
+rules; agents must reload the CA certificate` at `warn` level, so it shows with the default log level, when that changed the CA). Rule hosts the CA cannot accept (rows stored by older builds, for example with `_` in a label or under `.invalid`) are skipped with a `warn` line naming them, so startup never fails because of them: those hosts are simply not interceptable until the rule is fixed. Consequences on the first start
 after the upgrade:
 
 - Domains that were allowed by hand and that no rule uses are **dropped** from the CA; hosts that rules need but the CA
