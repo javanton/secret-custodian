@@ -137,6 +137,23 @@ next request in an open MITM tunnel; passthrough tunnels end by idle timeout or 
 attributes every request to the token id and machine label. Mitigations: short `--ttl`, one token per machine, narrow
 roles, revoke on suspicion. The token is not bound to a source address.
 
+#### Isolating agents that share a machine
+
+A token is an identity, not a credential: stealing it never yields a secret value, only the permissions of its role
+while it lives. But two agents running as the **same OS user** can read each other's environment
+(`/proc/<pid>/environ`), shell history and files, so a `reviewer` agent could take the `developer` token. Real
+isolation needs a boundary the kernel enforces. In order of practicality:
+
+1. **One container per agent**, with the token only in that container's `-e HTTPS_PROXY=...`.
+2. **A different OS user per agent** (`sudo -u agent-reviewer ...`), token only in that process's environment.
+3. **A per-process sandbox** (`bubblewrap`, `systemd-run`) with its own PID namespace.
+4. **Same user, damage control only:** keep the token out of files and history, use short `--ttl`, revoke when the
+   session ends, and watch the audit log for a machine label doing something its role should not.
+
+Phase 2b of the roadmap removes the token as a secret: the proxy would also listen on a Unix socket and derive the
+role from the peer credentials (`SO_PEERCRED`), so there is nothing to steal. It requires distinct users or
+containers per role and is not implemented yet (spec, section 10).
+
 ### Stolen CA private key
 
 (Requires the database and key, or process memory.) The thief can sign certificates, but only for the CA's

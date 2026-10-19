@@ -3,6 +3,8 @@
 - **Fecha:** 2026-10-16
 - **Estado:** borrador pendiente de revisión
 - **Alcance de esta spec:** fase 1 (ver "Fases")
+- **Enmienda 2026-10-19:** todo secreto nace con al menos una regla y la CA se deriva de las reglas
+  (§4, §6.3, §7.3–7.5); autenticación por proceso registrada como fase 2b (§5, §10).
 
 ## 1. Propósito
 
@@ -97,7 +99,8 @@ se confirma en el plan.
 ### Esquema (resumen)
 
 - `meta`: versión de esquema, `kdf`, sal Argon2, DEK cifrada, `token_signing_key`.
-- `secrets`: `id`, `name` (único), `value_enc`, `created_at`, `rotated_at`.
+- `secrets`: `id`, `name` (único), `value_enc`, `created_at`, `rotated_at`. Invariante (§7.5): todo
+  secreto tiene al menos una fila en `rules`.
 - `roles`: `name`, `unmatched_policy` (`passthrough` | `deny`).
 - `rules`: `id`, `role`, `host_pattern`, `path_pattern`, `methods`, `injection_kind`
   (`header` | `query`), `target_name`, `template`, `secret_id`.
@@ -118,6 +121,12 @@ se confirma en el plan.
 - Un token es válido para **un rol**. Una máquina puede tener varios tokens (p. ej. `developer`
   y `reviewer`). La etiqueta de máquina sirve para el audit log y la revocación en bloque.
 - Sin token válido el proxy responde `407`; con token válido pero sin permiso, `403`.
+- **Aislamiento entre agentes en una misma máquina.** El token es una identidad, no una credencial:
+  quien lo roba no obtiene ningún secreto, pero sí los permisos de su rol mientras siga vivo. Dos
+  agentes con el mismo usuario del sistema pueden leerse el entorno (`/proc/<pid>/environ`), así que
+  el aislamiento real exige contenedores, usuarios o namespaces distintos; con el mismo usuario solo se
+  reduce el daño (token solo en el entorno de su proceso, TTL cortos, revocación, audit). Se documenta
+  en `docs/security-model.md`. La fase 2b elimina el token como secreto (§10).
 
 ## 6. Proxy e inyección
 
@@ -227,16 +236,16 @@ El argumento de cierre descansa en estas suposiciones:
 ### 6.3 CA acotada
 
 - La CA se crea en el primer arranque con **name constraints** (`permitted dNSName`) limitadas
-  a los dominios registrados con `sg ca allow-domain <dominio>`. Un dominio permitido cubre sus
-  subdominios.
+  a los dominios derivados de las reglas (§7.5); ya no se registran a mano. Un dominio permitido
+  cubre sus subdominios.
 - Sin dominios permitidos la CA se restringe al TLD reservado `invalid`, de modo que nunca queda
-  sin restricciones. `allow-domain` rechaza TLDs y dominios de una sola etiqueta (salvo `localhost`).
+  sin restricciones. El alta de dominios rechaza TLDs y dominios de una sola etiqueta (salvo `localhost`).
   También excluye todas las direcciones IP (`0.0.0.0/0` y `::/0`), porque las restricciones DNS no
-  limitan los SAN de tipo IP. `allow-domain` valida el nombre con las reglas DNS de webpki y comprueba
+  limitan los SAN de tipo IP. El alta valida el nombre con las reglas DNS de webpki y comprueba
   con una hoja de prueba que el nuevo certificado sigue siendo válido para todos los dominios.
-  `allow-domain` no consulta la Public Suffix List: el operador es responsable de no permitir sufijos
+  No se consulta la Public Suffix List: el operador es responsable de no crear reglas sobre sufijos
   públicos como `github.io`.
-- Añadir un dominio fuera de lo permitido reemite el certificado de la CA **con la misma clave**
+- Añadir un dominio (al crear una regla con un host nuevo) o retirarlo (al borrar la última regla que lo usa) reemite el certificado de la CA **con la misma clave**
   y requiere que los agentes recarguen el certificado público. La UI y la CLI avisan.
 - El certificado público se descarga con `sg ca export` o desde la web; la clave privada
   no sale nunca.
@@ -355,11 +364,12 @@ REST/JSON sobre `axum`. Recursos: `secrets`, `roles`, `rules`, `tokens`, `ca`, `
 ```
 sg serve [--key-file|--passphrase] [--proxy-bind] [--admin-bind] [--admin-public-url] [--data-dir] [--socket] [--upstream-ca <pem>]
 sg keygen   [--out <fichero>]
-sg secret   add|rotate|rm|ls
+sg secret   add|rotate|rm|ls     (add exige la primera regla: --role --host --header|--query
+                                  [--path --methods --template])
 sg role     add|rm|ls            (--unmatched passthrough|deny)
 sg rule     add|rm|ls            (--role --host --path --methods --header|--query --template --secret)
 sg token    create|revoke|ls     (--machine --role --ttl)
-sg ca       export|allow-domain|status
+sg ca       export|status
 sg audit       [--role --host --since]
 ```
 
@@ -370,7 +380,40 @@ de comandos (evita que aparezca en el historial y en `ps`).
 
 Frontend estático sin build de Node, embebido en el binario. Pantallas: secretos (solo metadatos),
 roles y reglas, tokens (el valor se muestra una vez), CA (descargar certificado, dominios
-permitidos), audit log.
+derivados de las reglas, solo lectura), audit log. El formulario de alta de secreto incluye el
+bloque de su primera regla (obligatorio) y «Add another rule».
+
+### 7.5 Alta de secretos con reglas y CA derivada
+
+**Invariante:** todo secreto tiene al menos una regla. Un secreto sin regla no se inyectaría nunca.
+
+- **Crear.** `POST /secrets` recibe `{name, value, rules: [...]}` con al menos una regla (`role`,
+  `host`, `path`, `methods`, `header`|`query`, `template`). Se valida todo antes de escribir y
+  secreto y reglas se guardan en una sola transacción. Sin reglas, o con una regla inválida
+  (incluido un host que la CA rechaza), responde `400` y no se crea nada. La CLI y la web usan
+  la misma operación.
+- **Reglas adicionales.** `POST /rules` sigue existiendo. Borrar la última regla de un secreto
+  responde `409` (hay que borrar el secreto). Borrar un secreto borra sus reglas en la misma
+  transacción.
+- **Secretos anteriores a la enmienda** sin reglas siguen siendo válidos (nunca se inyectan); el
+  listado informa del número de reglas y la web los marca con un aviso.
+- **Rol por defecto.** Si solo existe un rol, el formulario y la CLI lo preseleccionan. Si no
+  existe ninguno, se crea antes `default` (`unmatched = passthrough`) como paso aparte; si el alta
+  del secreto falla, ese rol queda creado y es inofensivo.
+- **CA derivada.** Los dominios permitidos son exactamente los hosts de las reglas existentes,
+  normalizados; `*.x` se traduce a `x`, que por RFC 5280 cubre `x` y sus subdominios (algo más
+  ancho que la regla; se documenta). Se recalculan tras cada cambio de reglas o secretos y la CA
+  solo se reemite si el conjunto cambia. Sin reglas vuelve al placeholder `invalid`. La
+  validación del §6.3 se ejecuta antes de confirmar, y regla y CA cambian juntas o no cambian.
+  Al arrancar se sincroniza una vez con las reglas existentes.
+- **Aviso a los agentes.** La respuesta incluye `ca_changed`. Si se añadió un dominio, los agentes
+  deben recargar el certificado; la CLI y la web lo indican junto con la ruta o el comando para
+  obtener el PEM vigente. Tras retirar un dominio no es urgente.
+- **Se eliminan** `sg ca allow-domain` y su endpoint (cambio incompatible aceptado: la rama no se
+  ha publicado). La librería conserva `CaService::allow_domain` y añade `set_domains`.
+- **Pruebas:** API (atomicidad, `400`, `409`, cascada), sincronización de la CA (añadir, retirar,
+  comodín, rechazo sin efectos, reinicio), CLI y web.
+
 
 ## 8. Errores y observabilidad
 
@@ -402,6 +445,11 @@ permitidos), audit log.
 1. **Esta spec:** núcleo cifrado, CA acotada, proxy con inyección en header/query, tokens por
    (máquina, rol), reglas, audit, CLI y web local.
 2. Sidecar / launcher `sg run` (el agente no ve el token).
+   2b. **Autenticación por proceso.** El proxy escucha también en un socket Unix y deduce el rol
+   del cliente con `SO_PEERCRED` (uid/pid) mapeado a roles, de modo que no existe token que robar.
+   Exige usuarios, contenedores o namespaces distintos por rol y no sirve entre agentes del mismo
+   usuario; convive con los tokens y se diseñaría junto a `sg run`. Pendiente de brainstorm y spec
+   propia. Registrada el 2026-10-19 a petición del operador.
 3. Modo de administración remota con login (opt-in).
 4. Federación OIDC como segundo `TokenVerifier` y tokens por agente.
 5. Inyección en body y firmas (SigV4).
