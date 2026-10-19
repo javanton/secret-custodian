@@ -55,7 +55,14 @@ pub enum ClientCommand {
 #[derive(Subcommand)]
 pub enum SecretCmd {
     /// Add a secret; the value is read from stdin or a hidden prompt, never from arguments
-    Add { name: String },
+    Add {
+        name: String,
+        /// Role of the first rule (default: the only role, or a new `default`)
+        #[arg(long)]
+        role: Option<String>,
+        #[command(flatten)]
+        target: RuleTarget,
+    },
     /// Rotate a secret's value (read from stdin or a hidden prompt)
     Rotate { name: String },
     /// Remove a secret
@@ -79,11 +86,10 @@ pub enum RoleCmd {
     Ls,
 }
 
+/// Where and how a secret is injected; shared by `secret add` (first rule) and `rule add`.
 #[derive(Args)]
 #[command(group(clap::ArgGroup::new("target").required(true).args(["header", "query"])))]
-pub struct RuleAdd {
-    #[arg(long)]
-    role: String,
+pub struct RuleTarget {
     #[arg(long)]
     host: String,
     #[arg(long, default_value = "*")]
@@ -99,6 +105,14 @@ pub struct RuleAdd {
     query: Option<String>,
     #[arg(long, default_value = "{secret}")]
     template: String,
+}
+
+#[derive(Args)]
+pub struct RuleAdd {
+    #[arg(long)]
+    role: String,
+    #[command(flatten)]
+    target: RuleTarget,
     /// Name of an existing secret
     #[arg(long)]
     secret: String,
@@ -144,9 +158,7 @@ pub enum TokenCmd {
 pub enum CaCmd {
     /// Print the CA certificate (PEM)
     Export,
-    /// Permit a domain (and its subdomains); re-issues the CA certificate
-    AllowDomain { domain: String },
-    /// Show the domains the CA permits
+    /// Show the domains the CA permits (derived from the rules)
     Status,
 }
 
@@ -225,8 +237,9 @@ async fn send_secret(
     path: &str,
     name: Option<&str>,
     value: &str,
+    rules: Option<&Value>,
 ) -> anyhow::Result<Value> {
-    let body = secret_body(name, value)?;
+    let body = secret_body(name, value, rules)?;
     send(
         socket,
         method,
@@ -372,6 +385,74 @@ pub async fn run_io(
     }
 }
 
+/// Wire form of one rule, shared by `secret add` and `rule add`.
+fn rule_json(role: &str, t: &RuleTarget) -> anyhow::Result<Value> {
+    let (kind, target) = match (&t.header, &t.query) {
+        (Some(h), None) => ("header", h.clone()),
+        (None, Some(q)) => ("query", q.clone()),
+        _ => bail!("use exactly one of --header or --query"),
+    };
+    if kind == "query" && t.template != "{secret}" {
+        bail!(
+            "--query injects the bare secret: the template must be `{{secret}}` (got `{}`)",
+            t.template
+        );
+    }
+    let methods: Vec<String> = t
+        .methods
+        .iter()
+        .map(|m| m.trim().to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .collect();
+    Ok(json!({
+        "role": role, "host_pattern": t.host, "path_pattern": t.path, "methods": methods,
+        "kind": kind, "target_name": target, "template": t.template
+    }))
+}
+
+/// `--role`, else the only existing role, else a new `default`.
+async fn resolve_role(
+    socket: &Path,
+    io: &mut Io<'_>,
+    role: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(r) = role {
+        return Ok(r);
+    }
+    let roles = api(socket, Method::GET, "/roles", None).await?;
+    let names: Vec<String> = roles
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(String::from))
+        .collect();
+    match names.len() {
+        0 => {
+            let body = json!({"name": "default", "unmatched": "passthrough"});
+            api(socket, Method::POST, "/roles", Some(body)).await?;
+            writeln!(
+                io.err,
+                "note: no role existed, created role 'default' (unmatched = passthrough)"
+            )?;
+            Ok("default".into())
+        }
+        1 => Ok(names[0].clone()),
+        _ => bail!(
+            "several roles exist ({}): choose one with --role",
+            names.join(", ")
+        ),
+    }
+}
+
+/// The server's CA notice (agents must reload the certificate), as a warning on stderr.
+fn print_notice(io: &mut Io, v: &Value) -> anyhow::Result<()> {
+    if let Some(w) = v["notice"].as_str() {
+        writeln!(io.err, "warning: {}", sanitize(w, 500))?;
+    }
+    Ok(())
+}
+
 async fn secret(
     socket: &Path,
     opts: &ClientOpts,
@@ -379,15 +460,31 @@ async fn secret(
     io: &mut Io<'_>,
 ) -> anyhow::Result<()> {
     match c {
-        SecretCmd::Add { name } => {
+        SecretCmd::Add { name, role, target } => {
             let value = read_value(io.stdin, io.tty, true)?;
-            let v = send_secret(socket, Method::POST, "/secrets", Some(&name), &value).await?;
-            done(io, opts, &v, format!("secret '{name}' stored"))
+            let role = resolve_role(socket, io, role).await?;
+            let rules = json!([rule_json(&role, &target)?]);
+            let v = send_secret(
+                socket,
+                Method::POST,
+                "/secrets",
+                Some(&name),
+                &value,
+                Some(&rules),
+            )
+            .await?;
+            done(
+                io,
+                opts,
+                &v,
+                format!("secret '{name}' stored with rule {}", v["rules"][0]["id"]),
+            )?;
+            print_notice(io, &v)
         }
         SecretCmd::Rotate { name } => {
             let value = read_value(io.stdin, io.tty, false)?;
             let path = format!("/secrets/{}", enc(&name));
-            let v = send_secret(socket, Method::PUT, &path, None, &value).await?;
+            let v = send_secret(socket, Method::PUT, &path, None, &value, None).await?;
             done(io, opts, &v, format!("secret '{name}' rotated"))
         }
         SecretCmd::Rm { name } => {
@@ -397,14 +494,21 @@ async fn secret(
         }
         SecretCmd::Ls => {
             let v = api(socket, Method::GET, "/secrets", None).await?;
-            list_table(io, opts, &v, &["ID", "NAME", "CREATED", "ROTATED"], |s| {
-                vec![
-                    text(s, "id"),
-                    text(s, "name"),
-                    time(s, "created_at"),
-                    time(s, "rotated_at"),
-                ]
-            })
+            list_table(
+                io,
+                opts,
+                &v,
+                &["ID", "NAME", "RULES", "CREATED", "ROTATED"],
+                |s| {
+                    vec![
+                        text(s, "id"),
+                        text(s, "name"),
+                        text(s, "rules"),
+                        time(s, "created_at"),
+                        time(s, "rotated_at"),
+                    ]
+                },
+            )
         }
     }
 }
@@ -433,39 +537,17 @@ async fn role(socket: &Path, opts: &ClientOpts, c: RoleCmd, io: &mut Io<'_>) -> 
 async fn rule(socket: &Path, opts: &ClientOpts, c: RuleCmd, io: &mut Io<'_>) -> anyhow::Result<()> {
     match c {
         RuleCmd::Add(a) => {
-            let (kind, target) = match (&a.header, &a.query) {
-                (Some(h), None) => ("header", h.clone()),
-                (None, Some(q)) => ("query", q.clone()),
-                _ => bail!("use exactly one of --header or --query"),
-            };
-            if kind == "query" && a.template != "{secret}" {
-                bail!(
-                    "--query injects the bare secret: the template must be `{{secret}}` (got `{}`)",
-                    a.template
-                );
-            }
-            let methods: Vec<String> = a
-                .methods
-                .iter()
-                .map(|m| m.trim().to_ascii_uppercase())
-                .filter(|m| !m.is_empty())
-                .collect();
+            let mut body = rule_json(&a.role, &a.target)?;
             let secrets = api(socket, Method::GET, "/secrets", None).await?;
             let secret_id = secrets
                 .as_array()
                 .and_then(|l| l.iter().find(|s| s["name"] == a.secret.as_str()))
                 .and_then(|s| s["id"].as_i64())
                 .with_context(|| format!("secret '{}' not found", a.secret))?;
-            let body = json!({
-                "role": a.role, "host_pattern": a.host, "path_pattern": a.path, "methods": methods,
-                "kind": kind, "target_name": target, "template": a.template, "secret_id": secret_id
-            });
+            body["secret_id"] = json!(secret_id);
             let v = api(socket, Method::POST, "/rules", Some(body)).await?;
             done(io, opts, &v, format!("rule {} created", v["rule"]["id"]))?;
-            if let Some(w) = v["ca_warning"].as_str() {
-                writeln!(io.err, "warning: {}", sanitize(w, 500))?;
-            }
-            Ok(())
+            print_notice(io, &v)
         }
         RuleCmd::Rm { id } => {
             let v = api(socket, Method::DELETE, &format!("/rules/{id}"), None).await?;
@@ -608,17 +690,6 @@ async fn ca(socket: &Path, opts: &ClientOpts, c: CaCmd, io: &mut Io<'_>) -> anyh
             }
             io.out.write_all(&raw)?;
             Ok(())
-        }
-        CaCmd::AllowDomain { domain } => {
-            let v = api(
-                socket,
-                Method::POST,
-                "/ca/domains",
-                Some(json!({ "domain": domain })),
-            )
-            .await?;
-            let notice = sanitize(v["notice"].as_str().unwrap_or("done"), 500);
-            done(io, opts, &v, notice)
         }
         CaCmd::Status => {
             let v = api(socket, Method::GET, "/ca", None).await?;
@@ -774,10 +845,67 @@ mod tests {
 
     #[test]
     fn secret_add_has_no_value_argument() {
-        assert!(parse(["sg", "secret", "add", "gh", "ghp_literal_value"]).is_err());
-        assert!(parse(["sg", "secret", "add", "gh"]).is_ok());
+        let add = [
+            "sg", "secret", "add", "gh", "--host", "a.com", "--header", "A",
+        ];
+        assert!(parse(add).is_ok());
+        assert!(parse([
+            "sg",
+            "secret",
+            "add",
+            "gh",
+            "ghp_literal_value",
+            "--host",
+            "a.com",
+            "--header",
+            "A"
+        ])
+        .is_err());
         assert!(parse(["sg", "secret", "rotate", "gh", "ghp_literal_value"]).is_err());
-        assert!(parse(["sg", "secret", "add", "gh", "--value", "x"]).is_err());
+        assert!(parse([
+            "sg", "secret", "add", "gh", "--value", "x", "--host", "a.com", "--header", "A"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn secret_add_requires_a_rule_target_and_a_host() {
+        assert!(parse(["sg", "secret", "add", "gh"]).is_err());
+        assert!(parse(["sg", "secret", "add", "gh", "--host", "a.com"]).is_err());
+        assert!(parse([
+            "sg",
+            "secret",
+            "add",
+            "gh",
+            "--host",
+            "a.com",
+            "--header",
+            "Authorization",
+            "--query",
+            "k"
+        ])
+        .is_err());
+        assert!(parse([
+            "sg",
+            "secret",
+            "add",
+            "gh",
+            "--host",
+            "a.com",
+            "--header",
+            "Authorization"
+        ])
+        .is_ok());
+        assert!(parse([
+            "sg", "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--query", "k"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn ca_has_no_allow_domain_any_more() {
+        assert!(parse(["sg", "ca", "allow-domain", "x.com"]).is_err());
+        assert!(parse(["sg", "ca", "status"]).is_ok());
     }
 
     #[test]

@@ -71,8 +71,13 @@ pub fn read_value(
     finish(buf, true)
 }
 
-/// Builds `{"name":..,"value":..}` (or `{"value":..}`) without intermediate copies of the value.
-pub fn secret_body(name: Option<&str>, value: &str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+/// Builds `{"name":..,"value":..,"rules":..}` (name and rules optional) without intermediate
+/// copies of the value. The rules carry no secret.
+pub fn secret_body(
+    name: Option<&str>,
+    value: &str,
+    rules: Option<&serde_json::Value>,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     // Worst case a byte becomes a six-byte `\u00XX` escape, so the buffer never reallocates.
     let mut out = Zeroizing::new(Vec::with_capacity(
         6 * value.len() + 6 * name.map_or(0, str::len) + 64,
@@ -85,6 +90,32 @@ pub fn secret_body(name: Option<&str>, value: &str) -> anyhow::Result<Zeroizing<
     }
     out.extend_from_slice(b"\"value\":");
     serde_json::to_writer(&mut *out, value)?;
+    if let Some(r) = rules {
+        out.extend_from_slice(b",\"rules\":");
+        serde_json::to_writer(&mut *out, r)?;
+    }
     out.push(b'}');
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_body_without_rules() {
+        let b = secret_body(None, "v\"1", None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v, serde_json::json!({"value": "v\"1"}));
+    }
+
+    #[test]
+    fn secret_body_with_rules() {
+        let rules = serde_json::json!([{"role": "dev", "host_pattern": "a.com"}]);
+        let b = secret_body(Some("gh"), "s3cr3t", Some(&rules)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["name"], "gh");
+        assert_eq!(v["value"], "s3cr3t");
+        assert_eq!(v["rules"], rules);
+    }
 }

@@ -140,7 +140,14 @@ fn echo_ok() -> Fake {
 #[tokio::test]
 async fn secret_add_reads_stdin_strips_one_newline_and_never_prints_it() {
     let f = echo_ok();
-    let r = cli(&f, &["secret", "add", "gh"], b"ghp_sekrit value \n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"ghp_sekrit value \n",
+    )
+    .await;
     r.ok();
     let log = f.log();
     assert_eq!(log.len(), 1);
@@ -148,20 +155,24 @@ async fn secret_add_reads_stdin_strips_one_newline_and_never_prints_it() {
     assert_eq!(log[0].uri, "/secrets");
     assert_eq!(log[0].ctype.as_deref(), Some("application/json"));
     let body: serde_json::Value = serde_json::from_slice(&log[0].body).unwrap();
-    assert_eq!(
-        body,
-        serde_json::json!({"name": "gh", "value": "ghp_sekrit value "})
-    );
+    assert_eq!(body["name"], "gh");
+    assert_eq!(body["value"], "ghp_sekrit value ");
     assert!(!r.out().contains("sekrit") && !r.err.contains("sekrit"));
 }
 
 #[tokio::test]
 async fn secret_add_strips_crlf() {
     let f = echo_ok();
-    cli(&f, &["secret", "add", "gh"], b"abc\r\n")
-        .await
-        .res
-        .unwrap();
+    cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"abc\r\n",
+    )
+    .await
+    .res
+    .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&f.log()[0].body).unwrap();
     assert_eq!(body["value"], "abc");
 }
@@ -201,7 +212,14 @@ async fn invalid_values_are_refused_before_any_request() {
     }));
     for (label, input) in cases {
         let f = echo_ok();
-        let r = cli(&f, &["secret", "add", "gh"], &input).await;
+        let r = cli(
+            &f,
+            &[
+                "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+            ],
+            &input,
+        )
+        .await;
         assert!(r.res.is_err(), "{label} must fail");
         assert!(f.log().is_empty(), "{label}: request was sent");
         let msg = r.err_msg();
@@ -217,7 +235,16 @@ async fn a_value_of_exactly_8192_bytes_is_accepted() {
     let f = echo_ok();
     let mut input = vec![b'a'; 8192];
     input.push(b'\n');
-    cli(&f, &["secret", "add", "gh"], &input).await.res.unwrap();
+    cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        &input,
+    )
+    .await
+    .res
+    .unwrap();
     assert_eq!(f.log().len(), 1);
 }
 
@@ -234,7 +261,14 @@ impl Read for Endless {
 async fn oversize_stdin_is_rejected_without_reading_it_all() {
     let f = echo_ok();
     let mut src = Endless(0);
-    let r = cli_with(&f.sock, &["secret", "add", "gh"], &mut src).await;
+    let r = cli_with(
+        &f.sock,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        &mut src,
+    )
+    .await;
     assert!(r.res.is_err());
     assert!(src.0 <= 8193 + 8192, "read {} bytes", src.0);
     assert!(f.log().is_empty());
@@ -251,7 +285,14 @@ async fn server_errors_that_echo_the_value_never_reach_the_output() {
                 .into_bytes(),
         )
     });
-    let r = cli(&f, &["secret", "add", "gh"], b"ghp_TOPSECRET\n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"ghp_TOPSECRET\n",
+    )
+    .await;
     let msg = r.err_msg();
     assert!(!msg.contains("TOPSECRET"), "{msg}");
     assert!(!r.out().contains("TOPSECRET") && !r.err.contains("TOPSECRET"));
@@ -261,13 +302,27 @@ async fn server_errors_that_echo_the_value_never_reach_the_output() {
 #[tokio::test]
 async fn short_values_do_not_mangle_ordinary_words_in_server_errors() {
     let f = fake(|_| (409, br#"{"error":"secret already exists"}"#.to_vec()));
-    let r = cli(&f, &["secret", "add", "gh"], b"x\n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"x\n",
+    )
+    .await;
     assert!(
         r.err_msg().contains("secret already exists"),
         "{}",
         r.err_msg()
     );
-    let r = cli(&f, &["secret", "add", "gh"], b"ist\n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"ist\n",
+    )
+    .await;
     assert!(
         r.err_msg().contains("secret already exists"),
         "{}",
@@ -286,7 +341,14 @@ async fn short_values_are_still_never_echoed_as_the_whole_message() {
                 .into_bytes(),
         )
     });
-    let r = cli(&f, &["secret", "add", "gh"], b"hunter2\n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"hunter2\n",
+    )
+    .await;
     assert!(!r.err_msg().contains("hunter2"), "{}", r.err_msg());
 }
 
@@ -301,7 +363,14 @@ async fn values_of_eight_bytes_are_redacted_inside_longer_messages() {
                 .into_bytes(),
         )
     });
-    let r = cli(&f, &["secret", "add", "gh"], b"12345678\n").await;
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--role", "dev", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"12345678\n",
+    )
+    .await;
     assert!(!r.err_msg().contains("12345678"), "{}", r.err_msg());
     assert!(r.err_msg().contains("bad"), "{}", r.err_msg());
 }
@@ -431,22 +500,24 @@ async fn role_add_defaults_to_passthrough() {
 }
 
 fn rules_fake() -> Fake {
-    fake(|rec| match (rec.method.as_str(), rec.uri.as_str()) {
+    fake(|rec| {
+        match (rec.method.as_str(), rec.uri.as_str()) {
         ("GET", "/secrets") => ok_json(
             serde_json::json!([{"id": 7, "name": "gh", "created_at": 0, "rotated_at": null}]),
         ),
         ("POST", "/rules") => (
             201,
-            serde_json::json!({"rule": {"id": 4}, "ca_warning": "the CA does not permit h.com"})
+            serde_json::json!({"rule": {"id": 4}, "ca_changed": true, "notice": "the CA certificate changed: agents must reload it"})
                 .to_string()
                 .into_bytes(),
         ),
         _ => (404, br#"{"error":"not found"}"#.to_vec()),
+    }
     })
 }
 
 #[tokio::test]
-async fn rule_add_resolves_the_secret_and_prints_the_ca_warning_on_stderr() {
+async fn rule_add_resolves_the_secret_and_prints_the_ca_notice_on_stderr() {
     let f = rules_fake();
     let r = cli(
         &f,
@@ -477,8 +548,8 @@ async fn rule_add_resolves_the_secret_and_prints_the_ca_warning_on_stderr() {
         body,
         serde_json::json!({"role": "dev", "host_pattern": "h.com", "path_pattern": "*", "methods": ["GET", "HEAD"], "kind": "header", "target_name": "Authorization", "template": "Bearer {secret}", "secret_id": 7})
     );
-    assert!(r.err.contains("the CA does not permit h.com"), "{}", r.err);
-    assert!(!r.out().contains("does not permit"));
+    assert!(r.err.contains("the CA certificate changed"), "{}", r.err);
+    assert!(!r.out().contains("certificate changed"));
 }
 
 #[tokio::test]
@@ -682,18 +753,6 @@ async fn ca_export_writes_the_pem_exactly() {
 }
 
 #[tokio::test]
-async fn ca_allow_domain_prints_the_notice() {
-    let f = fake(|_| {
-        ok_json(serde_json::json!({"domains": ["x.com"], "notice": "the CA certificate changed"}))
-    });
-    let r = cli(&f, &["ca", "allow-domain", "x.com"], b"").await;
-    r.ok();
-    assert!(r.out().contains("the CA certificate changed"));
-    let body: serde_json::Value = serde_json::from_slice(&f.log()[0].body).unwrap();
-    assert_eq!(body, serde_json::json!({"domain": "x.com"}));
-}
-
-#[tokio::test]
 async fn audit_builds_an_encoded_query() {
     let f = fake(|_| ok_json(serde_json::json!([])));
     cli(
@@ -751,4 +810,111 @@ async fn odd_names_cannot_change_the_route() {
         cli(&f, &["secret", "rm", name], b"").await.res.unwrap();
         assert_eq!(f.log().last().unwrap().uri, want);
     }
+}
+
+fn secrets_fake(roles: serde_json::Value) -> Fake {
+    fake(move |rec| {
+        match (rec.method.as_str(), rec.uri.as_str()) {
+        ("GET", "/roles") => ok_json(roles.clone()),
+        ("POST", "/roles") => (
+            201,
+            br#"{"name":"default","unmatched":"passthrough"}"#.to_vec(),
+        ),
+        ("POST", "/secrets") => (
+            201,
+            serde_json::json!({"secret":{"id":1,"name":"gh","created_at":0,"rotated_at":null},
+                "rules":[{"id":1}],"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sg ca export)"})
+            .to_string()
+            .into_bytes(),
+        ),
+        _ => (404, br#"{"error":"not found"}"#.to_vec()),
+    }
+    })
+}
+
+#[tokio::test]
+async fn secret_add_sends_the_value_and_its_first_rule_in_one_request() {
+    let f = secrets_fake(serde_json::json!([{"name":"dev","unmatched":"deny"}]));
+    let r = cli(
+        &f,
+        &[
+            "secret",
+            "add",
+            "gh",
+            "--host",
+            "api.github.com",
+            "--header",
+            "Authorization",
+            "--template",
+            "Bearer {secret}",
+        ],
+        b"s3cr3t-value\n",
+    )
+    .await;
+    r.ok();
+    let log = f.log();
+    let post = log
+        .iter()
+        .find(|r| r.method == "POST" && r.uri == "/secrets")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["name"], "gh");
+    assert_eq!(body["value"], "s3cr3t-value");
+    assert_eq!(
+        body["rules"][0]["role"], "dev",
+        "the only role is chosen automatically"
+    );
+    assert_eq!(body["rules"][0]["host_pattern"], "api.github.com");
+    assert_eq!(body["rules"][0]["kind"], "header");
+    assert_eq!(body["rules"][0]["template"], "Bearer {secret}");
+    assert!(
+        r.err.contains("reload"),
+        "the CA notice goes to stderr: {}",
+        r.err
+    );
+}
+
+#[tokio::test]
+async fn secret_add_creates_the_default_role_when_there_is_none() {
+    let f = secrets_fake(serde_json::json!([]));
+    cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"valuevalue\n",
+    )
+    .await
+    .res
+    .unwrap();
+    let log = f.log();
+    assert!(log.iter().any(|r| r.method == "POST" && r.uri == "/roles"));
+    let post = log
+        .iter()
+        .find(|r| r.uri == "/secrets" && r.method == "POST")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["rules"][0]["role"], "default");
+}
+
+#[tokio::test]
+async fn secret_add_with_several_roles_demands_one_and_never_leaks_the_value() {
+    let f = secrets_fake(
+        serde_json::json!([{"name":"a","unmatched":"deny"},{"name":"b","unmatched":"deny"}]),
+    );
+    let r = cli(
+        &f,
+        &[
+            "secret", "add", "gh", "--host", "a.com", "--header", "X-Key",
+        ],
+        b"valuevalue\n",
+    )
+    .await;
+    let e = format!("{:#}", r.res.unwrap_err());
+    assert!(e.contains("--role") && e.contains("a, b"), "{e}");
+    assert!(!e.contains("valuevalue"));
+    assert!(
+        !f.log().iter().any(|r| r.method == "POST"),
+        "nothing is created"
+    );
 }

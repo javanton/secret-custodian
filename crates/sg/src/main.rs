@@ -27,11 +27,11 @@ KEY SOURCES (for `sg serve`)
 EXAMPLE WORKFLOW
   sg keygen --out ~/.config/sg.key            # once; back this file up
   sg serve --key-file ~/.config/sg.key &      # prints the proxy address and the web login URL
-  echo -n \"$GITHUB_TOKEN\" | sg secret add gh # value from stdin, never from arguments
   sg role add reviewer --unmatched deny
-  sg ca allow-domain github.com
-  sg rule add --role reviewer --host api.github.com --methods GET \\
-      --header Authorization --template 'Bearer {secret}' --secret gh
+  echo -n \"$GITHUB_TOKEN\" | sg secret add gh --role reviewer --host api.github.com \\
+      --methods GET --header Authorization --template 'Bearer {secret}'
+                                               # value from stdin, never from arguments; the CA
+                                               # domains come from the rules (see `sg ca status`)
   sg token create --machine laptop --role reviewer   # prints the HTTPS_PROXY line for the agent
   sg login-url                                 # a fresh link to the web UI";
 

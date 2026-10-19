@@ -261,7 +261,7 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
     if sg_admin::ops::sync_ca(&vault, &ca)
         .map_err(|e| anyhow::anyhow!("cannot sync the CA with the rules: {}", e.1))?
     {
-        tracing::info!(
+        tracing::warn!(
             "CA domains re-derived from the rules; agents must reload the CA certificate"
         );
     }

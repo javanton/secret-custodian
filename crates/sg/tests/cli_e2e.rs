@@ -272,7 +272,6 @@ fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
     assert!(s.login.contains("/#t="));
     let (ok, url) = sg(&s, &["login-url"], None);
     assert!(ok && url.contains("/#t="), "{url}");
-    assert!(sg(&s, &["secret", "add", "gh"], Some(&format!("{MARKER}\n"))).0);
     assert!(
         sg(
             &s,
@@ -281,12 +280,12 @@ fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
         )
         .0
     );
-    assert!(sg(&s, &["ca", "allow-domain", "github.com"], None).0);
     let (ok, out) = sg(
         &s,
         &[
-            "rule",
+            "secret",
             "add",
+            "gh",
             "--role",
             "reviewer",
             "--host",
@@ -297,12 +296,12 @@ fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
             "Authorization",
             "--template",
             "Bearer {secret}",
-            "--secret",
-            "gh",
         ],
-        None,
+        Some(&format!("{MARKER}\n")),
     );
     assert!(ok, "{out}");
+    let (ok, ca) = sg(&s, &["ca", "status"], None);
+    assert!(ok && ca.contains("api.github.com"), "{ca}");
     let (ok, token_out) = sg(
         &s,
         &[
@@ -333,13 +332,21 @@ fn full_cli_flow_never_echoes_the_secret_and_db_stays_encrypted() {
     }
     assert!(!everything.contains(MARKER));
     assert!(
-        !sg(&s, &["secret", "add", "bad"], Some("x\r\ny\n")).0,
+        !sg(
+            &s,
+            &["secret", "add", "bad", "--role", "reviewer", "--host", "a.com", "--header", "X"],
+            Some("x\r\ny\n")
+        )
+        .0,
         "CRLF values must be refused"
     );
+    let (ok, ls) = sg(&s, &["secret", "ls"], None);
+    assert!(ok && ls.contains("RULES"), "{ls}");
     assert!(
-        !sg(&s, &["secret", "rm", "gh"], None).0,
-        "secret in use must be refused"
+        sg(&s, &["secret", "rm", "gh"], None).0,
+        "removing a secret cascades to its rules"
     );
+    assert!(!sg(&s, &["rule", "ls"], None).1.contains("api.github.com"));
     for e in std::fs::read_dir(&s.data).unwrap().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with("vault.db") {
@@ -564,7 +571,14 @@ fn a_second_instance_on_the_same_dir_fails_without_damaging_the_first() {
         s.socket.exists(),
         "the first instance's socket must survive"
     );
-    assert!(sg(&s, &["secret", "add", "still-ok"], Some("v\n")).0);
+    assert!(
+        sg(
+            &s,
+            &["secret", "add", "still-ok", "--host", "a.com", "--header", "X"],
+            Some("v\n")
+        )
+        .0
+    );
     assert!(sg(&s, &["secret", "ls"], None).1.contains("still-ok"));
 }
 
