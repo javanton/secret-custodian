@@ -120,3 +120,13 @@ test("secretBody never puts the value anywhere but `value` and always carries at
   assert.equal(JSON.stringify(b.rules).includes("s3cr3t"), false);
   assert.throws(() => app.secretBody("gh", "s3cr3t", []), /at least one rule/);
 });
+
+test("capitalise and deleteSecretLabel are small pure helpers", () => {
+  assert.equal(app.capitalise("the CA certificate changed"), "The CA certificate changed");
+  assert.equal(app.capitalise(""), "");
+  assert.equal(app.capitalise(undefined), "");
+  assert.equal(app.deleteSecretLabel(3), "Yes, delete (and its 3 rules)");
+  assert.equal(app.deleteSecretLabel(1), "Yes, delete (and its 1 rule)");
+  assert.equal(app.deleteSecretLabel(0), "Yes, delete");
+  assert.equal(app.deleteSecretLabel(undefined), "Yes, delete");
+});

@@ -95,6 +95,18 @@ function buildRule(v) {
   };
 }
 
+/** Upper-cases the first letter of an API notice so it reads as a sentence after "added.". */
+function capitalise(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
+}
+
+/** Confirmation label for deleting a secret: its rules go with it. */
+function deleteSecretLabel(rules) {
+  const n = Number(rules);
+  if (!Number.isFinite(n) || n <= 0) return "Yes, delete";
+  return `Yes, delete (and its ${n} ${n === 1 ? "rule" : "rules"})`;
+}
+
 /** Body for `POST /secrets`: a secret is only useful with at least one rule. */
 function secretBody(name, value, rules) {
   if (!rules.length) throw new Error("a secret needs at least one rule");
@@ -314,7 +326,7 @@ async function viewSecrets(root) {
           }
           const res = await api("POST", "/secrets", body);
           await refresh();
-          if (res && res.notice) notify(`Secret "${body.name}" added. ${res.notice}`, "notice");
+          if (res && res.notice) notify(`Secret "${body.name}" added. ${capitalise(res.notice)}`, "notice");
           else notify(`Secret "${body.name}" added.`);
         }),
       },
@@ -333,7 +345,7 @@ async function viewSecrets(root) {
 function secretActions(s) {
   const box = el("div", { class: "row-actions" });
   const rotateBtn = el("button", { type: "button", onclick: openRotate }, "Rotate");
-  const del = confirmButton("Delete", "Yes, delete", async () => {
+  const del = confirmButton("Delete", deleteSecretLabel(s.rules), async () => {
     await api("DELETE", "/secrets/" + encodeURIComponent(s.name));
     notify(`Secret "${s.name}" deleted.`);
     await refresh();
@@ -818,7 +830,7 @@ async function boot() {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { renderChrome, el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo, buildRule, secretBody };
+  module.exports = { renderChrome, el, table, parseFragment, parseTtl, proxyEnv, tokenStatus, api, setOnExpired, encodeUserinfo, buildRule, secretBody, capitalise, deleteSecretLabel };
 }
 if (typeof window !== "undefined") {
   boot().catch((e) => showHelp("Unexpected error: " + (e && e.message ? e.message : e)));
