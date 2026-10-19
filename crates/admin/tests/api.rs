@@ -88,18 +88,46 @@ fn rule_body(secret_id: i64) -> Value {
     })
 }
 
+fn secret_body(name: &str, role: &str, host: &str) -> Value {
+    json!({"name": name, "value": "v", "rules": [{
+        "role": role, "host_pattern": host, "kind": "header",
+        "target_name": "Authorization", "template": "Bearer {secret}"
+    }]})
+}
+
+async fn role(app: &Router, name: &str) {
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            "/roles",
+            Some(json!({"name": name, "unmatched": "deny"}))
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+}
+
+async fn domains(app: &Router) -> Vec<String> {
+    let v = json_of(&call(app, "GET", "/ca", None).await.1);
+    v["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
 async fn no_route_ever_returns_a_secret_value() {
     let (_d, app) = app();
-    let (st, _) = call(
-        &app,
-        "POST",
-        "/secrets",
-        Some(json!({"name":"gh","value":"TOPSECRET-VALUE"})),
-    )
-    .await;
+    role(&app, "dev").await;
+    let mut body = secret_body("gh", "dev", "a.com");
+    body["value"] = json!("TOPSECRET-VALUE");
+    let (st, created) = call(&app, "POST", "/secrets", Some(body)).await;
     assert_eq!(st, StatusCode::CREATED);
-    let mut dump = String::new();
+    let mut dump = created;
     for uri in [
         "/secrets",
         "/secrets/gh",
@@ -126,13 +154,10 @@ async fn no_route_ever_returns_a_secret_value() {
 #[tokio::test]
 async fn secret_with_crlf_is_rejected_with_400() {
     let (_d, app) = app();
-    let (st, body) = call(
-        &app,
-        "POST",
-        "/secrets",
-        Some(json!({"name":"x","value":"a\r\nEvil: 1"})),
-    )
-    .await;
+    role(&app, "dev").await;
+    let mut body = secret_body("x", "dev", "a.com");
+    body["value"] = json!("a\r\nEvil: 1");
+    let (st, body) = call(&app, "POST", "/secrets", Some(body)).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(json_of(&body)["error"].is_string());
 }
@@ -140,21 +165,22 @@ async fn secret_with_crlf_is_rejected_with_400() {
 #[tokio::test]
 async fn secret_create_rotate_delete_list_flow_and_conflicts() {
     let (_d, app) = app();
+    role(&app, "dev").await;
     let (st, body) = call(
         &app,
         "POST",
         "/secrets",
-        Some(json!({"name":"gh","value":"v1"})),
+        Some(secret_body("gh", "dev", "a.com")),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED);
-    assert_eq!(json_of(&body)["name"], "gh");
+    assert_eq!(json_of(&body)["secret"]["name"], "gh");
     assert_eq!(
         call(
             &app,
             "POST",
             "/secrets",
-            Some(json!({"name":"gh","value":"v2"}))
+            Some(secret_body("gh", "dev", "a.com"))
         )
         .await
         .0,
@@ -165,7 +191,7 @@ async fn secret_create_rotate_delete_list_flow_and_conflicts() {
             &app,
             "POST",
             "/secrets",
-            Some(json!({"name":"BAD NAME","value":"v"}))
+            Some(secret_body("BAD NAME", "dev", "a.com"))
         )
         .await
         .0,
@@ -199,13 +225,6 @@ async fn secret_create_rotate_delete_list_flow_and_conflicts() {
 #[tokio::test]
 async fn full_policy_flow_and_conflicts() {
     let (_d, app) = app();
-    call(
-        &app,
-        "POST",
-        "/secrets",
-        Some(json!({"name":"gh","value":"v"})),
-    )
-    .await;
     assert_eq!(
         call(
             &app,
@@ -228,71 +247,53 @@ async fn full_policy_flow_and_conflicts() {
         .0,
         StatusCode::CONFLICT
     );
-    let (st, body) = call(&app, "POST", "/rules", Some(rule_body(1))).await;
-    assert_eq!(st, StatusCode::CREATED);
-    let v = json_of(&body);
-    assert!(v["ca_warning"].as_str().unwrap().contains("allow-domain"));
-    assert_eq!(
-        call(&app, "DELETE", "/secrets/gh", None).await.0,
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        call(&app, "DELETE", &format!("/rules/{}", v["rule"]["id"]), None)
-            .await
-            .0,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        call(&app, "DELETE", "/secrets/gh", None).await.0,
-        StatusCode::NO_CONTENT
-    );
-}
-
-#[tokio::test]
-async fn no_ca_warning_once_the_domain_is_allowed() {
-    let (_d, app) = app();
-    call(
-        &app,
-        "POST",
-        "/ca/domains",
-        Some(json!({"domain":"github.com"})),
-    )
-    .await;
-    call(
+    let (st, body) = call(
         &app,
         "POST",
         "/secrets",
-        Some(json!({"name":"gh","value":"v"})),
+        Some(secret_body("gh", "dev", "api.github.com")),
     )
     .await;
-    call(
-        &app,
-        "POST",
-        "/roles",
-        Some(json!({"name":"dev","unmatched":"deny"})),
-    )
-    .await;
-    let v = json_of(&call(&app, "POST", "/rules", Some(rule_body(1))).await.1);
-    assert!(v["ca_warning"].is_null());
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let v = json_of(&body);
+    assert_eq!(v["ca_changed"], true);
+    let rule_id = v["rules"][0]["id"].as_i64().unwrap();
+    // the only rule of a secret cannot be deleted; deleting the secret cascades
+    assert_eq!(
+        call(&app, "DELETE", &format!("/rules/{rule_id}"), None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    let (st, body) = call(&app, "POST", "/rules", Some(rule_body(sid))).await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert!(json_of(&body).get("ca_warning").is_none());
+    assert_eq!(
+        call(&app, "DELETE", "/secrets/gh", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(json_of(&call(&app, "GET", "/rules", None).await.1)
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
 async fn rule_validation_errors_surface_as_400_with_the_policy_message() {
     let (_d, app) = app();
-    call(
-        &app,
-        "POST",
-        "/secrets",
-        Some(json!({"name":"gh","value":"v"})),
-    )
-    .await;
-    call(
-        &app,
-        "POST",
-        "/roles",
-        Some(json!({"name":"dev","unmatched":"deny"})),
-    )
-    .await;
+    role(&app, "dev").await;
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gh", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
     let cases: Vec<(Value, &str)> = vec![
         (json!({"host_pattern":"github"}), "host_pattern"),
         (json!({"host_pattern":"127.0.0.1"}), "host_pattern"),
@@ -306,7 +307,7 @@ async fn rule_validation_errors_surface_as_400_with_the_policy_message() {
         (json!({"role":"ghost"}), ""),
     ];
     for (patch, needle) in cases {
-        let mut b = rule_body(1);
+        let mut b = rule_body(sid);
         for (k, v) in patch.as_object().unwrap() {
             b[k] = v.clone();
         }
@@ -318,7 +319,7 @@ async fn rule_validation_errors_surface_as_400_with_the_policy_message() {
         );
     }
     // single-label host is rejected but localhost is accepted
-    let mut b = rule_body(1);
+    let mut b = rule_body(sid);
     b["host_pattern"] = json!("localhost");
     assert_eq!(
         call(&app, "POST", "/rules", Some(b)).await.0,
@@ -329,21 +330,26 @@ async fn rule_validation_errors_surface_as_400_with_the_policy_message() {
 #[tokio::test]
 async fn deleting_a_role_cascades_its_rules() {
     let (_d, app) = app();
-    call(
-        &app,
-        "POST",
-        "/secrets",
-        Some(json!({"name":"gh","value":"v"})),
-    )
-    .await;
-    call(
-        &app,
-        "POST",
-        "/roles",
-        Some(json!({"name":"dev","unmatched":"deny"})),
-    )
-    .await;
-    call(&app, "POST", "/rules", Some(rule_body(1))).await;
+    role(&app, "dev").await;
+    role(&app, "rev").await;
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gh", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    // a second rule under another role keeps the secret from being orphaned
+    let mut extra = rule_body(sid);
+    extra["role"] = json!("rev");
+    assert_eq!(
+        call(&app, "POST", "/rules", Some(extra)).await.0,
+        StatusCode::CREATED
+    );
     assert_eq!(
         json_of(&call(&app, "GET", "/rules?role=dev", None).await.1)
             .as_array()
@@ -360,13 +366,12 @@ async fn deleting_a_role_cascades_its_rules() {
             .as_array()
             .unwrap()
             .len(),
-        0
+        1
     );
     assert_eq!(
         call(&app, "DELETE", "/roles/dev", None).await.0,
         StatusCode::NOT_FOUND
     );
-    // and the secret is free again
     assert_eq!(
         call(&app, "DELETE", "/secrets/gh", None).await.0,
         StatusCode::NO_CONTENT
@@ -512,22 +517,7 @@ async fn ca_endpoints() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_TYPE], "application/x-pem-file");
     assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
-    let (st, body) = call(
-        &app,
-        "POST",
-        "/ca/domains",
-        Some(json!({"domain":" GitHub.com "})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let v = json_of(&body);
-    assert!(v["notice"].as_str().unwrap().contains("reload"));
-    assert_eq!(v["domains"], json!(["github.com"]));
-    let (st, body) = call(&app, "POST", "/ca/domains", Some(json!({"domain":"com"}))).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
-    assert!(json_of(&body)["error"].as_str().unwrap().contains("domain"));
-    let (_, status) = call(&app, "GET", "/ca", None).await;
-    assert!(status.contains("github.com"));
+    assert!(domains(&app).await.is_empty());
 }
 
 #[tokio::test]
@@ -619,7 +609,8 @@ async fn oversized_bodies_get_413_and_wrong_content_type_gets_415() {
         raw(&app, "POST", "/secrets", Some("application/json"), big).await,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    let ok = json!({"name":"x","value":"v"}).to_string();
+    role(&app, "dev").await;
+    let ok = secret_body("x", "dev", "a.com").to_string();
     for ct in [
         Some("application/x-www-form-urlencoded"),
         Some("text/plain"),
@@ -684,7 +675,7 @@ async fn oversized_bodies_get_413_and_wrong_content_type_gets_415() {
             "POST",
             "/secrets",
             Some("application/json"),
-            json!({"name":"y","value":"v","x":1}).to_string()
+            json!({"name":"y","value":"v","rules":[],"x":1}).to_string()
         )
         .await,
         StatusCode::BAD_REQUEST
@@ -708,4 +699,250 @@ async fn error_bodies_never_leak_internals() {
             assert!(!lower.contains(leak), "{body}");
         }
     }
+}
+
+#[tokio::test]
+async fn a_secret_without_rules_is_refused_and_nothing_is_created() {
+    let (_d, app) = app();
+    for body in [
+        json!({"name":"gh","value":"v"}),
+        json!({"name":"gh","value":"v","rules":[]}),
+    ] {
+        let (st, _) = call(&app, "POST", "/secrets", Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(call(&app, "GET", "/secrets", None).await.1, "[]");
+}
+
+#[tokio::test]
+async fn more_than_twenty_rules_are_refused() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let mut body = secret_body("gh", "dev", "a.com");
+    let rule = body["rules"][0].clone();
+    body["rules"] = json!(vec![rule; 21]);
+    assert_eq!(
+        call(&app, "POST", "/secrets", Some(body)).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(call(&app, "GET", "/secrets", None).await.1, "[]");
+}
+
+#[tokio::test]
+async fn creating_a_secret_stores_its_rules_and_permits_their_hosts() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/secrets",
+        Some(secret_body("gh", "dev", "*.habbi.cc")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let v = json_of(&body);
+    assert_eq!(v["secret"]["name"], "gh");
+    assert_eq!(v["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(v["ca_changed"], true);
+    assert!(v["notice"].as_str().unwrap().contains("reload"));
+    assert_eq!(domains(&app).await, vec!["habbi.cc"]);
+    // a second secret on a new exact domain changes the CA, a third on the same one does not
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gl", "dev", "git.habbi.cc")),
+        )
+        .await
+        .1,
+    );
+    assert_eq!(v["ca_changed"], true, "git.habbi.cc is a new exact domain");
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gl2", "dev", "git.habbi.cc")),
+        )
+        .await
+        .1,
+    );
+    assert_eq!(v["ca_changed"], false);
+    assert!(v["notice"].is_null());
+    let list = json_of(&call(&app, "GET", "/secrets", None).await.1);
+    assert!(list.as_array().unwrap().iter().all(|s| s["rules"] == 1));
+}
+
+#[tokio::test]
+async fn a_host_the_ca_rejects_creates_nothing() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let marker = "SECRET-MARKER-123456";
+    let mut body = secret_body("gh", "dev", "x.invalid");
+    body["value"] = json!(marker);
+    let (st, text) = call(&app, "POST", "/secrets", Some(body)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(!text.contains(marker), "the value must never be echoed");
+    assert_eq!(call(&app, "GET", "/secrets", None).await.1, "[]");
+    assert!(domains(&app).await.is_empty());
+    assert!(json_of(&call(&app, "GET", "/rules", None).await.1)
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn unknown_role_or_invalid_rule_fails_the_whole_creation() {
+    let (_d, app) = app();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/secrets",
+        Some(secret_body("gh", "ghost", "a.com")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&app, "GET", "/secrets", None).await.1, "[]");
+}
+
+#[tokio::test]
+async fn the_last_rule_of_a_secret_cannot_be_deleted() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gh", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let id = v["rules"][0]["id"].as_i64().unwrap();
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    assert_eq!(
+        call(&app, "DELETE", &format!("/rules/{id}"), None).await.0,
+        StatusCode::CONFLICT
+    );
+    // add a second rule on another host, then the first one can go and its domain is retired
+    let extra = json!({"role":"dev","host_pattern":"b.com","kind":"header","target_name":"X","template":"{secret}","secret_id":sid});
+    let r = json_of(&call(&app, "POST", "/rules", Some(extra)).await.1);
+    assert_eq!(r["ca_changed"], true);
+    assert_eq!(domains(&app).await, vec!["a.com", "b.com"]);
+    assert_eq!(
+        call(&app, "DELETE", &format!("/rules/{id}"), None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(domains(&app).await, vec!["b.com"]);
+}
+
+#[tokio::test]
+async fn deleting_a_secret_deletes_its_rules_and_retires_its_domains() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    call(
+        &app,
+        "POST",
+        "/secrets",
+        Some(secret_body("gh", "dev", "a.com")),
+    )
+    .await;
+    assert_eq!(domains(&app).await, vec!["a.com"]);
+    assert_eq!(
+        call(&app, "DELETE", "/secrets/gh", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(json_of(&call(&app, "GET", "/rules", None).await.1)
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(domains(&app).await.is_empty());
+}
+
+#[tokio::test]
+async fn deleting_a_role_that_would_orphan_a_secret_is_refused() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    role(&app, "rev").await;
+    call(
+        &app,
+        "POST",
+        "/secrets",
+        Some(secret_body("only-dev", "dev", "a.com")),
+    )
+    .await;
+    let (st, body) = call(&app, "DELETE", "/roles/dev", None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(body.contains("only-dev"));
+    assert_eq!(domains(&app).await, vec!["a.com"]);
+    // `rev` has no rules, so it can go
+    assert_eq!(
+        call(&app, "DELETE", "/roles/rev", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_last_role_rule_retires_the_domain_back_to_the_placeholder() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    role(&app, "rev").await;
+    let v = json_of(
+        &call(
+            &app,
+            "POST",
+            "/secrets",
+            Some(secret_body("gh", "dev", "a.com")),
+        )
+        .await
+        .1,
+    );
+    let sid = v["secret"]["id"].as_i64().unwrap();
+    let mut extra = rule_body(sid);
+    extra["role"] = json!("rev");
+    extra["host_pattern"] = json!("b.com");
+    call(&app, "POST", "/rules", Some(extra)).await;
+    assert_eq!(domains(&app).await, vec!["a.com", "b.com"]);
+    assert_eq!(
+        call(&app, "DELETE", "/roles/dev", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(domains(&app).await, vec!["b.com"]);
+}
+
+#[tokio::test]
+async fn the_manual_ca_endpoint_is_gone() {
+    let (_d, app) = app();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/ca/domains",
+        Some(json!({"domain":"github.com"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creations_keep_every_domain() {
+    let (_d, app) = app();
+    role(&app, "dev").await;
+    let hosts = ["a.com", "b.com", "c.com", "d.com"];
+    let mut tasks = Vec::new();
+    for (i, h) in hosts.iter().enumerate() {
+        let app = app.clone();
+        let body = secret_body(&format!("s{i}"), "dev", h);
+        tasks.push(tokio::spawn(async move {
+            call(&app, "POST", "/secrets", Some(body)).await.0
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), StatusCode::CREATED);
+    }
+    assert_eq!(
+        domains(&app).await,
+        vec!["a.com", "b.com", "c.com", "d.com"]
+    );
 }

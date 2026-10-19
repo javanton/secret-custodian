@@ -1,5 +1,6 @@
 mod api;
 mod error;
+pub mod ops;
 mod serve;
 mod sessions;
 mod state;

@@ -1669,6 +1669,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rand",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",

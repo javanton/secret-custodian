@@ -258,6 +258,13 @@ pub async fn run(args: ServeArgs, socket: PathBuf) -> anyhow::Result<()> {
     let tokens =
         Arc::new(TokenService::new(vault.clone()).context("cannot load the token service")?);
     let ca = Arc::new(CaService::init_or_load(vault.clone()).context("cannot load the CA")?);
+    if sg_admin::ops::sync_ca(&vault, &ca)
+        .map_err(|e| anyhow::anyhow!("cannot sync the CA with the rules: {}", e.1))?
+    {
+        tracing::info!(
+            "CA domains re-derived from the rules; agents must reload the CA certificate"
+        );
+    }
     let roots = load_roots(&args.upstream_ca)?;
 
     let proxy_listener = TcpListener::bind(args.proxy_bind)

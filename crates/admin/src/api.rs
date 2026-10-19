@@ -4,7 +4,7 @@
 //! short SQLite statements behind a mutex, and the admin API is low traffic. The proxy
 //! makes the same trade-off.
 
-use crate::{error::*, state::AppState};
+use crate::{error::*, ops, state::AppState};
 use axum::{
     extract::{
         rejection::PathRejection, DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query,
@@ -19,7 +19,7 @@ use axum::{
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use sg_core::{audit::AuditFilter, SecretMeta};
-use sg_policy::{InjectionKind, NewRule, Unmatched};
+use sg_policy::{InjectionKind, NewRule, RuleSpec, Unmatched};
 use std::time::Duration;
 
 /// Every request body is capped at 64 KiB.
@@ -56,7 +56,6 @@ fn build_router(state: AppState, socket_only: bool) -> Router {
         .route("/machines/{machine}/revoke", post(revoke_machine))
         .route("/ca", get(ca_status))
         .route("/ca/cert", get(ca_cert))
-        .route("/ca/domains", post(ca_allow))
         .route("/audit", get(audit));
     let router = if socket_only {
         router.route("/admin/login-token", post(login_token))
@@ -203,6 +202,38 @@ fn machine_name(s: &str) -> ApiResult<&str> {
 struct NewSecret {
     name: String,
     value: String,
+    /// Absent or empty is refused by `ops::create_secret` with a descriptive message.
+    #[serde(default)]
+    rules: Vec<RuleSpecBody>,
+}
+
+/// A rule as sent inside `POST /secrets`: the secret is the one being created.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleSpecBody {
+    role: String,
+    host_pattern: String,
+    #[serde(default = "star")]
+    path_pattern: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    kind: InjectionKind,
+    target_name: String,
+    template: String,
+}
+
+impl From<RuleSpecBody> for RuleSpec {
+    fn from(b: RuleSpecBody) -> Self {
+        Self {
+            role: b.role,
+            host_pattern: b.host_pattern,
+            path_pattern: b.path_pattern,
+            methods: b.methods,
+            kind: b.kind,
+            target_name: b.target_name,
+            template: b.template,
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,8 +241,18 @@ struct RotateSecret {
     value: String,
 }
 
-async fn list_secrets(State(s): State<AppState>) -> ApiResult<Json<Vec<SecretMeta>>> {
-    Ok(Json(s.vault.list_secrets()?))
+async fn list_secrets(State(s): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
+    let list = s
+        .vault
+        .list_secrets_with_rule_counts()?
+        .into_iter()
+        .map(|(meta, rules)| {
+            let mut v = serde_json::to_value(meta).unwrap_or(Value::Null);
+            v["rules"] = json!(rules);
+            v
+        })
+        .collect();
+    Ok(Json(list))
 }
 async fn get_secret(State(s): State<AppState>, Param(name): Param) -> ApiResult<Json<SecretMeta>> {
     Ok(Json(s.vault.get_secret_meta(name_param(&name)?)?))
@@ -219,10 +260,21 @@ async fn get_secret(State(s): State<AppState>, Param(name): Param) -> ApiResult<
 async fn add_secret(
     State(s): State<AppState>,
     JsonBody(b): JsonBody<NewSecret>,
-) -> ApiResult<(StatusCode, Json<SecretMeta>)> {
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let c = ops::create_secret(
+        &s,
+        &b.name,
+        &b.value,
+        b.rules.into_iter().map(Into::into).collect(),
+    )?;
     Ok((
         StatusCode::CREATED,
-        Json(s.vault.add_secret(&b.name, &b.value)?),
+        Json(json!({
+            "secret": c.secret,
+            "rules": c.rules,
+            "ca_changed": c.ca_changed,
+            "notice": c.ca_changed.then_some(ops::CA_NOTICE),
+        })),
     ))
 }
 async fn rotate_secret(
@@ -233,7 +285,7 @@ async fn rotate_secret(
     Ok(Json(s.vault.rotate_secret(name_param(&name)?, &b.value)?))
 }
 async fn delete_secret(State(s): State<AppState>, Param(name): Param) -> ApiResult<StatusCode> {
-    s.vault.remove_secret(name_param(&name)?)?;
+    ops::delete_secret(&s, name_param(&name)?)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -259,7 +311,7 @@ async fn add_role(
     ))
 }
 async fn delete_role(State(s): State<AppState>, Param(name): Param) -> ApiResult<StatusCode> {
-    sg_policy::remove_role(&s.vault, name_param(&name)?)?;
+    ops::delete_role(&s, name_param(&name)?)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -302,9 +354,8 @@ async fn add_rule(
     State(s): State<AppState>,
     JsonBody(b): JsonBody<NewRuleBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let host = b.host_pattern.trim_start_matches("*.").to_string();
-    let rule = sg_policy::add_rule(
-        &s.vault,
+    let (rule, ca_changed) = ops::add_rule(
+        &s,
         NewRule {
             role: b.role,
             host_pattern: b.host_pattern,
@@ -316,12 +367,13 @@ async fn add_rule(
             secret_id: b.secret_id,
         },
     )?;
-    let warning = (!s.ca.is_host_permitted(&host)).then(|| {
-        format!("the CA does not permit {host}: run `sg ca allow-domain {host}` and reload the CA certificate in your agents")
-    });
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "rule": rule, "ca_warning": warning })),
+        Json(json!({
+            "rule": rule,
+            "ca_changed": ca_changed,
+            "notice": ca_changed.then_some(ops::CA_NOTICE),
+        })),
     ))
 }
 async fn delete_rule(State(s): State<AppState>, Param(id): Param) -> ApiResult<StatusCode> {
@@ -330,7 +382,7 @@ async fn delete_rule(State(s): State<AppState>, Param(id): Param) -> ApiResult<S
         .ok()
         .filter(|i| *i > 0)
         .ok_or_else(|| ApiError::bad_request("invalid rule id"))?;
-    sg_policy::remove_rule(&s.vault, id)?;
+    ops::delete_rule(&s, id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -391,22 +443,6 @@ async fn ca_cert(State(s): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "application/x-pem-file")],
         s.ca.cert_pem(),
     )
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AllowDomain {
-    domain: String,
-}
-async fn ca_allow(
-    State(s): State<AppState>,
-    JsonBody(b): JsonBody<AllowDomain>,
-) -> ApiResult<Json<Value>> {
-    s.ca.allow_domain(&b.domain)?;
-    Ok(Json(json!({
-        "domains": s.ca.domains(),
-        "notice": "the CA certificate changed: agents must reload it (sg ca export)"
-    })))
 }
 
 // ---- audit ----------------------------------------------------------------------------------

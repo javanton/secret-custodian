@@ -8,6 +8,7 @@ sg-core.workspace = true
 sg-policy.workspace = true
 sg-auth.workspace = true
 sg-ca.workspace = true
+rusqlite.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
