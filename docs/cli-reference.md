@@ -1,13 +1,13 @@
 # CLI reference
 
-Every command and flag of the `sg` binary. Everything on this page was produced by running the real
-binary (`sg 0.1.0`); sample outputs are copied from those runs (timestamps and ports differ on your machine).
+Every command and flag of the `sc` binary. Everything on this page was produced by running the real
+binary (`sc 0.1.0`); sample outputs are copied from those runs (timestamps and ports differ on your machine).
 For a guided first run see the [README](../README.md#quick-start-from-source); for what the commands
 call on the server see [admin-api.md](admin-api.md).
 
-Contents: [Global options](#global-options) · [Exit codes](#exit-codes) · [`sg serve`](#sg-serve) ·
-[`sg keygen`](#sg-keygen) · [`sg secret`](#sg-secret) · [`sg role`](#sg-role) · [`sg rule`](#sg-rule) ·
-[`sg token`](#sg-token) · [`sg ca`](#sg-ca) · [`sg audit`](#sg-audit) · [`sg login-url`](#sg-login-url) ·
+Contents: [Global options](#global-options) · [Exit codes](#exit-codes) · [`sc serve`](#sc-serve) ·
+[`sc keygen`](#sc-keygen) · [`sc secret`](#sc-secret) · [`sc role`](#sc-role) · [`sc rule`](#sc-rule) ·
+[`sc token`](#sc-token) · [`sc ca`](#sc-ca) · [`sc audit`](#sc-audit) · [`sc login-url`](#sc-login-url) ·
 [Errors you will meet](#errors-you-will-meet)
 
 ## How the CLI is split
@@ -16,8 +16,8 @@ Two kinds of commands:
 
 | Kind | Commands | Talks to |
 |---|---|---|
-| Local | `sg serve`, `sg keygen` | The filesystem. `serve` is the server itself. |
-| Client | `sg secret`, `role`, `rule`, `token`, `ca`, `audit`, `login-url` | A running `sg serve`, over its admin Unix socket. They cannot work offline and never open the database file. |
+| Local | `sc serve`, `sc keygen` | The filesystem. `serve` is the server itself. |
+| Client | `sc secret`, `role`, `rule`, `token`, `ca`, `audit`, `login-url` | A running `sc serve`, over its admin Unix socket. They cannot work offline and never open the database file. |
 
 The socket is the only credential of a client command: whoever can open it (mode `0600`, in a `0700`
 directory) is the operator. The client refuses to use a socket whose directory is not yours and `0700`, or a
@@ -25,16 +25,16 @@ socket that is not yours or is group/other writable (see [Errors](#errors-you-wi
 
 ## Global options
 
-Accepted by every subcommand, before or after it (`sg --json audit` and `sg audit --json` are the same).
+Accepted by every subcommand, before or after it (`sc --json audit` and `sc audit --json` are the same).
 
 | Option | Env | Default | Meaning |
 |---|---|---|---|
-| `--socket <PATH>` | `SG_SOCKET` | `$XDG_RUNTIME_DIR/secret-custodian.sock`; if `XDG_RUNTIME_DIR` is unset, empty or relative: `<data dir>/sg.sock` | Admin socket. For `sg serve` it is where the socket is created; for client commands it is where to connect. |
+| `--socket <PATH>` | `SC_SOCKET` | `$XDG_RUNTIME_DIR/secret-custodian.sock`; if `XDG_RUNTIME_DIR` is unset, empty or relative: `<data dir>/sg.sock` | Admin socket. For `sc serve` it is where the socket is created; for client commands it is where to connect. |
 | `--json` | - | off | Print the raw JSON returned by the server instead of a table or a sentence. No effect on `serve` and `keygen`. |
-| `-h`, `--help` | - | - | Help. `sg <command> --help` for any subcommand. |
-| `-V`, `--version` | - | - | Prints `sg 0.1.0`. |
+| `-h`, `--help` | - | - | Help. `sc <command> --help` for any subcommand. |
+| `-V`, `--version` | - | - | Prints `sc 0.1.0`. |
 
-Data directory default (used by `sg serve --data-dir`): `$XDG_DATA_HOME/secret-custodian`, else
+Data directory default (used by `sc serve --data-dir`): `$XDG_DATA_HOME/secret-custodian`, else
 `$HOME/.local/share/secret-custodian`, else `/tmp/secret-custodian`. Empty or relative `XDG_DATA_HOME`/`HOME`
 are ignored. (Verified: with `XDG_RUNTIME_DIR` unset and `HOME=/x`, a client looks for
 `/x/.local/share/secret-custodian/sg.sock`.)
@@ -42,46 +42,46 @@ are ignored. (Verified: with `XDG_RUNTIME_DIR` unset and `HOME=/x`, a client loo
 Logging: `tracing` to stderr, default level `warn`, overridable with `RUST_LOG` (for example
 `RUST_LOG=sg_proxy=debug`). The code logs very little: upstream failures and internal errors (`warn`/`error`)
 and, at `debug`, dropped connections. There are no `info` messages, and requests are not logged at all (use
-[`sg audit`](#sg-audit)). A real line looks like
+[`sc audit`](#sc-audit)). A real line looks like
 `WARN sg_proxy::forward: upstream failure error=connect failed: Connection refused (os error 111) host=localhost`.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. For `sg serve`: clean stop on `SIGINT`/`SIGTERM`. |
-| `1` | The command ran and failed (message on stderr as `error: <message>`): server unreachable, server returned an error, invalid input detected by the CLI, `sg serve` could not start. |
+| `0` | Success. For `sc serve`: clean stop on `SIGINT`/`SIGTERM`. |
+| `1` | The command ran and failed (message on stderr as `error: <message>`): server unreachable, server returned an error, invalid input detected by the CLI, `sc serve` could not start. |
 | `2` | Usage error detected by the argument parser (unknown subcommand, missing or invalid flag value). Message on stderr, followed by a usage hint. |
-| `130` | `sg serve` only: a second `SIGINT`/`SIGTERM` while shutting down forces the exit. |
+| `130` | `sc serve` only: a second `SIGINT`/`SIGTERM` while shutting down forces the exit. |
 
-Messages go to stderr; results go to stdout. `sg secret add` and `sg rule add` print their CA reload warning on stderr.
+Messages go to stderr; results go to stdout. `sc secret add` and `sc rule add` print their CA reload warning on stderr.
 
-## `sg serve`
+## `sc serve`
 
 Runs the vault: the credential-injecting proxy, the admin Unix socket and the local web UI, in one process.
 
 ```
-sg serve [OPTIONS]
+sc serve [OPTIONS]
 ```
 
 | Option | Env | Default | Meaning |
 |---|---|---|---|
 | `--data-dir <DATA_DIR>` | - | see above | Directory holding `vault.db` (plus `-wal`/`-shm`). Created, with missing parents, with mode `0700`. An existing directory you own with looser permissions is tightened to `0700` (`note: tightened <dir> to mode 0700` on stderr); one owned by another user, or a file, is refused. |
-| `--socket <PATH>` | `SG_SOCKET` | see above | Admin socket to create. Its directory must be yours and `0700`. A stale socket file is replaced; a socket with a live server is refused. |
-| `--proxy-bind <ADDR>` | `SG_PROXY_BIND` | `127.0.0.1:8080` | Address of the proxy. Must be `IP:port` (a hostname such as `localhost:80` is a usage error). Port `0` picks a free port; the real one is printed. |
-| `--admin-bind <ADDR>` | `SG_ADMIN_BIND` | `127.0.0.1:9090` | Address of the web UI. A non-loopback address prints a warning (there is no remote login). |
-| `--admin-public-url <URL>` | `SG_ADMIN_PUBLIC_URL` | `http://localhost:<bound admin port>` | The URL you really use to reach the web UI, `http://host[:port]` without userinfo, path, query or fragment (invalid values, including `https://`, end the start with an error: the UI only accepts `http://` origins). It is printed on the `admin:` line, returned by `sg login-url`, and its host:port (the bare host too when the port is the scheme default) is added to the `Host`/`Origin` allowlist. |
+| `--socket <PATH>` | `SC_SOCKET` | see above | Admin socket to create. Its directory must be yours and `0700`. A stale socket file is replaced; a socket with a live server is refused. |
+| `--proxy-bind <ADDR>` | `SC_PROXY_BIND` | `127.0.0.1:8080` | Address of the proxy. Must be `IP:port` (a hostname such as `localhost:80` is a usage error). Port `0` picks a free port; the real one is printed. |
+| `--admin-bind <ADDR>` | `SC_ADMIN_BIND` | `127.0.0.1:9090` | Address of the web UI. A non-loopback address prints a warning (there is no remote login). |
+| `--admin-public-url <URL>` | `SC_ADMIN_PUBLIC_URL` | `http://localhost:<bound admin port>` | The URL you really use to reach the web UI, `http://host[:port]` without userinfo, path, query or fragment (invalid values, including `https://`, end the start with an error: the UI only accepts `http://` origins). It is printed on the `admin:` line, returned by `sc login-url`, and its host:port (the bare host too when the port is the scheme default) is added to the `Host`/`Origin` allowlist. |
 | `--admin-allowed-host <HOST:PORT>` | - | none | Extra `Host`/`Origin` value accepted by the web UI. Repeatable. Needed when a container publishes the UI on a different port. |
-| `--key-file <FILE>` | `SG_KEY_FILE` | none | Master key file: base64 of 32 bytes, as written by `sg keygen`. Must be mode `0600` (no group/other bits). |
+| `--key-file <FILE>` | `SC_KEY_FILE` | none | Master key file: base64 of 32 bytes, as written by `sc keygen`. Must be mode `0600` (no group/other bits). |
 | `--passphrase` | - | off | Derive the master key from a passphrase typed at a prompt. Needs a terminal. |
-| `--upstream-ca <PEM>` | `SG_UPSTREAM_CA` | none | Extra PEM CA bundle trusted for **upstream** TLS (internal services with a private CA). Repeatable as a flag; the environment variable takes one path. A file without a PEM certificate is an error. |
+| `--upstream-ca <PEM>` | `SC_UPSTREAM_CA` | none | Extra PEM CA bundle trusted for **upstream** TLS (internal services with a private CA). Repeatable as a flag; the environment variable takes one path. A file without a PEM certificate is an error. |
 | `--allow-loopback-targets` | - | off | Allow the proxy to tunnel and forward to loopback addresses. The proxy's and the web UI's own ports stay denied. See [proxy-internals.md](proxy-internals.md#network-policy). |
 
-Also: `SG_MASTER_KEY` (environment variable only, not a flag): the same base64 value as a key file.
+Also: `SC_MASTER_KEY` (environment variable only, not a flag): the same base64 value as a key file.
 
-**Key source: exactly one of** `--key-file`/`SG_KEY_FILE`, `SG_MASTER_KEY`, `--passphrase`. None gives
+**Key source: exactly one of** `--key-file`/`SC_KEY_FILE`, `SC_MASTER_KEY`, `--passphrase`. None gives
 `no key source`, two or more give `ambiguous key source` (see [Errors](#errors-you-will-meet)). An empty
-`SG_MASTER_KEY` counts as unset. With `--passphrase` the prompt is `Vault passphrase: ` on every start, and
+`SC_MASTER_KEY` counts as unset. With `--passphrase` the prompt is `Vault passphrase: ` on every start, and
 a second `Repeat passphrase: ` the first time (when `vault.db` does not exist yet). A vault created with a
 raw key cannot be opened with a passphrase and the reverse; both fail with the same non-specific message.
 
@@ -129,43 +129,43 @@ The `hint:` line appears only when the port is not `9090` and no `--admin-allowe
 Host values the web UI accepts by default: `localhost:<port>`, `127.0.0.1:<port>`, `[::1]:<port>`, plus every
 `--admin-allowed-host` and `--admin-public-url` value. `Origin` must be exactly `http://<one of those>`.
 
-## `sg keygen`
+## `sc keygen`
 
 ```
-sg keygen --out <FILE>
+sc keygen --out <FILE>
 ```
 
 Writes a new random master key (base64 of 32 bytes, 44 characters, no newline) to `FILE` with mode `0600`.
 It refuses to overwrite: `FILE` must not exist. The parent directory must exist and be writable.
 
 ```
-$ sg keygen --out sg.key
+$ sc keygen --out sg.key
 wrote sg.key
 Back this file up: without it the vault cannot be opened.
-$ sg keygen --out sg.key
+$ sc keygen --out sg.key
 error: cannot create sg.key (it must not exist yet): File exists (os error 17)
 ```
 
 Losing the key means losing every stored secret; there is no recovery path
 ([operations.md](operations.md#key-management)).
 
-## `sg secret`
+## `sc secret`
 
 Secrets are **write-only**: no command returns a stored value.
 
 | Command | Meaning |
 |---|---|
-| `sg secret add <NAME> [--role <ROLE>] --host <HOST> [--path <PATH>] [--methods <LIST>] (--header <NAME> \| --query <NAME>) [--template <TEMPLATE>]` | Create a secret **together with its first rule**, in one atomic request. Fails with `already exists` if the name is taken. |
-| `sg secret rotate <NAME>` | Replace the value of an existing secret (`not found` otherwise). Rules keep pointing at it. |
-| `sg secret rm <NAME>` | Delete the secret **and its rules**. If that removes the last rule that needed a host, the CA is re-issued without it. |
-| `sg secret ls` | List metadata: `ID`, `NAME`, `RULES` (number of rules), `CREATED`, `ROTATED` (`-` if never rotated), sorted by name. |
+| `sc secret add <NAME> [--role <ROLE>] --host <HOST> [--path <PATH>] [--methods <LIST>] (--header <NAME> \| --query <NAME>) [--template <TEMPLATE>]` | Create a secret **together with its first rule**, in one atomic request. Fails with `already exists` if the name is taken. |
+| `sc secret rotate <NAME>` | Replace the value of an existing secret (`not found` otherwise). Rules keep pointing at it. |
+| `sc secret rm <NAME>` | Delete the secret **and its rules**. If that removes the last rule that needed a host, the CA is re-issued without it. |
+| `sc secret ls` | List metadata: `ID`, `NAME`, `RULES` (number of rules), `CREATED`, `ROTATED` (`-` if never rotated), sorted by name. |
 
 **Name:** 1 to 64 characters of `[a-z0-9._-]`.
 
 ### `secret add` creates the first rule
 
 A secret that no rule uses can never be injected, so `secret add` always creates one rule with it. The rule
-options are the same as `sg rule add` (see [`sg rule`](#sg-rule)) except that the secret is the one being created:
+options are the same as `sc rule add` (see [`sc rule`](#sc-rule)) except that the secret is the one being created:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -180,14 +180,14 @@ options are the same as `sg rule add` (see [`sg rule`](#sg-rule)) except that th
 a role `default` (unmatched policy `passthrough`) is created first and the CLI prints a `note:` on stderr; if there are
 several roles it fails with `several roles exist (<names>): choose one with --role`. The CLI validates the rule options
 before reading the value or creating anything, so a bad `--query`/`--template` combination leaves no `default` role
-behind. Add more rules (for the same or other roles) with `sg rule add`.
+behind. Add more rules (for the same or other roles) with `sc rule add`.
 
 Without `--host` and `--header`/`--query` the argument parser refuses the command (exit code 2) and nothing is
 stored. If the server rejects the rule (for example `unknown role`, a bad host or `domain rejected: reserved`, which
 is what a host under the placeholder TLD `invalid` gets), nothing is stored either: no secret, no rule, no CA change.
 
 When the new rule's host was not yet in the CA, the CA certificate is re-issued and the command prints
-`warning: the CA certificate changed: agents must reload it (sg ca export)` on stderr; with `--json` the same text is in
+`warning: the CA certificate changed: agents must reload it (sc ca export)` on stderr; with `--json` the same text is in
 the `notice` field.
 
 ### How the value is read
@@ -213,18 +213,18 @@ Error messages never contain the value. The CLI also scrubs the value out of any
 (replacing it with `[redacted]`; see [redaction](#redaction-of-the-value-in-error-messages)).
 
 ```
-$ sg role add reviewer --unmatched deny
+$ sc role add reviewer --unmatched deny
 role 'reviewer' created
-$ printf '%s' "$GITHUB_TOKEN" | sg secret add gh --role reviewer --host api.github.com --methods GET \
+$ printf '%s' "$GITHUB_TOKEN" | sc secret add gh --role reviewer --host api.github.com --methods GET \
      --path '/repos/*' --header Authorization --template 'Bearer {secret}'
 secret 'gh' stored with rule 1
-warning: the CA certificate changed: agents must reload it (sg ca export)
-$ printf '%s' "$NEW_TOKEN" | sg secret rotate gh
+warning: the CA certificate changed: agents must reload it (sc ca export)
+$ printf '%s' "$NEW_TOKEN" | sc secret rotate gh
 secret 'gh' rotated
-$ sg secret ls
+$ sc secret ls
 ID  NAME  RULES  CREATED               ROTATED
 1   gh    1      2026-10-16T19:55:47Z  2026-10-16T19:58:10Z
-$ sg --json secret ls
+$ sc --json secret ls
 [
   {
     "created_at": 1792180547,
@@ -234,7 +234,7 @@ $ sg --json secret ls
     "rules": 1
   }
 ]
-$ sg secret rm gh
+$ sc secret rm gh
 secret 'gh' removed
 ```
 
@@ -248,25 +248,25 @@ The CLI replaces the value with `[redacted]` in any server error message, raw or
 is at least 8 bytes long: replacing a one-letter value would mangle ordinary words (`already exists` for the value `x`).
 Real secrets are far longer than that. A message that is exactly the value is always replaced.
 
-## `sg role`
+## `sc role`
 
 A role is a name plus an **unmatched policy**: what the proxy does with a request from this role to a host that
 has no rule for the role. See [policy-and-rules.md](policy-and-rules.md#1-roles-and-the-unmatched-policy).
 
 | Command | Meaning |
 |---|---|
-| `sg role add <NAME> [--unmatched passthrough\|deny]` | Create a role. `--unmatched` defaults to `passthrough`. |
-| `sg role rm <NAME>` | Delete a role **and all its rules**, unless that would leave a secret without any rule: then it is refused (`409`) with the names of the affected secrets and nothing is deleted. If the role's rules were the only ones needing some hosts, the CA is re-issued without them. Existing tokens of that role keep verifying but every request gets `403` (`unknown-role`). |
-| `sg role ls` | List roles: `NAME`, `UNMATCHED`, sorted by name. |
+| `sc role add <NAME> [--unmatched passthrough\|deny]` | Create a role. `--unmatched` defaults to `passthrough`. |
+| `sc role rm <NAME>` | Delete a role **and all its rules**, unless that would leave a secret without any rule: then it is refused (`409`) with the names of the affected secrets and nothing is deleted. If the role's rules were the only ones needing some hosts, the CA is re-issued without them. Existing tokens of that role keep verifying but every request gets `403` (`unknown-role`). |
+| `sc role ls` | List roles: `NAME`, `UNMATCHED`, sorted by name. |
 
 **Name:** 1 to 64 characters of `[a-z0-9_-]` (no dot, unlike secret names).
 
 ```
-$ sg role add reviewer --unmatched deny
+$ sc role add reviewer --unmatched deny
 role 'reviewer' created
-$ sg role add developer
+$ sc role add developer
 role 'developer' created
-$ sg role ls
+$ sc role ls
 NAME       UNMATCHED
 developer  passthrough
 reviewer   deny
@@ -274,17 +274,17 @@ reviewer   deny
 
 For least privilege prefer `--unmatched deny`: the agent can then only reach hosts you have written rules for.
 
-## `sg rule`
+## `sc rule`
 
 A rule says: for this role, for requests matching host, path and methods, inject this secret this way.
 
 | Command | Meaning |
 |---|---|
-| `sg rule add ...` | Add a rule for an **existing** secret. Prints `rule <id> created`. (The first rule of a secret is created by [`sg secret add`](#sg-secret).) |
-| `sg rule rm <ID>` | Delete a rule by numeric id. `not found` if absent. Refused (`409`) when it is the last rule of its secret: delete the secret instead, or add another rule first. |
-| `sg rule ls [--role <ROLE>]` | List rules (all, or one role's), ordered by id. |
+| `sc rule add ...` | Add a rule for an **existing** secret. Prints `rule <id> created`. (The first rule of a secret is created by [`sc secret add`](#sc-secret).) |
+| `sc rule rm <ID>` | Delete a rule by numeric id. `not found` if absent. Refused (`409`) when it is the last rule of its secret: delete the secret instead, or add another rule first. |
+| `sc rule ls [--role <ROLE>]` | List rules (all, or one role's), ordered by id. |
 
-`sg rule add` options:
+`sc rule add` options:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -301,13 +301,13 @@ semantics) are in [policy-and-rules.md](policy-and-rules.md).
 
 If the rule's host was not yet in the CA's permitted domains, the CA is re-issued as part of the same operation (rule and
 CA change together or not at all) and a warning is printed on stderr; the agents must then reload the certificate
-(`sg ca export`). If the host was already permitted, nothing is printed:
+(`sc ca export`). If the host was already permitted, nothing is printed:
 
 ```
-$ sg rule add --role reviewer --host example.org --header X-Key --secret upstream-key
+$ sc rule add --role reviewer --host example.org --header X-Key --secret upstream-key
 rule 3 created
-warning: the CA certificate changed: agents must reload it (sg ca export)
-$ sg rule add --role developer --host example.org --header X-Other --secret upstream-key
+warning: the CA certificate changed: agents must reload it (sc ca export)
+$ sc rule add --role developer --host example.org --header X-Other --secret upstream-key
 rule 4 created
 ```
 
@@ -315,19 +315,19 @@ A host the CA cannot permit (for example under the placeholder TLD `invalid`) ma
 `domain rejected: reserved` and nothing is created.
 
 ```
-$ sg rule add --role reviewer  --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret upstream-key
+$ sc rule add --role reviewer  --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret upstream-key
 rule 1 created
-warning: the CA certificate changed: agents must reload it (sg ca export)
-$ sg rule add --role developer --host localhost --header Authorization --template 'Bearer {secret}' --secret upstream-key
+warning: the CA certificate changed: agents must reload it (sc ca export)
+$ sc rule add --role developer --host localhost --header Authorization --template 'Bearer {secret}' --secret upstream-key
 rule 2 created
-$ sg rule ls
+$ sc rule ls
 ID  ROLE       HOST       PATH  METHODS  KIND    TARGET         TEMPLATE         SECRET
 1   reviewer   localhost  *     GET      header  Authorization  Bearer {secret}  1
 2   developer  localhost  *     *        header  Authorization  Bearer {secret}  1
-$ sg --json rule add --role developer --host example.net --header X-Key --secret upstream-key
+$ sc --json rule add --role developer --host example.net --header X-Key --secret upstream-key
 {
   "ca_changed": true,
-  "notice": "the CA certificate changed: agents must reload it (sg ca export)",
+  "notice": "the CA certificate changed: agents must reload it (sc ca export)",
   "rule": {
     "host_pattern": "example.net",
     "id": 5,
@@ -349,26 +349,26 @@ Common examples:
 
 ```sh
 # read-only access to one API prefix
-sg rule add --role reviewer --host api.github.com --path '/repos/*' --methods GET \
+sc rule add --role reviewer --host api.github.com --path '/repos/*' --methods GET \
    --header Authorization --template 'Bearer {secret}' --secret gh
 # a header that takes the bare secret (GitLab)
-sg rule add --role developer --host gitlab.com --path '/api/v4/*' \
+sc rule add --role developer --host gitlab.com --path '/api/v4/*' \
    --header PRIVATE-TOKEN --secret gitlab
 # an API that wants the key in the query string (prefer headers: see Limitations in the README)
-sg rule add --role developer --host api.example.com --query api_key --secret example
+sc rule add --role developer --host api.example.com --query api_key --secret example
 ```
 
-## `sg token`
+## `sc token`
 
 A token proves the identity `(machine, role)` to the proxy. It is shown **once**, at creation; only metadata
 can be listed afterwards.
 
 | Command | Meaning |
 |---|---|
-| `sg token create --machine <M> --role <R> [--ttl <T>] [--proxy-url <URL>]` | Issue a token. |
-| `sg token revoke <JTI>` | Revoke one token by id (`not found` if unknown **or already revoked**). |
-| `sg token revoke-machine <MACHINE>` | Revoke every active token of a machine; prints the count (`0 token(s) revoked for 'ghost'` is not an error). |
-| `sg token ls` | List metadata, newest first: `JTI`, `MACHINE`, `ROLE`, `CREATED`, `EXPIRES` (`-` = never), `STATUS` (`active`, `expired` or `revoked`). |
+| `sc token create --machine <M> --role <R> [--ttl <T>] [--proxy-url <URL>]` | Issue a token. |
+| `sc token revoke <JTI>` | Revoke one token by id (`not found` if unknown **or already revoked**). |
+| `sc token revoke-machine <MACHINE>` | Revoke every active token of a machine; prints the count (`0 token(s) revoked for 'ghost'` is not an error). |
+| `sc token ls` | List metadata, newest first: `JTI`, `MACHINE`, `ROLE`, `CREATED`, `EXPIRES` (`-` = never), `STATUS` (`active`, `expired` or `revoked`). |
 
 `token create` options:
 
@@ -388,7 +388,7 @@ TTL checks (real results): `90s`, `30m`, `12h`, `7d`, `3650d` and `315360000` ar
 Without `--json`, `token create` prints the token and a ready-to-paste block (real run; the JWT is shortened):
 
 ```
-$ sg token create --machine laptop --role reviewer --proxy-url http://127.0.0.1:44065 --ttl 12h
+$ sc token create --machine laptop --role reviewer --proxy-url http://127.0.0.1:44065 --ttl 12h
 token (shown once): eyJhbGciOiJFZERTQSIs...<JWT>
 
 export HTTPS_PROXY=http://laptop:eyJhbGciOiJFZERTQSIs...<JWT>@127.0.0.1:44065
@@ -396,7 +396,7 @@ export HTTP_PROXY=$HTTPS_PROXY
 export NO_PROXY=localhost,127.0.0.1
 
 # trust the vault CA:
-sg ca export > sg-ca.pem
+sc ca export > sg-ca.pem
 export SSL_CERT_FILE=$PWD/sg-ca.pem
 export NODE_EXTRA_CA_CERTS=$PWD/sg-ca.pem
 export REQUESTS_CA_BUNDLE=$PWD/sg-ca.pem
@@ -409,7 +409,7 @@ Points to know:
   proxy ignores the user name anyway: the token is in the password position.
 - `NO_PROXY=localhost,127.0.0.1` is part of the block. If your upstream is `localhost`, delete that line,
   otherwise the client bypasses the proxy and nothing is injected.
-- The `sg ca export > sg-ca.pem` line is an instruction to run on the machine where the agent runs, not part
+- The `sc ca export > sg-ca.pem` line is an instruction to run on the machine where the agent runs, not part
   of the exports. Each CA variable points at the file; most of them *replace* the tool's own trust store (see
   [README: Configure an agent](../README.md#configure-an-agent)).
 - Inside Docker the default `--proxy-url` is wrong for agents in other containers: pass
@@ -418,7 +418,7 @@ Points to know:
 With `--json` only the JSON is printed, without the block:
 
 ```
-$ sg --json token create --machine laptop --role reviewer --ttl 12h
+$ sc --json token create --machine laptop --role reviewer --ttl 12h
 {
   "jti": "e7783b5f-4282-4532-93f8-d2fa9897f486",
   "machine": "laptop",
@@ -428,15 +428,15 @@ $ sg --json token create --machine laptop --role reviewer --ttl 12h
 ```
 
 ```
-$ sg token ls
+$ sc token ls
 JTI                                   MACHINE  ROLE       CREATED               EXPIRES               STATUS
 e7783b5f-4282-4532-93f8-d2fa9897f486  laptop   reviewer   2026-10-16T19:55:56Z  2026-10-17T07:55:56Z  active
 3f5d576b-e73a-4ce0-a5b2-61410cd488ed  laptop   developer  2026-10-16T19:55:56Z  -                     active
-$ sg token revoke 3f5d576b-e73a-4ce0-a5b2-61410cd488ed
+$ sc token revoke 3f5d576b-e73a-4ce0-a5b2-61410cd488ed
 token 3f5d576b-e73a-4ce0-a5b2-61410cd488ed revoked
-$ sg token revoke-machine laptop
+$ sc token revoke-machine laptop
 1 token(s) revoked for 'laptop'
-$ sg token revoke not-a-uuid
+$ sc token revoke not-a-uuid
 error: invalid token id
 ```
 
@@ -444,7 +444,7 @@ Revocation is immediate for open MITM tunnels (checked before every request); it
 passthrough tunnels when they end (bounded by the idle timeout and lifetime). See
 [proxy-internals.md](proxy-internals.md#authentication-and-revocation).
 
-## `sg ca`
+## `sc ca`
 
 The proxy re-signs HTTPS for the hosts that have rules with a local CA whose X.509 name constraints are limited
 to the domains **derived from the rules**. There is no command to add or remove a domain: creating a rule for a new host
@@ -452,22 +452,22 @@ adds it, deleting the last rule that needs it removes it. Details: [tokens-and-c
 
 | Command | Meaning |
 |---|---|
-| `sg ca export` | Print the CA certificate (PEM, public part only) on stdout. |
-| `sg ca status` | List the permitted domains (read-only; a wildcard rule `*.x` shows as `x`). |
+| `sc ca export` | Print the CA certificate (PEM, public part only) on stdout. |
+| `sc ca status` | List the permitted domains (read-only; a wildcard rule `*.x` shows as `x`). |
 
 ```
-$ sg ca status
+$ sc ca status
 permitted domains:
-$ sg ca status
+$ sc ca status
 permitted domains:
   api.github.com
   gitlab.com
   x.example
-$ sg ca export > sg-ca.pem
+$ sc ca export > sg-ca.pem
 $ head -2 sg-ca.pem
 -----BEGIN CERTIFICATE-----
 MIIBzzCCAXWgAwIBAgIQGLka/vxjiCk9HHYWLBt+VzAKBggqhkjOPQQDAjAdMRsw
-$ sg --json ca status
+$ sc --json ca status
 {
   "domains": [
     "localhost"
@@ -479,7 +479,7 @@ $ sg --json ca status
 `secret add gl --host '*.gitlab.com' ...` and a rule for `x.example`.)
 
 **When agents must reload the certificate.** Every `secret add` or `rule add` whose host is new to the CA prints
-`warning: the CA certificate changed: agents must reload it (sg ca export)`. **Re-export the certificate and restart or
+`warning: the CA certificate changed: agents must reload it (sc ca export)`. **Re-export the certificate and restart or
 reconfigure the agents**: a client still holding the previous certificate refuses the newly permitted name, because the
 old certificate has narrower constraints. Leaf certificates issued earlier stay valid. Removing a host (deleting its last
 rule, a secret or a role) re-issues the certificate too, but agents holding the old one keep working, so no reload is
@@ -492,10 +492,10 @@ sign for every site under it. Write rules for exact hosts. When no rule remains 
 
 There is no command to rotate the CA key.
 
-## `sg audit`
+## `sc audit`
 
 ```
-sg audit [--role <ROLE>] [--host <HOST>] [--since <UNIX_TS>] [--limit <N>]
+sc audit [--role <ROLE>] [--host <HOST>] [--since <UNIX_TS>] [--limit <N>]
 ```
 
 Shows the audit log, **newest first**. Filters combine with AND.
@@ -512,7 +512,7 @@ Columns: `TIME`, `MACHINE`, `ROLE`, `METHOD`, `HOST`, `PATH`, `DECISION`, `STATU
 explained in [proxy-internals.md](proxy-internals.md#audit-decisions).
 
 ```
-$ sg audit --limit 6
+$ sc audit --limit 6
 TIME                  MACHINE  ROLE       METHOD   HOST       PATH         DECISION   STATUS  RULE
 2026-10-16T20:10:34Z  laptop   developer  POST     localhost  /repos/demo  inject     200     2
 2026-10-16T20:10:34Z  laptop   developer  CONNECT  localhost  /            mitm       200     -
@@ -526,7 +526,7 @@ JSON rows have the fields `ts`, `jti`, `machine`, `role`, `host`, `method`, `pat
 `status` (`null` where unknown):
 
 ```
-$ sg --json audit --limit 1
+$ sc --json audit --limit 1
 [
   {
     "decision": "inject",
@@ -545,10 +545,10 @@ $ sg --json audit --limit 1
 
 The audit log is never pruned by the program; see [operations.md](operations.md#observability).
 
-## `sg login-url`
+## `sc login-url`
 
 ```
-sg login-url
+sc login-url
 ```
 
 Mints a fresh single-use login link for the web UI and prints it. It works through the admin socket only (the
@@ -556,9 +556,9 @@ web listener cannot mint its own credentials), needs no restart, and can be run 
 works once and expires after 10 minutes; at most 8 pending links are kept (older ones are dropped).
 
 ```
-$ sg login-url
+$ sc login-url
 http://localhost:45081/#t=7bb9d66e57d13ce721571a5cfdf300cceb87ebf3f815177884d0ba79821baa83
-$ sg --json login-url
+$ sc --json login-url
 {
   "token": "20bae5416d8853f38147a2ec12a2dbe626abb6e64f40617241ce3c819742883e",
   "url": "http://localhost:36655/#t=20bae5416d8853f38147a2ec12a2dbe626abb6e64f40617241ce3c819742883e"
@@ -577,7 +577,7 @@ Copied from real runs. Prefix is always `error: ` on stderr, exit code `1` (or `
 
 | Message | Cause and fix |
 |---|---|
-| `cannot reach the vault at <socket> (is `sg serve` running?): No such file or directory (os error 2)` | No server, or the wrong socket path. Start `sg serve`, or pass `--socket`/`SG_SOCKET` (remember the default depends on `XDG_RUNTIME_DIR`). |
+| `cannot reach the vault at <socket> (is `sc serve` running?): No such file or directory (os error 2)` | No server, or the wrong socket path. Start `sc serve`, or pass `--socket`/`SC_SOCKET` (remember the default depends on `XDG_RUNTIME_DIR`). |
 | `... Connection refused (os error 111)` | The path exists but nothing listens (stale socket, or not a socket). |
 | `refusing to use <socket>: its directory <dir> is accessible to group/others (mode 755); the socket must live in a 0700 directory such as $XDG_RUNTIME_DIR` | The client will not talk to a socket other users could have replaced. `chmod 700 <dir>` or use another directory. |
 | `refusing to use <socket>: its directory <dir> is owned by uid N, not by you (uid M)` / `... it is owned by uid N, not by you` / `... it is writable by group/others (mode 666)` | Same family: wrong owner or loose mode. |
@@ -609,34 +609,34 @@ Copied from real runs. Prefix is always `error: ` on stderr, exit code `1` (or `
 ### From the argument parser (exit code 2)
 
 ```
-$ sg rule add --role reviewer --host localhost --secret upstream-key
+$ sc rule add --role reviewer --host localhost --secret upstream-key
 error: the following required arguments were not provided:
   <--header <HEADER>|--query <QUERY>>
-$ echo v | sg secret add k
+$ echo v | sc secret add k
 error: the following required arguments were not provided:
   --host <HOST>
   <--header <HEADER>|--query <QUERY>>
-$ sg role add x --unmatched foo
+$ sc role add x --unmatched foo
 error: invalid value 'foo' for '--unmatched <UNMATCHED>'
   [possible values: passthrough, deny]
-$ sg audit --limit 5000
+$ sc audit --limit 5000
 error: invalid value '5000' for '--limit <LIMIT>': 5000 is not in 1..=1000
-$ sg token create --machine m --role reviewer --ttl 11y
+$ sc token create --machine m --role reviewer --ttl 11y
 error: invalid value '11y' for '--ttl <TTL>': expected seconds or a duration like 30m, 12h, 7d
 ```
 
-### `sg serve` start-up errors
+### `sc serve` start-up errors
 
 | Message | Cause and fix |
 |---|---|
-| `no key source: use --key-file, SG_MASTER_KEY or --passphrase` | None given. |
-| `ambiguous key source: use exactly one of --key-file, SG_MASTER_KEY, --passphrase` | More than one given. |
+| `no key source: use --key-file, SC_MASTER_KEY or --passphrase` | None given. |
+| `ambiguous key source: use exactly one of --key-file, SC_MASTER_KEY, --passphrase` | More than one given. |
 | `key file <f> is accessible to group/others (mode 644); run `chmod 600 <f>`` | The key file must be `0600`. |
 | `cannot read key file <f>: No such file or directory (os error 2)` | Wrong path or unreadable. In a container: see the Docker key pitfall in the README. |
-| `the key is not valid: expected base64 of exactly 32 bytes (generate one with `sg keygen`)` | Corrupt or wrong file/variable. The value is never echoed. |
+| `the key is not valid: expected base64 of exactly 32 bytes (generate one with `sc keygen`)` | Corrupt or wrong file/variable. The value is never echoed. |
 | `could not unlock the vault with the given key source` | Wrong key, wrong passphrase, key kind different from the one the vault was created with, or a damaged vault. Deliberately non-specific. |
-| `database schema version 99 is not supported by this build (supports 1)` | The database was written by a different version of the program. Use a matching `sg`. |
-| `--passphrase needs a terminal to prompt on; use --key-file or SG_MASTER_KEY when running unattended` | No TTY on stdin. |
+| `database schema version 99 is not supported by this build (supports 1)` | The database was written by a different version of the program. Use a matching `sc`. |
+| `--passphrase needs a terminal to prompt on; use --key-file or SC_MASTER_KEY when running unattended` | No TTY on stdin. |
 | `passphrases do not match` / `the passphrase must not be empty` | Prompt problems on first creation. |
 | `already running: <socket> accepts connections` | A live server owns that socket. Use another `--socket` (and `--data-dir`) or stop it. |
 | `refusing to create the admin socket: directory <dir> is accessible to group/others (mode 755); use a 0700 directory such as $XDG_RUNTIME_DIR` | Put the socket in a private directory. |

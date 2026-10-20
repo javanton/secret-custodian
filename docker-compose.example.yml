@@ -2,35 +2,35 @@
 #
 # Setup:
 #   1. Create the master key once and back it up (losing it means losing every stored secret).
-#      Easiest: `sg keygen --out sg.key` on the host (mode 0600, owned by you). Or generate it inside
+#      Easiest: `sc keygen --out sg.key` on the host (mode 0600, owned by you). Or generate it inside
 #      a volume as root and hand it to the container user (uid 10001), then mount that volume at
 #      /run/secrets instead of using the `secrets:` entry below:
 #        docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-custodian:dev \
-#          -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
+#          -c 'sc keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
 #      (A plain `docker run -v "$PWD":/out ... keygen --out /out/sg.key` fails with `Permission
 #      denied`: uid 10001 cannot write to your directory.)
 #   2. The key is delivered as a Docker secret. Compose file-based secrets are bind-mounted with the
 #      host file's ownership, so the `uid`/`mode` below only take effect with Swarm; with plain
 #      `docker compose` make the HOST file readable only by uid 10001:
 #        sudo chown 10001:10001 sg.key && sudo chmod 0400 sg.key
-#      Alternative without any file: set SG_MASTER_KEY (the same base64 value) in `environment:` and
+#      Alternative without any file: set SC_MASTER_KEY (the same base64 value) in `environment:` and
 #      drop the `--key-file` option from `command:`. The file route is preferred; env vars show up in
 #      `docker inspect`.
 #   3. docker compose up -d --build
 #   4. Configure the vault with the CLI over the in-container admin socket:
-#        docker compose exec secret-custodian sg secret ls
-#        printf %s "$TOKEN" | docker compose exec -T secret-custodian sg secret add github
-#        docker compose exec secret-custodian sg token create --machine agent1 --role reviewer \
+#        docker compose exec secret-custodian sc secret ls
+#        printf %s "$TOKEN" | docker compose exec -T secret-custodian sc secret add github
+#        docker compose exec secret-custodian sc token create --machine agent1 --role reviewer \
 #            --proxy-url http://secret-custodian:8080
-#      Web UI: docker compose exec secret-custodian sg login-url   (open the printed link on the host,
+#      Web UI: docker compose exec secret-custodian sc login-url   (open the printed link on the host,
 #      it points to http://localhost:9090). If you publish the UI on another host port, e.g.
 #      "127.0.0.1:19090:9090", add `--admin-public-url http://localhost:19090` to `command:` (or set
-#      SG_ADMIN_PUBLIC_URL): the printed link then names that URL and its Host is accepted, so
+#      SC_ADMIN_PUBLIC_URL): the printed link then names that URL and its Host is accepted, so
 #      `--admin-allowed-host` is not needed.
 #
 # Security notes:
 #   * The admin UI has NO remote login: it is published on the host loopback only, and every session
-#     still needs a single-use login token from `sg login-url`.
+#     still needs a single-use login token from `sc login-url`.
 #   * Both ports live in the same container, so an agent container on the `agents` network CAN reach
 #     the admin port (secret-custodian:9090). That is why the proxy refuses to relay to its own ports
 #     and the admin UI rejects unexpected Host/Origin headers and requires the login token. Keep
@@ -66,7 +66,7 @@ services:
 
   # Example agent: everything it sends over HTTP(S) goes through the vault, which injects credentials.
   # Create a token first (see step 4) and put the HTTPS_PROXY line it prints in the environment.
-  # The CA is exported with `docker compose exec secret-custodian sg ca export > sg-ca.pem`.
+  # The CA is exported with `docker compose exec secret-custodian sc ca export > sg-ca.pem`.
   #
   # agent:
   #   image: curlimages/curl

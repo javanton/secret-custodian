@@ -404,7 +404,7 @@ async fn unreachable_vault_message_names_the_socket() {
     .await;
     let msg = r.err_msg();
     assert!(
-        msg.contains("sg serve") && msg.contains("/nonexistent/x.sock"),
+        msg.contains("sc serve") && msg.contains("/nonexistent/x.sock"),
         "{msg}"
     );
 }
@@ -650,7 +650,7 @@ async fn token_create_prints_the_token_env_block_and_ca_hints() {
     );
     assert!(out.contains("HTTP_PROXY="));
     assert!(out.contains("NO_PROXY=localhost,127.0.0.1"));
-    assert!(out.contains("sg ca export > sg-ca.pem"));
+    assert!(out.contains("sc ca export > sg-ca.pem"));
     for v in [
         "SSL_CERT_FILE",
         "NODE_EXTRA_CA_CERTS",
@@ -823,7 +823,7 @@ fn secrets_fake(roles: serde_json::Value) -> Fake {
         ("POST", "/secrets") => (
             201,
             serde_json::json!({"secret":{"id":1,"name":"gh","created_at":0,"rotated_at":null},
-                "rules":[{"id":1}],"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sg ca export)"})
+                "rules":[{"id":1}],"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sc ca export)"})
             .to_string()
             .into_bytes(),
         ),

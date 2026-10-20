@@ -7,7 +7,7 @@ judged. Sources: `crates/policy/src/{model,store,matcher,normalize,render}.rs`,
 `crates/proxy/tests/inject.rs`. The spec reference is section 6.2 of
 [`docs/specs/2026-10-16-secret-guardian-vault.md`](specs/2026-10-16-secret-guardian-vault.md).
 
-Rules are created with `sg rule add` (see [cli-reference.md](cli-reference.md#sg-rule)), the web UI, or
+Rules are created with `sc rule add` (see [cli-reference.md](cli-reference.md#sc-rule)), the web UI, or
 `POST /rules` of the admin API ([admin-api.md](admin-api.md)); all call `sg_policy::add_rule`. The JSON shown in
 section 10 is the body of `POST /rules`.
 
@@ -81,9 +81,9 @@ ids are autoincrement and used as the final tie-break.
 A secret that no rule uses can never be injected, so the admin layer (not the SQL schema) enforces the invariant
 **every secret has at least one rule**:
 
-- **Creation.** `POST /secrets` / `sg secret add` creates the secret together with its first rule(s), atomically
+- **Creation.** `POST /secrets` / `sc secret add` creates the secret together with its first rule(s), atomically
   (`rules` is required and has 1 to 20 items). The rules use the same validation as `add_rule` (section 2.1) through
-  `RuleSpec`, a rule without `secret_id`. Extra rules come from `POST /rules` / `sg rule add`.
+  `RuleSpec`, a rule without `secret_id`. Extra rules come from `POST /rules` / `sc rule add`.
 - **Identical rules.** A rule equal to an existing one in every field (role, host, path, injection kind, target name,
   template and secret; methods compare as a set, so order and case do not matter, and an empty list is different from an
   explicit one) is refused with `409 an identical rule already exists (rule N)`. This applies to `POST /rules` and to two
@@ -441,9 +441,9 @@ Principles:
 6. Hosts are exact or one-label wildcards; add separate rules for each hostname (for example `api.github.com`
    and `uploads.github.com` are different hosts).
 
-Examples, as the JSON body of `POST /rules` (secret ids refer to existing secrets; with the CLI, the first rule below is `sg rule add --role reviewer --host
+Examples, as the JSON body of `POST /rules` (secret ids refer to existing secrets; with the CLI, the first rule below is `sc rule add --role reviewer --host
 api.github.com --path '/repos/*' --methods GET --header Authorization --template 'Bearer {secret}' --secret gh`. The *first*
-rule of a secret is created by `sg secret add`, as the `rules` entry of `POST /secrets` without `secret_id`):
+rule of a secret is created by `sc secret add`, as the `rules` entry of `POST /secrets` without `secret_id`):
 
 GitHub, read-only role and read-write role (`Authorization: Bearer <token>`):
 

@@ -35,7 +35,7 @@ Dockerfile or anything in the container path.
 
    | Job | Result |
    |---|---|
-   | `binary` | Builds the static `x86_64-unknown-linux-musl` binary with `scripts/package-release.sh`, which **fails if the tag differs from the `Cargo.toml` version**, if the binary is not statically linked, or if `sg --version` does not print the version. Produces `sg-vX.Y.Z-x86_64-linux.tar.gz` (binary, `LICENSE`, `README.md`) and `SHA256SUMS`, uploaded as a build artifact. |
+   | `binary` | Builds the static `x86_64-unknown-linux-musl` binary with `scripts/package-release.sh`, which **fails if the tag differs from the `Cargo.toml` version**, if the binary is not statically linked, or if `sc --version` does not print the version. Produces `sc-vX.Y.Z-x86_64-linux.tar.gz` (binary, `LICENSE`, `README.md`) and `SHA256SUMS`, uploaded as a build artifact. |
    | `publish-release` | Creates the GitHub Release for the tag (`gh release create`) and attaches both files directly as release assets. |
    | `publish-image` | Builds the `Dockerfile` and pushes `:vX.Y.Z` and `:latest` to the GitHub Container Registry (`ghcr.io/<owner>/<repo>`). |
 
@@ -47,7 +47,7 @@ itself is not guaranteed to be bit-for-bit reproducible across toolchain version
 Needs the musl target and `musl-gcc` (`apt-get install musl-tools`, `rustup target add x86_64-unknown-linux-musl`):
 
 ```sh
-scripts/package-release.sh v0.1.0     # writes ./dist/sg-v0.1.0-x86_64-linux.tar.gz and ./dist/SHA256SUMS
+scripts/package-release.sh v0.1.0     # writes ./dist/sc-v0.1.0-x86_64-linux.tar.gz and ./dist/SHA256SUMS
 ```
 
 To build it exactly as CI does without installing anything, use the same image:

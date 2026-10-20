@@ -10,7 +10,7 @@ use std::{
 /// Where the master key comes from. Exactly one source must be chosen.
 pub struct KeySource {
     pub key_file: Option<PathBuf>,
-    /// Base64 of 32 bytes, from the `SG_MASTER_KEY` environment variable.
+    /// Base64 of 32 bytes, from the `SC_MASTER_KEY` environment variable.
     pub master_key: Option<String>,
     pub passphrase: bool,
 }
@@ -41,10 +41,10 @@ pub fn resolve_key(src: &KeySource, confirm_passphrase: bool) -> anyhow::Result<
     .filter(|b| **b)
     .count();
     match chosen {
-        0 => bail!("no key source: use --key-file, SG_MASTER_KEY or --passphrase"),
+        0 => bail!("no key source: use --key-file, SC_MASTER_KEY or --passphrase"),
         1 => {}
         _ => bail!(
-            "ambiguous key source: use exactly one of --key-file, SG_MASTER_KEY, --passphrase"
+            "ambiguous key source: use exactly one of --key-file, SC_MASTER_KEY, --passphrase"
         ),
     }
     if let Some(p) = &src.key_file {
@@ -70,7 +70,7 @@ pub fn resolve_key(src: &KeySource, confirm_passphrase: bool) -> anyhow::Result<
         ));
     }
     if !std::io::stdin().is_terminal() {
-        bail!("--passphrase needs a terminal to prompt on; use --key-file or SG_MASTER_KEY when running unattended");
+        bail!("--passphrase needs a terminal to prompt on; use --key-file or SC_MASTER_KEY when running unattended");
     }
     let pw = rpassword::prompt_password("Vault passphrase: ")?;
     if pw.is_empty() {
@@ -84,7 +84,7 @@ pub fn resolve_key(src: &KeySource, confirm_passphrase: bool) -> anyhow::Result<
 
 fn bad_key() -> anyhow::Error {
     anyhow::anyhow!(
-        "the key is not valid: expected base64 of exactly 32 bytes (generate one with `sg keygen`)"
+        "the key is not valid: expected base64 of exactly 32 bytes (generate one with `sc keygen`)"
     )
 }
 

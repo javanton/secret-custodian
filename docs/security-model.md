@@ -24,7 +24,7 @@ operating-system user as the vault.
 | Asset | Where it lives | Protected by |
 |---|---|---|
 | Secret values (API keys, tokens) | `secrets.value_enc` in `vault.db` | AES-256-GCM under the data key, bound to `secret:{id}` |
-| Master key (KEK) | Key file, `SG_MASTER_KEY`, or a passphrase | File mode `0600` (enforced), environment, human memory; never in the database |
+| Master key (KEK) | Key file, `SC_MASTER_KEY`, or a passphrase | File mode `0600` (enforced), environment, human memory; never in the database |
 | Data key (DEK) | `meta.dek_wrapped`, in memory while running | Wrapped under the KEK |
 | Token signing key (Ed25519) | `meta.token_signing_key` | Sealed under the DEK |
 | CA private key | `ca.key_enc` | Sealed under the DEK; certificate carries name constraints |
@@ -55,7 +55,7 @@ flowchart LR
     PX --- DB
     ADM --- DB
     KEY -.-> DB
-    OP -- "sg CLI via socket" --> ADM
+    OP -- "sc CLI via socket" --> ADM
     OP -- "browser with one-time login" --> ADM
     WEB -. "must be refused" .-> ADM
 ```
@@ -132,7 +132,7 @@ start a new vault. Rotation of the master key is not implemented ([operations.md
 
 ### Stolen agent token
 
-The thief has the role's permissions until the token expires or is revoked (`sg token revoke`, effective at the
+The thief has the role's permissions until the token expires or is revoked (`sc token revoke`, effective at the
 next request in an open MITM tunnel; passthrough tunnels end by idle timeout or after at most 8 h). The audit log
 attributes every request to the token id and machine label. Mitigations: short `--ttl`, one token per machine, narrow
 roles, revoke on suspicion. The token is not bound to a source address.
@@ -177,7 +177,7 @@ re-issued whenever that set changes, in the same transaction as the rule change.
   `*.co.uk` lets a stolen CA key sign for every site under that suffix. Write rules for exact hosts.
 
 Removing the last rule that needed a host also removes it from the CA, so the CA shrinks as rules go. Agents that hold
-an older certificate keep working after a removal; after an addition they must reload the certificate (`sg ca export`)
+an older certificate keep working after a removal; after an addition they must reload the certificate (`sc ca export`)
 or they refuse the new name (see [tokens-and-ca.md](tokens-and-ca.md#24-re-issue-with-the-same-key)). Start-up drops
 domains no rule uses.
 
@@ -196,7 +196,7 @@ connect is not possible. Private LAN addresses are allowed on purpose (homelab):
 | Secret on the command line, in history or `ps` | Value read from stdin or a hidden prompt, bounded, validated, scrubbed from error messages | `crates/cli/src/input.rs`, `commands.rs` |
 | Secret in logs or error bodies | No request logging; tracing events carry no request data; error bodies are fixed strings | `crates/proxy/tests/no_leaks.rs`, `connect.rs` (`error_bodies_do_not_echo_tokens_or_secret_names`); `crates/sg/tests/cli_e2e.rs` |
 | Stolen database | AES-256-GCM with a per-purpose AAD; key outside the DB; Argon2id for passphrases | `crates/core/src/crypto.rs`, `vault.rs`; [crypto-and-keys.md](crypto-and-keys.md) |
-| Key file readable by others | `sg serve` refuses a key file with any group/other bit; `sg keygen` creates it `0600` and never overwrites | `crates/sg/src/keys.rs` |
+| Key file readable by others | `sc serve` refuses a key file with any group/other bit; `sc keygen` creates it `0600` and never overwrites | `crates/sg/src/keys.rs` |
 | Database or directory readable by others | DB created `0600` before SQLite touches it; data dir `0700` (created or tightened; foreign owner refused) | `crates/core/src/vault.rs`; `crates/sg/src/serve.rs` (`prepare_data_dir`) |
 | Another user reaches the admin socket | Socket `0600` in a `0700` directory owned by the server's user, checked by the server and by the client; a regular file or symlink at the path is refused; a live socket is never replaced | `crates/admin/src/serve.rs` (`bind_unix`); `crates/cli/src/client.rs` |
 | Rebinding, CSRF, session theft, XSS, framing | See the web-page table | `crates/admin/src/web.rs`, `api.rs`, `sessions.rs`; `web/app.js` |
@@ -296,7 +296,7 @@ Before giving an agent a token:
 
 - [ ] The vault runs as its own OS user (or in a container); **agents run as a different user or container** and
       cannot read the key file, the data directory or the admin socket.
-- [ ] Master key in a `0600` file (or a Docker secret / `SG_MASTER_KEY` set from a secret manager), backed up
+- [ ] Master key in a `0600` file (or a Docker secret / `SC_MASTER_KEY` set from a secret manager), backed up
       **separately** from the database. Know that losing it loses every secret.
 - [ ] `--admin-bind` is loopback (or published only to the host's `127.0.0.1` in Docker). Never expose the web UI to
       a network; there is no remote login.
@@ -306,13 +306,13 @@ Before giving an agent a token:
       hosts, narrow path prefixes and the least methods (`GET` for read-only roles).
 - [ ] Credentials injected by header, not query string; upstream keys are scoped to the minimum the role needs.
 - [ ] Rule hosts (which become the CA's domains) are exact hosts you control or trust (`api.github.com`, not `*.github.io` or
-      `*.co.uk`); `sg ca status` shows what the CA currently permits.
+      `*.co.uk`); `sc ca status` shows what the CA currently permits.
 - [ ] The CA certificate is trusted only per agent process through the environment variables, not in a system store
       or browser.
-- [ ] Tokens have a `--ttl`, one token per machine and role; revoke (`sg token revoke`, `revoke-machine`) when a
+- [ ] Tokens have a `--ttl`, one token per machine and role; revoke (`sc token revoke`, `revoke-machine`) when a
       machine is retired or suspected.
 - [ ] You know your upstreams: none that reflect credentials in responses are used with agents you do not trust.
-- [ ] `sg audit` is reviewed periodically; the database is backed up; plan for audit growth (there is no built-in
+- [ ] `sc audit` is reviewed periodically; the database is backed up; plan for audit growth (there is no built-in
       pruning).
 - [ ] Binary and image come from your own build of a reviewed commit; the Docker image runs as uid 10001 with a
       read-only root filesystem, no capabilities and `no-new-privileges` (see the compose example).

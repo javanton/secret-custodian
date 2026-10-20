@@ -791,7 +791,7 @@ function showHelp(message) {
       { class: "helpscreen" },
       el("h2", {}, "Sign in required"),
       message ? el("p", { class: "error" }, message) : null,
-      el("p", {}, "This interface needs a one-time login link. Run ", el("code", {}, "sg login-url"), " in a terminal on this machine and open the printed link in this browser."),
+      el("p", {}, "This interface needs a one-time login link. Run ", el("code", {}, "sc login-url"), " in a terminal on this machine and open the printed link in this browser."),
       el("p", { class: "help" }, "Links work once and the session lasts only while this tab stays open."),
     ),
   );
@@ -807,7 +807,7 @@ function logout() {
 async function boot() {
   setOnExpired(() => {
     freshToken = null;
-    showHelp("Session expired: run `sg login-url` and open the printed link.");
+    showHelp("Session expired: run `sc login-url` and open the printed link.");
   });
   const hash = location.hash;
   const token = parseFragment(hash);
@@ -817,7 +817,7 @@ async function boot() {
       await login(token);
     } catch (e) {
       clearSession();
-      showHelp("Login failed: " + e.message + ". Run `sg login-url` for a fresh link.");
+      showHelp("Login failed: " + e.message + ". Run `sc login-url` for a fresh link.");
       return;
     }
   }

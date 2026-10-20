@@ -32,12 +32,12 @@ graph TD
 | `KeyInput::Raw(Key32)` | The 32 bytes are the KEK. Callers build them with `crypto::kek_from_base64(s)`: standard base64 (with padding), surrounding whitespace trimmed, must decode to exactly 32 bytes, else `CoreError::InvalidKey`. | `kdf = "raw"`, `salt` = empty blob |
 | `KeyInput::Passphrase(String)` | `crypto::kek_from_passphrase`: Argon2id, 16-byte random salt generated at `init`. | `kdf = "argon2id"`, `salt` = the 16 bytes |
 
-The three user-facing sources of the spec (key file `--key-file`/`SG_KEY_FILE`, env var
-`SG_MASTER_KEY`, passphrase prompt) map onto those two variants: key file and env var both yield a
+The three user-facing sources of the spec (key file `--key-file`/`SC_KEY_FILE`, env var
+`SC_MASTER_KEY`, passphrase prompt) map onto those two variants: key file and env var both yield a
 base64 32-byte key (`Raw`), the passphrase yields `Passphrase`. The code that reads them is in
 `crates/sg/src/keys.rs` (`resolve_key`): exactly one source must be given; a key file must have no group/other
-permission bits (mode `0600`); `SG_MASTER_KEY` is read from the environment only (never a flag); the passphrase is
-prompted on a terminal (twice when the vault is first created). `sg keygen --out FILE` writes a new random key
+permission bits (mode `0600`); `SC_MASTER_KEY` is read from the environment only (never a flag); the passphrase is
+prompted on a terminal (twice when the vault is first created). `sc keygen --out FILE` writes a new random key
 (base64, mode `0600`, never overwrites). `sg-core` itself only offers `kek_from_base64` and `kek_from_passphrase`.
 
 **Argon2id parameters** (`crypto.rs`, `argon2id()`), fixed explicitly so a crate default change cannot
@@ -170,7 +170,7 @@ What it cannot guarantee:
 
 `WrongKey` vs `KeySourceMismatch` distinguishes only the *kind* of key source, which is visible
 in plaintext `meta.kdf` anyway; a wrong value of the right kind and a corrupt file give the same
-`WrongKey`. The spec says the failure reason is not revealed: `sg serve` honours that by printing the same
+`WrongKey`. The spec says the failure reason is not revealed: `sc serve` honours that by printing the same
 `could not unlock the vault with the given key source` for `WrongKey`, `KeySourceMismatch`, `InvalidKey` and `Crypto`
 (`open_error` in `crates/sg/src/serve.rs`); only the library error types distinguish them.
 

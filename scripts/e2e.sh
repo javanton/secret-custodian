@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host-side end-to-end test: real curl through the real `sg` proxy to a real local TLS upstream.
+# Host-side end-to-end test: real curl through the real `sc` proxy to a real local TLS upstream.
 # Uses a private temp dir and dynamic ports; never touches your own data dir or sockets.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -7,10 +7,10 @@ cd "$(dirname "$0")/.."
 for tool in cargo curl openssl python3; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 2; }
 done
-unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy SG_SOCKET SG_MASTER_KEY SG_KEY_FILE
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy SC_SOCKET SC_MASTER_KEY SC_KEY_FILE
 
 cargo build -q -p sg
-SG="$PWD/target/debug/sg"
+SC="$PWD/target/debug/sc"
 W="$(mktemp -d)"
 SERVE_PID=""; UP_PID=""
 FAILED=0
@@ -25,7 +25,7 @@ SECRET="E2E-SECRET-$RANDOM$RANDOM$RANDOM"
 SOCK="$W/sg.sock"
 DATA="$W/data"
 UPLOG="$W/upstream.log"; : >"$UPLOG"
-sg() { "$SG" --socket "$SOCK" "$@"; }
+sc() { "$SC" --socket "$SOCK" "$@"; }
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILED=1; }
@@ -69,14 +69,14 @@ for _ in $(seq 100); do [ -s "$W/up.port" ] && break; kill -0 "$UP_PID" 2>/dev/n
 UPPORT="$(cat "$W/up.port")"
 
 # 2. The vault.
-"$SG" keygen --out "$W/k.key" >/dev/null
+"$SC" keygen --out "$W/k.key" >/dev/null
 MASTER_KEY="$(cat "$W/k.key")"
-"$SG" serve --data-dir "$DATA" --socket "$SOCK" --key-file "$W/k.key" \
+"$SC" serve --data-dir "$DATA" --socket "$SOCK" --key-file "$W/k.key" \
   --proxy-bind 127.0.0.1:0 --admin-bind 127.0.0.1:0 --upstream-ca "$W/up.pem" \
   >"$W/serve.out" 2>"$W/serve.err" &
 SERVE_PID=$!
-for _ in $(seq 100); do grep -qx ready "$W/serve.out" 2>/dev/null && break; kill -0 "$SERVE_PID" 2>/dev/null || die "sg serve died"; sleep 0.1; done
-grep -qx ready "$W/serve.out" || die "sg serve never printed ready"
+for _ in $(seq 100); do grep -qx ready "$W/serve.out" 2>/dev/null && break; kill -0 "$SERVE_PID" 2>/dev/null || die "sc serve died"; sleep 0.1; done
+grep -qx ready "$W/serve.out" || die "sc serve never printed ready"
 PROXY="$(sed -n 's/^proxy: http:\/\///p' "$W/serve.out")"
 ADMIN_PORT="$(sed -n 's/^admin: http:\/\/localhost:\([0-9]*\)\/.*/\1/p' "$W/serve.out")"
 LOGIN_TOKEN="$(sed -n 's/^admin: .*#t=//p' "$W/serve.out")"
@@ -85,22 +85,22 @@ LOGIN_TOKEN="$(sed -n 's/^admin: .*#t=//p' "$W/serve.out")"
 echo "vault: proxy=$PROXY admin_port=$ADMIN_PORT upstream_port=$UPPORT"
 
 # 3. Configuration through the CLI.
-sg role add developer --unmatched deny >/dev/null
-sg role add reviewer --unmatched deny >/dev/null
-sg role add restricted --unmatched deny >/dev/null
-sg role add querier --unmatched deny >/dev/null
-sg role add keyer --unmatched deny >/dev/null
+sc role add developer --unmatched deny >/dev/null
+sc role add reviewer --unmatched deny >/dev/null
+sc role add restricted --unmatched deny >/dev/null
+sc role add querier --unmatched deny >/dev/null
+sc role add keyer --unmatched deny >/dev/null
 # A secret is created together with its first rule; the CA permits the rule's host from then on.
-if printf '%s' "$SECRET" | sg secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
-sg secret ls | grep -q norule-key && fail "rejected secret was stored" || pass "rejected secret was not stored"
-printf '%s' "$SECRET" | sg secret add api-key --role developer --host localhost --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
-sg rule add --role reviewer   --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
-sg rule add --role restricted --host localhost --methods GET --path '/repos/*' --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
-sg rule add --role querier    --host localhost --query api_key --secret api-key >/dev/null
-sg rule add --role keyer      --host localhost --header X-Api-Key --secret api-key >/dev/null
-sg ca status | grep -q localhost && pass "ca status lists the rule host" || fail "ca status does not list localhost"
-sg ca export >"$W/ca.pem"
-tokjson() { sg --json token create --machine e2e --role "$1" --proxy-url "http://$PROXY"; }
+if printf '%s' "$SECRET" | sc secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
+sc secret ls | grep -q norule-key && fail "rejected secret was stored" || pass "rejected secret was not stored"
+printf '%s' "$SECRET" | sc secret add api-key --role developer --host localhost --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
+sc rule add --role reviewer   --host localhost --methods GET --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
+sc rule add --role restricted --host localhost --methods GET --path '/repos/*' --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
+sc rule add --role querier    --host localhost --query api_key --secret api-key >/dev/null
+sc rule add --role keyer      --host localhost --header X-Api-Key --secret api-key >/dev/null
+sc ca status | grep -q localhost && pass "ca status lists the rule host" || fail "ca status does not list localhost"
+sc ca export >"$W/ca.pem"
+tokjson() { sc --json token create --machine e2e --role "$1" --proxy-url "http://$PROXY"; }
 jget() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 DEV_JSON="$(tokjson developer)"; DEV="$(jget token <<<"$DEV_JSON")"; DEV_JTI="$(jget jti <<<"$DEV_JSON")"
 REV="$(tokjson reviewer | jget token)"
@@ -164,7 +164,7 @@ CONNECT_CODE="$(curl -s -o /dev/null -w '%{http_connect}' --max-time 20 --proxy 
 check "CONNECT to the proxy's own port refused" 403 "$CONNECT_CODE"
 
 # 8. Revocation.
-sg token revoke "$DEV_JTI" >/dev/null
+sc token revoke "$DEV_JTI" >/dev/null
 check "revoked developer token" 407 "$(connect_code "$DEV" /thing)"
 check "other tokens unaffected by revocation" 200 "$(req "$REV" GET /thing)"
 
@@ -172,19 +172,19 @@ check "other tokens unaffected by revocation" 200 "$(req "$REV" GET /thing)"
 if grep -rqaF "$SECRET" "$DATA"; then fail "plaintext secret in the data dir"; else pass "no plaintext secret in database files"; fi
 if grep -rqaF "$MASTER_KEY" "$DATA"; then fail "master key in the data dir"; else pass "no master key in database files"; fi
 LEAK=0
-for t in $SECRET $MASTER_KEY $ALL_TOKENS $(sg audit 2>/dev/null | grep -o 'eyJ[A-Za-z0-9._-]*' || true); do
+for t in $SECRET $MASTER_KEY $ALL_TOKENS $(sc audit 2>/dev/null | grep -o 'eyJ[A-Za-z0-9._-]*' || true); do
   grep -qF "$t" "$W/serve.out" "$W/serve.err" 2>/dev/null && LEAK=1
 done
 # the login token is allowed once, on the admin line of stdout only
 grep -qF "$LOGIN_TOKEN" "$W/serve.err" && LEAK=1
 [ "$LEAK" = 0 ] && pass "server stdout/stderr contain no secret, master key or agent token" || fail "sensitive value in server logs"
-if sg audit 2>&1 | grep -qF "$SECRET"; then fail "secret in audit output"; else pass "audit output contains no secret"; fi
+if sc audit 2>&1 | grep -qF "$SECRET"; then fail "secret in audit output"; else pass "audit output contains no secret"; fi
 
 # 10. Graceful shutdown.
 kill -TERM "$SERVE_PID"
 RC=0; wait "$SERVE_PID" || RC=$?
 SERVE_PID=""
-check "sg serve exit code after SIGTERM" 0 "$RC"
+check "sc serve exit code after SIGTERM" 0 "$RC"
 [ ! -e "$SOCK" ] && pass "socket removed after SIGTERM" || fail "socket still present after SIGTERM"
 
 if [ "$FAILED" = 0 ]; then echo "E2E OK"; else

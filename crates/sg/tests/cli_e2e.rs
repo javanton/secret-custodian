@@ -1,4 +1,4 @@
-//! End-to-end tests: they spawn the real `sg` binary on ephemeral ports.
+//! End-to-end tests: they spawn the real `sc` binary on ephemeral ports.
 use assert_cmd::cargo::cargo_bin;
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -39,14 +39,14 @@ fn private_tempdir() -> tempfile::TempDir {
 }
 
 fn sg_cmd() -> Command {
-    let mut c = Command::new(cargo_bin("sg"));
+    let mut c = Command::new(cargo_bin("sc"));
     for v in [
-        "SG_SOCKET",
-        "SG_KEY_FILE",
-        "SG_MASTER_KEY",
-        "SG_PROXY_BIND",
-        "SG_ADMIN_BIND",
-        "SG_UPSTREAM_CA",
+        "SC_SOCKET",
+        "SC_KEY_FILE",
+        "SC_MASTER_KEY",
+        "SC_PROXY_BIND",
+        "SC_ADMIN_BIND",
+        "SC_UPSTREAM_CA",
         "RUST_LOG",
     ] {
         c.env_remove(v);
@@ -412,7 +412,7 @@ fn web_login_flow_works_against_the_live_server() {
     let mut resp = String::new();
     let _ = raw.read_to_string(&mut resp);
     assert!(resp.contains(" 421 "), "{resp}");
-    // `sg login-url` mints a fresh working token
+    // `sc login-url` mints a fresh working token
     let (ok, url) = sg(&s, &["login-url"], None);
     assert!(ok, "{url}");
     let fresh = url.split("#t=").nth(1).unwrap().trim().to_string();
@@ -462,7 +462,7 @@ fn key_source_errors_are_clear_and_never_print_the_key() {
     // two sources
     let o = serve(
         &["--key-file", key_a.to_str().unwrap()],
-        &[("SG_MASTER_KEY", "AAAA")],
+        &[("SC_MASTER_KEY", "AAAA")],
     );
     assert!(!o.status.success());
     assert!(text(&o).contains("ambiguous"), "{}", text(&o));
@@ -511,8 +511,8 @@ fn key_source_errors_are_clear_and_never_print_the_key() {
     );
     let key_b_text = std::fs::read_to_string(&key_b).unwrap();
     assert!(!t.contains(key_b_text.trim()), "{t}");
-    // the same vault through SG_MASTER_KEY with the wrong value
-    let o = serve(&[], &[("SG_MASTER_KEY", key_b_text.trim())]);
+    // the same vault through SC_MASTER_KEY with the wrong value
+    let o = serve(&[], &[("SC_MASTER_KEY", key_b_text.trim())]);
     assert!(!o.status.success());
     assert!(!text(&o).contains(key_b_text.trim()));
     // a corrupt vault file
@@ -767,7 +767,7 @@ fn help_texts_are_meaningful() {
         "--socket",
         "--json",
     ] {
-        assert!(t.contains(needle), "sg --help lacks {needle}:\n{t}");
+        assert!(t.contains(needle), "sc --help lacks {needle}:\n{t}");
     }
     assert!(t.contains("SECURITY MODEL") && t.contains("EXAMPLE"), "{t}");
     assert!(
@@ -786,11 +786,11 @@ fn help_texts_are_meaningful() {
         "--allow-loopback-targets",
         "--admin-allowed-host",
         "--admin-public-url",
-        "SG_ADMIN_PUBLIC_URL",
-        "SG_MASTER_KEY",
-        "SG_KEY_FILE",
+        "SC_ADMIN_PUBLIC_URL",
+        "SC_MASTER_KEY",
+        "SC_KEY_FILE",
     ] {
-        assert!(t.contains(needle), "sg serve --help lacks {needle}:\n{t}");
+        assert!(t.contains(needle), "sc serve --help lacks {needle}:\n{t}");
     }
     assert!(!t.contains("RUST_LOG=info"), "nothing logs at info:\n{t}");
     let kg = sg_cmd().args(["keygen", "--help"]).output().unwrap();

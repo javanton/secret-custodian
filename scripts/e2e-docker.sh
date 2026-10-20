@@ -31,7 +31,7 @@ fail() { echo "FAIL: $1"; FAILED=1; }
 check() { if [ "$2" = "$3" ]; then pass "$1 (=$3)"; else fail "$1 (expected $2, got $3)"; fi; }
 die() { echo "FAIL: $1"; docker logs "$NAME" 2>&1 | tail -n 30 || true; tail -n 20 "$W/upstream.log" 2>/dev/null || true; exit 1; }
 freeport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
-dsg() { docker exec "$NAME" sg "$@"; }
+dsg() { docker exec "$NAME" sc "$@"; }
 
 echo "== build =="
 docker build -q -t "$IMAGE" . >/dev/null || die "docker build failed"
@@ -42,7 +42,7 @@ check "container user is uid 10001" 10001 "$(docker run --rm --entrypoint id "$I
 # (A host-owned file bind-mounted as a Docker secret keeps the host owner and is unreadable by uid 10001.)
 docker volume create "$KEYVOL" >/dev/null
 docker run --rm --user 0 --entrypoint sh -v "$KEYVOL:/k" "$IMAGE" -c \
-  'sg keygen --out /k/sg_key >/dev/null && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key' || die "key generation"
+  'sc keygen --out /k/sg_key >/dev/null && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key' || die "key generation"
 docker volume create "$DATAVOL" >/dev/null
 
 # Upstream on the host, reachable from the container via host.docker.internal. Cert SAN covers that name.
@@ -107,16 +107,16 @@ SECRET="E2E-DOCKER-SECRET-$RANDOM$RANDOM"
 dsg --socket /data/sg.sock role add developer --unmatched deny >/dev/null
 dsg --socket /data/sg.sock role add reviewer --unmatched deny >/dev/null
 # A secret is created together with its first rule; the CA permits the rule's host from then on.
-if printf '%s' "$SECRET" | docker exec -i "$NAME" sg --socket /data/sg.sock secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
+if printf '%s' "$SECRET" | docker exec -i "$NAME" sc --socket /data/sg.sock secret add norule-key >/dev/null 2>&1; then fail "secret add without rule flags succeeded"; else pass "secret add without rule flags is refused"; fi
 dsg --socket /data/sg.sock secret ls | grep -q norule-key && fail "rejected secret was stored" || pass "rejected secret was not stored"
-printf '%s' "$SECRET" | docker exec -i "$NAME" sg --socket /data/sg.sock secret add api-key --role developer --host "$UPHOST" --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
+printf '%s' "$SECRET" | docker exec -i "$NAME" sc --socket /data/sg.sock secret add api-key --role developer --host "$UPHOST" --header Authorization --template 'Bearer {secret}' >/dev/null || die "secret add"
 dsg --socket /data/sg.sock rule add --role reviewer --host "$UPHOST" --methods GET --header Authorization --template 'Bearer {secret}' --secret api-key >/dev/null
 dsg --socket /data/sg.sock ca status | grep -q "$UPHOST" && pass "ca status lists the rule host" || fail "ca status does not list $UPHOST"
 dsg --socket /data/sg.sock ca export >"$W/ca.pem"
 jget() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 DEV="$(dsg --socket /data/sg.sock --json token create --machine e2e --role developer | jget token)"
 REV="$(dsg --socket /data/sg.sock --json token create --machine e2e --role reviewer | jget token)"
-check "healthcheck command succeeds" 0 "$(docker exec "$NAME" sg --socket /data/sg.sock ca status >/dev/null 2>&1; echo $?)"
+check "healthcheck command succeeds" 0 "$(docker exec "$NAME" sc --socket /data/sg.sock ca status >/dev/null 2>&1; echo $?)"
 
 echo "== requests through the published proxy port =="
 BASE="https://$UPHOST:$UPPORT"

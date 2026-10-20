@@ -154,7 +154,7 @@ the service reloads from the vault (tests `leaf_aki_equals_ca_ski_fresh_after_al
 ### 2.3 The CA follows the rules
 
 The permitted domains are not configured by hand: the admin crate derives them from the stored rules and keeps the CA
-equal to that set. There is no `sg ca allow-domain` and no `POST /ca/domains`. (`CaService::allow_domain` survives only as a
+equal to that set. There is no `sc ca allow-domain` and no `POST /ca/domains`. (`CaService::allow_domain` survives only as a
 library call that the CA and proxy tests use to set up a domain; the admin crate never calls it, and its name appears in
 some test names below for that reason.)
 
@@ -171,7 +171,7 @@ together give one entry.
 | `DELETE /rules/{id}` | domain dropped if no other rule uses it |
 | `DELETE /secrets/{name}` (its rules go too) | domains dropped if nobody else uses them |
 | `DELETE /roles/{name}` (its rules go too; refused if it would orphan a secret) | domains dropped if nobody else uses them |
-| `sg serve` start-up (`sync_ca`) | one sync of the CA with the existing rules |
+| `sc serve` start-up (`sync_ca`) | one sync of the CA with the existing rules |
 
 **Prepare, commit, install.** `CaService::prepare_domains` validates the set (`validate_domain`), builds the new
 certificate with the same key and a new random serial, and **probes** it; `persist` writes it inside the operation's
@@ -190,7 +190,7 @@ Both adding and removing a domain re-issue the certificate; an unchanged set is 
 Rule validation applies the same DNS rules to `host_pattern` (with a leading `*.` removed; `localhost` is allowed), so a
 new rule can never name a host the CA would refuse and such a request gets a `400`. The CA validation remains as a
 safety net. Rules stored by older builds may still hold such hosts: when the CA domains are derived (every rule
-operation and `sg serve` startup) those hosts are skipped with a `warn` log line naming them, which only narrows the CA
+operation and `sc serve` startup) those hosts are skipped with a `warn` log line naming them, which only narrows the CA
 (they cannot be intercepted) instead of failing the operation.
 
 **The probe** (`probe`): with the new certificate as the only trust anchor and rustls-webpki's verifier, a
@@ -199,7 +199,7 @@ the name would exceed 253 bytes). If any verification fails the call returns
 `DomainRejected("would invalidate the CA name constraints")`. The point is that a name webpki would refuse can never
 make the whole CA unusable.
 
-**Start-up sync.** Each `sg serve` start makes the stored CA equal to the derived set once. Domains that no rule uses
+**Start-up sync.** Each `sc serve` start makes the stored CA equal to the derived set once. Domains that no rule uses
 (for example added by hand with the removed `ca allow-domain`) are dropped; domains rules need are added. A second start
 changes nothing. See [operations.md](operations.md#upgrading-from-a-version-without-required-rules).
 
@@ -224,8 +224,8 @@ Consequences:
   `leaf_issued_before_allow_domain_still_verifies_against_the_reissued_ca`). The leaf cache is cleared on every re-issue.
 - A client that still trusts the **old** certificate refuses a newly permitted domain (its constraints are narrower;
   test `old_ca_certificate_refuses_a_newly_allowed_domain`). **Agents must reload the exported public certificate
-  (`sg ca export`) after a domain is ADDED.** The CLI (`secret add`, `rule add`) prints `the CA certificate changed: agents
-  must reload it (sg ca export)`, the API returns `ca_changed` and `notice`, and the web UI shows the notice.
+  (`sc ca export`) after a domain is ADDED.** The CLI (`secret add`, `rule add`) prints `the CA certificate changed: agents
+  must reload it (sc ca export)`, the API returns `ca_changed` and `notice`, and the web UI shows the notice.
 - After a domain is **removed** the old certificate is wider, not narrower, so agents holding it keep working: reloading is
   not needed (but harmless).
 - The random serial matters because the issuer name and key stay the same across re-issues.
@@ -258,7 +258,7 @@ Consequences:
 
 When a host has rules but is not permitted (which should not happen while the CA is kept in sync with the rules), the
 proxy never reaches this point: CONNECT is answered `502` with the message `the CA does not permit <host>; its domains
-follow the rules: re-create the rule or restart `sg serve`, then reload the CA certificate` and audit `ca-not-permitted`.
+follow the rules: re-create the rule or restart `sc serve`, then reload the CA certificate` and audit `ca-not-permitted`.
 
 Upstream connections are independent of this CA: the proxy validates the real server's certificate with the system
 roots plus any extra roots in `UpstreamConfig::new` (`upstream.rs`).
@@ -296,5 +296,5 @@ Known limitations (spec section 6.5 and 11; these are properties of the clients,
 
 ## Commands
 
-`sg ca export|status` and `sg token create|revoke|revoke-machine|ls` are documented in
+`sc ca export|status` and `sc token create|revoke|revoke-machine|ls` are documented in
 [cli-reference.md](cli-reference.md); the web UI offers the same operations (its CA tab is read-only).

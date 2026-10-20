@@ -19,7 +19,7 @@ use sg_core::{SecretMeta, Vault};
 use sg_policy::{derive_ca_domains, insert_rule_in, list_rules_in, NewRule, Rule, RuleSpec};
 
 pub const MAX_RULES_PER_SECRET: usize = 20;
-pub const CA_NOTICE: &str = "the CA certificate changed: agents must reload it (sg ca export)";
+pub const CA_NOTICE: &str = "the CA certificate changed: agents must reload it (sc ca export)";
 
 pub struct Created {
     pub secret: SecretMeta,
@@ -57,7 +57,7 @@ fn install(ca: &CaService, prepared: Option<PreparedCa>) -> bool {
 }
 
 /// Makes the CA's permitted domains exactly the ones derived from the stored rules. Returns whether
-/// the CA certificate changed. Used by `sg serve` at startup.
+/// the CA certificate changed. Used by `sc serve` at startup.
 pub fn sync_ca(vault: &Vault, ca: &CaService) -> ApiResult<bool> {
     let _guard = ca.domain_guard();
     let prepared = vault.in_transaction(|conn| plan_ca(ca, conn))?;

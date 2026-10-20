@@ -1,6 +1,6 @@
 # Secret Custodian
 
-Secret Custodian (`sg`) is a self-hosted credential vault for AI agents and other untrusted automation. Your agents
+Secret Custodian (`sc`) is a self-hosted credential vault for AI agents and other untrusted automation. Your agents
 make ordinary HTTP(S) requests through a local proxy; the proxy looks up the agent's role, and injects the real API
 key into the request on the way out. The agent never holds the key, never sees it, and cannot ask for it. It is one
 Rust binary (or one Docker image) with a CLI, an admin API and a small local web UI, and it keeps everything in a
@@ -54,7 +54,7 @@ secret away and bounds what it can do with it; it does not make a dangerous perm
 
 ```mermaid
 flowchart LR
-    A["Agent (token + CA)"] -->|"HTTPS_PROXY, CONNECT"| P["sg proxy"]
+    A["Agent (token + CA)"] -->|"HTTPS_PROXY, CONNECT"| P["sc proxy"]
     P -->|"token valid?"| T["Token check and revocation"]
     P -->|"host, path, method"| R["Vault rules for the role"]
     R -->|"decrypt secret for this request"| V[("Encrypted vault.db")]
@@ -69,11 +69,11 @@ flowchart LR
 ```sh
 cargo build --release -p sg
 export PATH="$PWD/target/release:$PATH"
-sg serve --key-file ~/.config/secret-custodian/sg.key   # first run creates the key (back it up)
+sc serve --key-file ~/.config/secret-custodian/sg.key   # first run creates the key (back it up)
 ```
 
-That prints a `proxy:` address, a one-time `admin:` login link for the web UI, and `ready`. From there: `sg role add`,
-`sg secret add` (together with its first rule), `sg token create`, point an agent's `HTTPS_PROXY` at the proxy and
+That prints a `proxy:` address, a one-time `admin:` login link for the web UI, and `ready`. From there: `sc role add`,
+`sc secret add` (together with its first rule), `sc token create`, point an agent's `HTTPS_PROXY` at the proxy and
 trust its CA ([next section](#configure-an-agent)).
 
 **[docs/quickstart.md](docs/quickstart.md) is the full version**: every command run for real against a local test
@@ -89,16 +89,15 @@ Other platforms are not built; compile from source (above).
 ```sh
 VERSION=0.1.0   # see the releases page for the latest
 BASE="https://github.com/javanton/secret-custodian/releases/download/v$VERSION"
-curl -fLO "$BASE/sg-v$VERSION-x86_64-linux.tar.gz"
+curl -fLO "$BASE/sc-v$VERSION-x86_64-linux.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
-sha256sum -c SHA256SUMS                       # must print: sg-v0.1.0-x86_64-linux.tar.gz: OK
-tar xzf "sg-v$VERSION-x86_64-linux.tar.gz"
-install -m 0755 "sg-v$VERSION-x86_64-linux/sg" ~/.local/bin/sg
+sha256sum -c SHA256SUMS                       # must print: sc-v0.1.0-x86_64-linux.tar.gz: OK
+tar xzf "sc-v$VERSION-x86_64-linux.tar.gz"
+install -m 0755 "sc-v$VERSION-x86_64-linux/sc" ~/.local/bin/sc
 ```
 
-Most Linux systems already ship an unrelated `/usr/bin/sg` (from shadow-utils: "run a command with another group").
-Make sure `~/.local/bin` comes first in your `PATH` (check with `which -a sg`), or install the binary under another
-name such as `sgv`.
+The binary is named `sc`, not `sg`: most Linux systems already ship an unrelated `/usr/bin/sg` (from shadow-utils:
+"run a command with another group"), and `sc` avoids that collision.
 
 The release also publishes a Docker image as `:vX.Y.Z` and `:latest` (see [Docker](#docker)). The checksum file
 protects against a corrupted download, not against a compromised release page: for that, build from source and
@@ -107,10 +106,10 @@ compare. [docs/releasing.md](docs/releasing.md) documents the pipeline that prod
 ## Configure an agent
 
 Give each agent process three things: the proxy URL with its token, the vault CA certificate, and (if needed) the
-proxy variables for plain HTTP. `sg token create` prints exactly this block with your token filled in:
+proxy variables for plain HTTP. `sc token create` prints exactly this block with your token filled in:
 
 ```sh
-sg ca export > sg-ca.pem
+sc ca export > sg-ca.pem
 export HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080
 export HTTP_PROXY=$HTTPS_PROXY
 export SSL_CERT_FILE=$PWD/sg-ca.pem CURL_CA_BUNDLE=$PWD/sg-ca.pem REQUESTS_CA_BUNDLE=$PWD/sg-ca.pem NODE_EXTRA_CA_CERTS=$PWD/sg-ca.pem
@@ -135,14 +134,14 @@ able to read it); full walkthrough, the three ways around it, and using the CLI 
 
 ## CLI and web UI
 
-Every operation is available from the CLI (`sg --help`); the web UI (opened from the `admin:` link or `sg login-url`)
+Every operation is available from the CLI (`sc --help`); the web UI (opened from the `admin:` link or `sc login-url`)
 covers the same ground with no build step, no cookies, and a session you trade a one-time token for. **The web UI has
 not been verified in a real browser by the authors** — server-side behaviour, static-source checks and its JS logic
 are tested, but layout and the interactive flow are not; use the CLI if that matters to you.
 
 - **Full CLI reference** (every flag, default, output, error): [docs/cli-reference.md](docs/cli-reference.md)
 - **Admin API** (REST routes, authentication, guards): [docs/admin-api.md](docs/admin-api.md)
-- **`sg serve` flags and environment variables**: [docs/operations.md](docs/operations.md) (there is no config file)
+- **`sc serve` flags and environment variables**: [docs/operations.md](docs/operations.md) (there is no config file)
 
 ## Security and limitations
 
@@ -217,7 +216,7 @@ code wins, and the reference pages under `docs/` describe the code.
 **Phase 1 is complete:** the encrypted vault, name-constrained CA, header and query injection over TLS, tokens per
 (machine, role), rules, audit, the CLI, the admin API with a local web UI, Docker packaging and two end-to-end scripts.
 
-Planned for later phases (from the spec; none of it exists yet): a launcher/sidecar (`sg run`) that keeps the token out of
+Planned for later phases (from the spec; none of it exists yet): a launcher/sidecar (`sc run`) that keeps the token out of
 the agent's reach; authenticating agents by OS process identity instead of a token; OIDC federation as a second token
 verifier with per-agent tokens; injection into request bodies and request signing (SigV4 and similar).
 

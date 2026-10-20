@@ -50,7 +50,7 @@ is then sent as `Authorization: Bearer`.
 ## 2. Crate map
 
 The workspace (`Cargo.toml`) has eight members. Crate names on disk are `crates/<x>`; package names are
-`sg-<x>` (the binary package is `sg`).
+`sg-<x>` (the binary package is `sg`, which produces a binary named `sc`).
 
 | Crate | Status | Responsibility | Public API (summary) | Depends on (workspace) |
 |---|---|---|---|---|
@@ -61,7 +61,7 @@ The workspace (`Cargo.toml`) has eight members. Crate names on disk are `crates/
 | `proxy` (`sg-proxy`) | implemented | Proxy listener, CONNECT handling (MITM and passthrough), plain-HTTP handling (never injected), TLS termination, per-request policy evaluation, injection, upstream relay, network policy, per-identity limits, audit of proxy events. | `serve`, `serve_with`, `ServeOptions`, `ProxyState`, `UpstreamConfig`, `NetPolicy`. | `core`, `policy`, `auth`, `ca` |
 | `admin` (`sg-admin`) | implemented | JSON admin API on two routers (Unix socket without authentication of its own; loopback web with Host/Origin guards, one-time login and bearer sessions), embedded web assets, connection limits. The `ops` module holds the multi-step operations (secret with its rules, rule add/delete, secret and role delete, start-up CA sync) that keep the rules and the CA's derived domains in one transaction. | `api_router`, `socket_router`, `web_router`, `serve_unix(_with)`, `serve_web(_with)`, `bind_unix`, `AppState`, `Sessions`, `AdminServeOptions`. See [admin-api.md](admin-api.md). | `core`, `policy`, `auth`, `ca` |
 | `cli` (`sg-cli`) | implemented | The client commands (`secret`, `role`, `rule`, `token`, `ca`, `audit`, `login-url`): `clap` definitions, a Unix-socket HTTP client that checks socket ownership, secret input rules, table and JSON output. See [cli-reference.md](cli-reference.md). | `ClientCommand`, `ClientOpts`, `run_main`, `run_io`, `call`, `call_raw`. | `core` |
-| `sg` | implemented | The single binary: `sg serve` (key sources, data directory, assembly of the three servers, signal handling), `sg keygen`, and the client commands. | binary only (`crates/sg/src/{main,serve,keys}.rs`) | all of the above |
+| `sg` | implemented | The single binary (built as `sc`): `sc serve` (key sources, data directory, assembly of the three servers, signal handling), `sc keygen`, and the client commands. | binary only (`crates/sg/src/{main,serve,keys}.rs`) | all of the above |
 
 Dependencies are exactly those of each `Cargo.toml` (`crates/*/Cargo.toml`). Note that `policy`, `auth`
 and `ca` do not depend on each other: they only share `core`, and are composed by `proxy` and by
@@ -77,7 +77,7 @@ graph TD
     proxy["proxy (sg-proxy)<br/>CONNECT, MITM, injection"]
     admin["admin (sg-admin)<br/>API, sessions, web assets"]
     cli["cli (sg-cli)<br/>socket client, commands"]
-    sg["sg binary<br/>serve, keygen"]
+    sc["sc binary<br/>serve, keygen"]
 
     policy --> core
     auth --> core
@@ -91,25 +91,25 @@ graph TD
     admin --> auth
     admin --> ca
     cli --> core
-    sg --> proxy
-    sg --> admin
-    sg --> cli
-    sg --> core
-    sg --> policy
-    sg --> auth
-    sg --> ca
+    sc --> proxy
+    sc --> admin
+    sc --> cli
+    sc --> core
+    sc --> policy
+    sc --> auth
+    sc --> ca
 ```
 
 Arrows are the dependencies declared in each `Cargo.toml`. At run time the `admin` and `proxy` crates do not call
-each other: they share only the `Vault`, `TokenService` and `CaService` instances that `sg serve` builds.
+each other: they share only the `Vault`, `TokenService` and `CaService` instances that `sc serve` builds.
 
-### Process layout of `sg serve`
+### Process layout of `sc serve`
 
 `crates/sg/src/serve.rs` assembles one process with three listeners that share the same state:
 
 ```mermaid
 flowchart TD
-    start["sg serve"] --> dir["prepare data dir (0700)"]
+    start["sc serve"] --> dir["prepare data dir (0700)"]
     dir --> probe["probe admin socket path (refuse a live one)"]
     probe --> key["resolve key source (file, env or passphrase)"]
     key --> open["open or create vault.db"]
@@ -252,7 +252,7 @@ one by one, with their status codes, in [proxy-internals.md](proxy-internals.md#
 `host-mismatch`, `forbidden`, `plaintext-refused`, `upstream-error`, `internal-error` (vault failure, `503`,
 fail closed) and `client-aborted` (the agent went away while the request was in flight).
 
-Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`; `sg serve` uses the defaults): at most 1024
+Connection-level limits (`crates/proxy/src/lib.rs`, `ServeOptions`; `sc serve` uses the defaults): at most 1024
 simultaneous client connections (excess clients wait in the kernel backlog because the permit is taken before
 `accept`), 30 s to send a complete request head, 10 minutes of tunnel inactivity, 8 hours of tunnel lifetime, 64 tunnels
 and 64 concurrent upstream requests per token, 60 s without body progress. The full table is in
@@ -297,7 +297,7 @@ An admin write that touches rules also changes what the CA may sign for, and the
 its domain would make the proxy answer `502`, and a stale domain would leave the CA wider than the rules. The
 `ops` module (`crates/admin/src/ops.rs`) therefore runs each such operation as one unit: create secret with rules, add
 rule, delete rule, delete secret (its rules go too), delete role (refused when it would orphan a secret), and the one-off
-`sync_ca` at `sg serve` start-up.
+`sync_ca` at `sc serve` start-up.
 
 Each operation does the same four steps:
 
@@ -388,7 +388,7 @@ an independent oracle.
 ## Beyond phase 1
 
 Everything described on this page exists in the code. The spec ([section 10](specs/2026-10-16-secret-guardian-vault.md))
-lists what is deliberately left for later phases and must not be relied on today: a launcher/sidecar (`sg run`) that
+lists what is deliberately left for later phases and must not be relied on today: a launcher/sidecar (`sc run`) that
 keeps the token out of the agent's reach; remote administration with a login (opt-in); OIDC federation as a second
 `TokenVerifier` with per-agent tokens; injection into request bodies and request signing (SigV4, HMAC). Also not
 implemented: rotation of the master key, data key, token signing key and CA key; removal of a CA domain; audit retention;

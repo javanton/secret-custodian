@@ -623,7 +623,7 @@ async fn connect(
             );
             return text(
                 StatusCode::BAD_GATEWAY,
-                &format!("the CA does not permit {host}; its domains follow the rules: re-create the rule or restart `sg serve`, then reload the CA certificate\n"),
+                &format!("the CA does not permit {host}; its domains follow the rules: re-create the rule or restart `sc serve`, then reload the CA certificate\n"),
             );
         }
         let Some(tunnel) = limits

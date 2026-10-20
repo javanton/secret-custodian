@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds the static Linux x86_64 `sg` binary and packs it for a release.
+# Builds the static Linux x86_64 `sc` binary and packs it for a release.
 #
 #   scripts/package-release.sh vX.Y.Z
 #
 # Output (in $DIST_DIR, default ./dist):
-#   sg-vX.Y.Z-x86_64-linux.tar.gz   sg + LICENSE + README.md
+#   sc-vX.Y.Z-x86_64-linux.tar.gz   sc + LICENSE + README.md
 #   SHA256SUMS
 #
 # Needs the musl target (`rustup target add x86_64-unknown-linux-musl`) and `musl-gcc`
@@ -23,10 +23,10 @@ fi
 
 TARGET=x86_64-unknown-linux-musl
 DIST="${DIST_DIR:-dist}"
-NAME="sg-$TAG-x86_64-linux"
+NAME="sc-$TAG-x86_64-linux"
 
 CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked --target "$TARGET" -p sg
-BIN="${CARGO_TARGET_DIR:-target}/$TARGET/release/sg"
+BIN="${CARGO_TARGET_DIR:-target}/$TARGET/release/sc"
 
 # A static binary has no program interpreter (PT_INTERP). `ldd` is not usable here: on glibc it exits 0
 # and prints "statically linked" for static-PIE binaries.

@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-/// Options shared by every client command. The `sg` binary flattens this next to
+/// Options shared by every client command. The `sc` binary flattens this next to
 /// [`ClientCommand`]; `--json` is global so it can be given before or after the subcommand.
 #[derive(Args, Debug, Clone, Default)]
 pub struct ClientOpts {
@@ -622,7 +622,7 @@ async fn token(
             writeln!(io.out, "export HTTP_PROXY=$HTTPS_PROXY")?;
             writeln!(io.out, "export NO_PROXY=localhost,127.0.0.1\n")?;
             writeln!(io.out, "# trust the vault CA:")?;
-            writeln!(io.out, "sg ca export > sg-ca.pem")?;
+            writeln!(io.out, "sc ca export > sg-ca.pem")?;
             for var in [
                 "SSL_CERT_FILE",
                 "NODE_EXTRA_CA_CERTS",

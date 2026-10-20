@@ -14,9 +14,9 @@ command to get the current numbers.
 | Integration (network) | The proxy against **real TLS and plain TCP test upstreams** on ephemeral loopback ports, with real rustls clients: injection, hardening, limits, SSRF policy, streaming | `crates/proxy/tests` | `cargo test -p sg-proxy` |
 | Integration (HTTP) | The admin routers driven in-process (`tower::ServiceExt::oneshot`) and real listeners for the socket and web servers | `crates/admin/tests` | `cargo test -p sg-admin` |
 | Client | CLI commands against a fake admin server on a Unix socket | `crates/cli/tests` | `cargo test -p sg-cli` |
-| Binary end to end (Rust) | The real `sg` binary spawned on ephemeral ports: CLI flow, web login, signals, key-source errors | `crates/sg/tests/cli_e2e.rs` | `cargo test -p sg` |
+| Binary end to end (Rust) | The real `sc` binary spawned on ephemeral ports: CLI flow, web login, signals, key-source errors | `crates/sg/tests/cli_e2e.rs` | `cargo test -p sg` |
 | Page logic | The browser code's pure functions under `node --test` (no browser) | `crates/admin/tests/js` | run by `cargo test -p sg-admin`, or `node --test crates/admin/tests/js/app.test.js` |
-| Script end to end (host) | Real `curl` through the real `sg` proxy to a real local TLS upstream | `scripts/e2e.sh` | `scripts/e2e.sh` |
+| Script end to end (host) | Real `curl` through the real `sc` proxy to a real local TLS upstream | `scripts/e2e.sh` | `scripts/e2e.sh` |
 | Script end to end (Docker) | The same through the built image, hardened flags, restart persistence | `scripts/e2e-docker.sh` | `scripts/e2e-docker.sh` (needs Docker) |
 | Exhaustive | An independent oracle against the path matcher over about 1.5 million paths | `crates/policy/src/matcher.rs` | `cargo test -p sg-policy --release -- --include-ignored` |
 
@@ -34,7 +34,7 @@ Principles used throughout:
 ## Running tests
 
 ```sh
-cargo test -p sg-policy                        # one crate (package names are sg-<dir>; the binary package is `sg`)
+cargo test -p sg-policy                        # one crate (package names are sg-<dir>; the binary package is `sg`, producing `sc`)
 cargo test -p sg-proxy --test inject           # one integration file
 cargo test --workspace                         # everything (542 passed, 1 ignored, about 4 min cold)
 cargo test -p sg-policy --release -- --include-ignored   # + the exhaustive path test (1 min 07 s wall incl. build)
@@ -114,7 +114,7 @@ Counts are `passed` per binary from the workspace run (unit tests are the `src/`
 
 ### `scripts/e2e.sh` (host)
 
-Builds `sg`, starts a TLS upstream (Python, self-signed for `localhost`, logging the method, path and the credential
+Builds `sc`, starts a TLS upstream (Python, self-signed for `localhost`, logging the method, path and the credential
 headers it receives), a vault with dynamic ports and a private temp directory, then asserts (all with real `curl`):
 
 | Area | Assertions |

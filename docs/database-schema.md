@@ -188,7 +188,7 @@ every `Vault::init` and `Vault::open`.
 | `domains` | `TEXT NOT NULL` | JSON array of permitted domains: the set derived from the rules (`[]` initially; `*.x` is stored as `x`). |
 
 - Writers: `CaService::init_or_load` (insert on first run) and `CaService::persist` (updates `cert_pem`, `domains`), which the
-  admin calls inside the same transaction as the rule change that implies it (and once at `sg serve` start-up). The row is
+  admin calls inside the same transaction as the rule change that implies it (and once at `sc serve` start-up). The row is
   never edited by hand.
 - Reader: `CaService::init_or_load`.
 
@@ -242,7 +242,7 @@ value, no token signing key and no CA private key. The test `database_file_never
 - The directory that holds the file is not created or chmod-ed by `sg-core`. `paths::default_data_dir`
   only computes a path (`$XDG_DATA_HOME/secret-custodian`, else `$HOME/.local/share/secret-custodian`, else
   `/tmp/secret-custodian`; empty or relative variables are ignored). Creating and securing the directory
-  is done by `sg serve` (`prepare_data_dir` in `crates/sg/src/serve.rs`): it creates the directory and any missing
+  is done by `sc serve` (`prepare_data_dir` in `crates/sg/src/serve.rs`): it creates the directory and any missing
   parents with mode `0700`, tightens a looser directory it owns (`note: tightened <dir> to mode 0700`) and refuses
   one owned by another user.
 - `Vault::open` never creates a file: if the path does not exist it returns `CoreError::Io` (kind
@@ -289,7 +289,7 @@ database, or has no `meta` table, produces `CoreError::Db`.
 
 `SCHEMA_VERSION` is `1` and is written to `meta.schema_version` at init. `Vault::open` reads it back
 after the key is verified and refuses any other value with `CoreError::UnsupportedSchema`, which
-`sg serve` reports at start-up as `database schema version N is not supported by this build (supports 1)` and exits
+`sc serve` reports at start-up as `database schema version N is not supported by this build (supports 1)` and exits
 with status 1 (`open_error` in `crates/sg/src/serve.rs`); the server never starts on such a file. There is no migration framework and no
 `ALTER TABLE` in the code. As the code stands:
 

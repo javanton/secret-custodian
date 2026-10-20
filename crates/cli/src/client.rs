@@ -122,7 +122,7 @@ async fn exchange(
         .await
         .with_context(|| {
             format!(
-                "cannot reach the vault at {} (is `sg serve` running?)",
+                "cannot reach the vault at {} (is `sc serve` running?)",
                 socket.display()
             )
         })?;

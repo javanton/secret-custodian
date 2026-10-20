@@ -85,7 +85,7 @@ async fn host_guard(State(s): State<AppState>, req: Request, next: Next) -> Resp
 fn unauthorized() -> Response {
     ApiError(
         StatusCode::UNAUTHORIZED,
-        "login required: use the URL printed by `sg serve`".into(),
+        "login required: use the URL printed by `sc serve`".into(),
     )
     .into_response()
 }

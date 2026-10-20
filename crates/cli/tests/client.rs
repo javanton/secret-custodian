@@ -35,7 +35,7 @@ async fn missing_socket_gives_an_actionable_error() {
     .await
     .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("sg serve"), "{msg}");
+    assert!(msg.contains("sc serve"), "{msg}");
     assert!(msg.contains("/nonexistent/sg.sock"), "{msg}");
 }
 

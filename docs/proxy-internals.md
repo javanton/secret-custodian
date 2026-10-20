@@ -2,7 +2,7 @@
 
 What the proxy does with every byte an agent sends, in the order it does it. Sources:
 `crates/proxy/src/{server,mitm,forward,inject,upstream,body,ident,lib}.rs`; every status and body below was
-observed on a running `sg serve` (see [testing.md](testing.md) for the tests that pin each behaviour). For the
+observed on a running `sc serve` (see [testing.md](testing.md) for the tests that pin each behaviour). For the
 big picture see [architecture.md](architecture.md); for matching rules see [policy-and-rules.md](policy-and-rules.md).
 
 The proxy is an HTTP/1.1 proxy listener (`--proxy-bind`, default `127.0.0.1:8080`). Agents speak to it in one
@@ -52,7 +52,7 @@ For every accepted TCP connection (`serve_with` in `lib.rs`):
 4. Failed `accept` calls (for example out of file descriptors) are logged at `warn` and retried after 100 ms.
 
 None of these limits is configurable from the command line; they are the defaults of `ServeOptions` and
-`UpstreamConfig`, which `sg serve` uses unchanged.
+`UpstreamConfig`, which `sc serve` uses unchanged.
 
 ## Authentication and revocation
 
@@ -72,7 +72,7 @@ Authentication happens first, on every request the proxy listener receives (CONN
 
 **Per-request revocation.** The raw token is kept for the life of a MITM tunnel and **verified again before every
 inner request**. A revoked or expired token gets `407` (audit `token-invalid`, with the identity) and the tunnel is
-shut down gracefully. So `sg token revoke` stops an open MITM tunnel at the next request. **Passthrough tunnels
+shut down gracefully. So `sc token revoke` stops an open MITM tunnel at the next request. **Passthrough tunnels
 are opaque byte copies and are not re-checked**: revocation takes effect when they end, which is bounded by the idle
 timeout (10 min without any byte in either direction) and the absolute lifetime (8 h).
 
@@ -351,7 +351,7 @@ name or a rule.
 | 407 | `proxy authentication required` | missing, duplicate, oversized, malformed or invalid credentials (with `Proxy-Authenticate`); a revoked or expired token gets the same response; and token revoked mid-tunnel (no header) | none, or `token-invalid` for a revoked or expired signed token |
 | 421 | `Host does not match the CONNECT target` | host consistency | `host-mismatch` |
 | 429 | `too many open tunnels for this token` / `too many concurrent requests for this token` (with `Retry-After: 1`) | per-identity budgets | `identity-limit` |
-| 502 | `the CA does not permit <host>; its domains follow the rules: re-create the rule or restart `sg serve`, then reload the CA certificate` | CONNECT to a ruled host the CA does not permit | `ca-not-permitted` |
+| 502 | `the CA does not permit <host>; its domains follow the rules: re-create the rule or restart `sc serve`, then reload the CA certificate` | CONNECT to a ruled host the CA does not permit | `ca-not-permitted` |
 | 502 | `could not reach the destination` | passthrough connect failed | `tunnel-connect-failed` |
 | 502 | `upstream request failed` | upstream connect/TLS/I/O/timeout | `upstream-error` |
 | 502 | `secret unavailable` / `invalid injection value` / `could not build the upstream request` / `internal error` | internal failures while preparing the request | `upstream-error` |

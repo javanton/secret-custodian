@@ -2,7 +2,7 @@
 
 The JSON API that the CLI and the web UI use. It is served on **two listeners** with the same routes and
 different authentication. Source: `crates/admin/src/{api,web,sessions,serve,error}.rs`; every example below was
-obtained by calling a real `sg serve` with `curl --unix-socket` (socket) and `curl` plus the login flow (web).
+obtained by calling a real `sc serve` with `curl --unix-socket` (socket) and `curl` plus the login flow (web).
 
 You normally use the [CLI](cli-reference.md) or the [web UI](../README.md#web-ui). This page is for people writing
 tooling against the API, auditing it, or debugging.
@@ -14,8 +14,8 @@ and never come out; the admin crate does not call the decrypting function at all
 
 | | Unix socket | Web (loopback HTTP) |
 |---|---|---|
-| Address | `--socket` / `SG_SOCKET`, default `$XDG_RUNTIME_DIR/secret-custodian.sock`, mode `0600` | `--admin-bind`, default `127.0.0.1:9090` |
-| Used by | `sg` CLI, `curl --unix-socket`, scripts | the browser UI |
+| Address | `--socket` / `SC_SOCKET`, default `$XDG_RUNTIME_DIR/secret-custodian.sock`, mode `0600` | `--admin-bind`, default `127.0.0.1:9090` |
+| Used by | `sc` CLI, `curl --unix-socket`, scripts | the browser UI |
 | Authentication | None of its own: whoever can open the socket is the operator. The socket must be in a `0700` directory owned by the server's user (checked when binding and by the CLI client). | One-time login token in the URL fragment, exchanged by `POST /login` for a session; every `/api/*` call needs `Authorization: Bearer <session>` |
 | Path prefix | none (`/secrets`) | `/api` (`/api/secrets`) |
 | `POST /admin/login-token` | yes | **no** (404 behind the session check) |
@@ -35,10 +35,10 @@ only on the socket so the web listener can never mint its own credentials.
 ```mermaid
 sequenceDiagram
     participant Op as Operator (terminal)
-    participant S as sg serve
+    participant S as sc serve
     participant B as Browser
 
-    Op->>S: sg login-url (POST /admin/login-token on the socket)
+    Op->>S: sc login-url (POST /admin/login-token on the socket)
     S-->>Op: login URL with the token in the fragment (single use, 10 min)
     Op->>B: open the link
     B->>S: GET / (the fragment is never sent)
@@ -54,7 +54,7 @@ sequenceDiagram
 Properties:
 
 - The login token is 256 random bits (64 hex characters), single use, valid **10 minutes**, at most **8 pending**
-  at once (the oldest is dropped). `sg serve` prints the first one on its `admin:` line; `sg login-url` makes more.
+  at once (the oldest is dropped). `sc serve` prints the first one on its `admin:` line; `sc login-url` makes more.
 - A session is 256 random bits (64 hex characters), valid **8 hours** from login (no sliding renewal), at most
   **16 active** (the oldest is evicted). Only SHA-256 digests of tokens and sessions are kept, in memory:
   restarting the server logs everybody out.
@@ -72,7 +72,7 @@ Properties:
 Reproduction with `curl` (the `Host` header must be one the server allows; with a real browser it is automatic):
 
 ```
-$ TOKEN=$(sg --json login-url | jq -r .token)
+$ TOKEN=$(sc --json login-url | jq -r .token)
 $ curl -s -X POST -H 'Host: localhost:36655' -H 'Content-Type: application/json' \
        -d "{\"token\":\"$TOKEN\"}" http://127.0.0.1:36655/login
 {"session":"302bf0737f4bf3c69b31080068a73e2e82cb8396dc04ea5f83edb505f5949be9"}
@@ -89,7 +89,7 @@ Outermost first. Each response also gets the [security headers](#security-header
 | # | Guard | Applies to | Failure |
 |---|---|---|---|
 | 1 | **Host**: the `Host` header must equal (case-insensitively) one of `localhost:<port>`, `127.0.0.1:<port>`, `[::1]:<port>` or an `--admin-allowed-host` value. `Host: localhost` without port is refused. | every request, static files included | `421 Misdirected Request`, body `unexpected Host header` (plain text) |
-| 2 | **Session** (`/api/*` only): exactly one `Authorization: Bearer <id>` header with a valid session. Any other form (two headers, other scheme, cookie only) is treated as missing. | `/api/*` | `401` `{"error":"login required: use the URL printed by `sg serve`"}` |
+| 2 | **Session** (`/api/*` only): exactly one `Authorization: Bearer <id>` header with a valid session. Any other form (two headers, other scheme, cookie only) is treated as missing. | `/api/*` | `401` `{"error":"login required: use the URL printed by `sc serve`"}` |
 | 3 | **Origin** (writes under `/api`, and always on `POST /login`): a present `Origin` must be exactly `http://<allowed host>`; an absent `Origin` passes (curl, CLI-like clients). | `POST`/`PUT`/`DELETE` | `403` `{"error":"cross-origin request refused"}` |
 | 4 | **JSON content type** (writes): `Content-Type: application/json` (parameters allowed). A body without a declared type is refused; a write with `Content-Length: 0` or no body at all is allowed. | non-GET/HEAD/OPTIONS | `415` `{"error":"content type must be application/json"}` |
 | 5 | **Body limit**: 64 KiB. | all bodies | `413` `{"error":"request body too large"}` |
@@ -166,13 +166,13 @@ value). `ca_changed` is true when the permitted domains changed and the CA certi
 agents must reload it.
 
 ```
-$ curl -s -i --unix-socket $SG_SOCKET -X POST -H 'content-type: application/json' \
+$ curl -s -i --unix-socket $SC_SOCKET -X POST -H 'content-type: application/json' \
        -d '{"name":"api-key","value":"s3cr3t-value","rules":[{"role":"reviewer","host_pattern":"api.example.org","methods":["GET"],"kind":"header","target_name":"Authorization","template":"Bearer {secret}"}]}' \
        http://localhost/secrets
 HTTP/1.1 201 Created
 content-type: application/json
 
-{"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sg ca export)","rules":[{"host_pattern":"api.example.org","id":7,"kind":"header","methods":["GET"],"path_pattern":"*","role":"reviewer","secret_id":5,"target_name":"Authorization","template":"Bearer {secret}"}],"secret":{"created_at":1792417787,"id":5,"name":"api-key","rotated_at":null}}
+{"ca_changed":true,"notice":"the CA certificate changed: agents must reload it (sc ca export)","rules":[{"host_pattern":"api.example.org","id":7,"kind":"header","methods":["GET"],"path_pattern":"*","role":"reviewer","secret_id":5,"target_name":"Authorization","template":"Bearer {secret}"}],"secret":{"created_at":1792417787,"id":5,"name":"api-key","rotated_at":null}}
 ```
 
 Refusals (real responses):
@@ -210,18 +210,18 @@ Rule object: `{"id", "role", "host_pattern", "path_pattern", "methods": [...], "
 | `DELETE /rules/{id}` | - | `204`; the CA is re-synced | `400` `invalid rule id` (not a positive integer); `404`; `409` `this is the last rule of its secret: delete the secret instead, or add another rule first` |
 
 Creating the rule and re-deriving the CA's permitted domains happen in one transaction. `ca_changed` is true (and `notice`
-is `the CA certificate changed: agents must reload it (sg ca export)`) when the host was new to the CA. A rule for a host
+is `the CA certificate changed: agents must reload it (sc ca export)`) when the host was new to the CA. A rule for a host
 the CA already permits returns `"ca_changed": false, "notice": null`. Deleting a rule re-derives the domains too (a host
 no rule uses any more is dropped from the CA), without a notice.
 
 ```
-$ curl -s -i --unix-socket $SG_SOCKET -X POST -H 'content-type: application/json' \
+$ curl -s -i --unix-socket $SC_SOCKET -X POST -H 'content-type: application/json' \
        -d '{"role":"reviewer","host_pattern":"api.example.org","kind":"query","target_name":"k","template":"{secret}","secret_id":5}' \
        http://localhost/rules
 HTTP/1.1 201 Created
 
 {"ca_changed":false,"notice":null,"rule":{"host_pattern":"api.example.org","id":8,"kind":"query","methods":[],"path_pattern":"*","role":"reviewer","secret_id":5,"target_name":"k","template":"{secret}"}}
-$ curl -s -i --unix-socket $SG_SOCKET -X DELETE http://localhost/roles/default
+$ curl -s -i --unix-socket $SC_SOCKET -X DELETE http://localhost/roles/default
 HTTP/1.1 409 Conflict
 
 {"error":"deleting this role would leave secrets without rules: gl; delete them or give them rules for another role first"}
@@ -260,10 +260,10 @@ the query string. The meaning of `decision` values is in [proxy-internals.md](pr
 
 ### Socket only: `POST /admin/login-token`
 
-Mints a single-use web login token (the same mechanism as the one printed by `sg serve`).
+Mints a single-use web login token (the same mechanism as the one printed by `sc serve`).
 
 ```
-$ curl -s -i --unix-socket $SG_SOCKET -X POST http://localhost/admin/login-token
+$ curl -s -i --unix-socket $SC_SOCKET -X POST http://localhost/admin/login-token
 HTTP/1.1 200 OK
 content-type: application/json
 cache-control: no-store
@@ -271,7 +271,7 @@ cache-control: no-store
 {"token":"e6be5a3471ca2c13c9b5eef2e8cf5570e12fc38718623525a79d810c6f62557d","url":"http://localhost:36655/#t=e6be5a3471ca2c13c9b5eef2e8cf5570e12fc38718623525a79d810c6f62557d"}
 ```
 
-`url` is present when the server knows its web base URL (always, under `sg serve`). Via the web listener the same
+`url` is present when the server knows its web base URL (always, under `sc serve`). Via the web listener the same
 path (`/api/admin/login-token`) is `404`; `GET` on the socket gives `405`.
 
 ### Web only: `POST /login`

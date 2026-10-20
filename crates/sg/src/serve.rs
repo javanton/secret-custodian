@@ -25,8 +25,8 @@ const STANDARD_ADMIN_PORT: u16 = 9090;
 #[derive(Args)]
 #[command(after_help = "\
 KEY SOURCES (exactly one):
-  --key-file <file> / SG_KEY_FILE   base64 of 32 bytes, as written by `sg keygen`; must be mode 0600
-  SG_MASTER_KEY                     the same base64 value, environment variable only (never a flag)
+  --key-file <file> / SC_KEY_FILE   base64 of 32 bytes, as written by `sc keygen`; must be mode 0600
+  SC_MASTER_KEY                     the same base64 value, environment variable only (never a flag)
   --passphrase                      prompt (twice on first creation); needs a terminal
 
 OUTPUT (stdout, one item per line): `proxy: <url>`, `admin: <login url>`, `socket: <path>`, then
@@ -35,7 +35,7 @@ connection-level detail (nothing is logged at info level).
 
 The web UI is plain HTTP on --admin-bind. When it is reached through a published port or a name
 other than localhost:<bound port>, pass --admin-public-url: that URL is printed and used by
-`sg login-url`, and its host:port is accepted as Host/Origin.
+`sc login-url`, and its host:port is accepted as Host/Origin.
 
 Stop with SIGINT or SIGTERM (the socket file is removed); a second SIGINT forces the exit.")]
 pub struct ServeArgs {
@@ -43,22 +43,22 @@ pub struct ServeArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
     /// Address of the credential-injecting proxy
-    #[arg(long, env = "SG_PROXY_BIND", default_value = "127.0.0.1:8080")]
+    #[arg(long, env = "SC_PROXY_BIND", default_value = "127.0.0.1:8080")]
     proxy_bind: SocketAddr,
     /// Address of the local web UI. Anything but loopback prints a warning: there is no remote login
-    #[arg(long, env = "SG_ADMIN_BIND", default_value = "127.0.0.1:9090")]
+    #[arg(long, env = "SC_ADMIN_BIND", default_value = "127.0.0.1:9090")]
     admin_bind: SocketAddr,
     /// URL the operator actually uses to reach the web UI, e.g. http://localhost:19090 when a
     /// container publishes 9090 on host port 19090. Printed on the `admin:` line, returned by
-    /// `sg login-url`, and its host:port is accepted as Host/Origin. Default:
+    /// `sc login-url`, and its host:port is accepted as Host/Origin. Default:
     /// http://localhost:<bound admin port>
-    #[arg(long, env = "SG_ADMIN_PUBLIC_URL", value_name = "URL", value_parser = parse_public_url)]
+    #[arg(long, env = "SC_ADMIN_PUBLIC_URL", value_name = "URL", value_parser = parse_public_url)]
     admin_public_url: Option<PublicUrl>,
     /// Extra Host/Origin accepted by the web UI (repeatable); not needed for --admin-public-url
     #[arg(long = "admin-allowed-host", value_name = "HOST:PORT")]
     admin_allowed_host: Vec<String>,
-    /// File with the master key (base64 of 32 bytes, as written by `sg keygen`; must be mode 0600)
-    #[arg(long, env = "SG_KEY_FILE", value_name = "FILE")]
+    /// File with the master key (base64 of 32 bytes, as written by `sc keygen`; must be mode 0600)
+    #[arg(long, env = "SC_KEY_FILE", value_name = "FILE")]
     key_file: Option<PathBuf>,
     /// Master key as base64 of 32 bytes (environment variable only)
     #[arg(skip)]
@@ -68,7 +68,7 @@ pub struct ServeArgs {
     passphrase: bool,
     /// Extra PEM CA bundle trusted for upstream TLS (internal services with a private CA);
     /// repeatable
-    #[arg(long, env = "SG_UPSTREAM_CA", value_name = "PEM")]
+    #[arg(long, env = "SC_UPSTREAM_CA", value_name = "PEM")]
     upstream_ca: Vec<PathBuf>,
     /// Allow the proxy to tunnel/forward to loopback addresses (off by default: SSRF defence).
     /// The proxy's and the admin UI's own ports stay denied either way
@@ -152,10 +152,10 @@ fn parse_public_url(s: &str) -> Result<PublicUrl, String> {
 }
 
 impl ServeArgs {
-    /// `SG_MASTER_KEY` is read straight from the environment so that its value can never
+    /// `SC_MASTER_KEY` is read straight from the environment so that its value can never
     /// show up in `--help` or in a clap error message.
     pub fn with_env(mut self) -> Self {
-        self.master_key = std::env::var("SG_MASTER_KEY")
+        self.master_key = std::env::var("SC_MASTER_KEY")
             .ok()
             .filter(|v| !v.is_empty());
         self

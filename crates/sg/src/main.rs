@@ -19,25 +19,25 @@ SECURITY MODEL
     allow; install its certificate only where the agent runs.
   * The admin socket is mode 0600 and the web UI listens on 127.0.0.1 behind one-time logins.
 
-KEY SOURCES (for `sg serve`)
-  --key-file <file>   base64 of 32 bytes (create one with `sg keygen --out <file>`), or SG_KEY_FILE
-  SG_MASTER_KEY       the same base64 value in the environment
+KEY SOURCES (for `sc serve`)
+  --key-file <file>   base64 of 32 bytes (create one with `sc keygen --out <file>`), or SC_KEY_FILE
+  SC_MASTER_KEY       the same base64 value in the environment
   --passphrase        derive the key from a passphrase typed at a prompt
 
 EXAMPLE WORKFLOW
-  sg keygen --out ~/.config/sg.key            # once; back this file up
-  sg serve --key-file ~/.config/sg.key &      # prints the proxy address and the web login URL
-  sg role add reviewer --unmatched deny
-  echo -n \"$GITHUB_TOKEN\" | sg secret add gh --role reviewer --host api.github.com \\
+  sc keygen --out ~/.config/sg.key            # once; back this file up
+  sc serve --key-file ~/.config/sg.key &      # prints the proxy address and the web login URL
+  sc role add reviewer --unmatched deny
+  echo -n \"$GITHUB_TOKEN\" | sc secret add gh --role reviewer --host api.github.com \\
       --methods GET --header Authorization --template 'Bearer {secret}'
                                                # value from stdin, never from arguments; the CA
-                                               # domains come from the rules (see `sg ca status`)
-  sg token create --machine laptop --role reviewer   # prints the HTTPS_PROXY line for the agent
-  sg login-url                                 # a fresh link to the web UI";
+                                               # domains come from the rules (see `sc ca status`)
+  sc token create --machine laptop --role reviewer   # prints the HTTPS_PROXY line for the agent
+  sc login-url                                 # a fresh link to the web UI";
 
 #[derive(Parser)]
 #[command(
-    name = "sg",
+    name = "sc",
     version,
     about = "Secret Custodian: a vault whose proxy injects credentials so agents never see them",
     long_about = LONG_ABOUT,
@@ -45,9 +45,9 @@ EXAMPLE WORKFLOW
     after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Admin socket of a running `sg serve` (default: $XDG_RUNTIME_DIR/secret-custodian.sock; when
+    /// Admin socket of a running `sc serve` (default: $XDG_RUNTIME_DIR/secret-custodian.sock; when
     /// XDG_RUNTIME_DIR is unset, empty or relative: <data dir>/sg.sock)
-    #[arg(long, global = true, env = "SG_SOCKET", value_name = "PATH")]
+    #[arg(long, global = true, env = "SC_SOCKET", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[command(flatten)]
     opts: ClientOpts,

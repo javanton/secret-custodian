@@ -10,11 +10,11 @@ ports and a temporary directory so it cannot collide with an instance of your ow
 ```sh
 cargo build --release -p sg
 export PATH="$PWD/target/release:$PATH"
-sg --version
+sc --version
 ```
 
 ```
-sg 0.1.0
+sc 0.1.0
 ```
 
 **2. A demo directory and a TLS upstream** that prints what it receives (this stands in for a real API; it answers
@@ -56,9 +56,9 @@ without it. `--proxy-bind` and `--admin-bind` use port 0 here only to pick free 
 certificate.
 
 ```sh
-sg keygen --out sg.key
-export SG_SOCKET="$DEMO/sg.sock"
-sg serve --data-dir "$DEMO/data" --key-file sg.key --upstream-ca up.pem \
+sc keygen --out sg.key
+export SC_SOCKET="$DEMO/sg.sock"
+sc serve --data-dir "$DEMO/data" --key-file sg.key --upstream-ca up.pem \
    --proxy-bind 127.0.0.1:0 --admin-bind 127.0.0.1:0 > serve.out 2> serve.err &
 SERVE_PID=$!
 until grep -qx ready serve.out; do sleep 0.1; done
@@ -75,7 +75,7 @@ socket: /tmp/tmp.vINqLarwc9/sg.sock
 ready
 ```
 
-On a normal run you would write just `sg serve --key-file ~/.config/secret-custodian/sg.key`. The `admin:` line is a
+On a normal run you would write just `sc serve --key-file ~/.config/secret-custodian/sg.key`. The `admin:` line is a
 one-time login link for the web UI (see [admin-api.md](admin-api.md)).
 
 **4. Create roles, store a secret with its first rule, add another rule.** The secret comes from stdin, never from an
@@ -85,20 +85,20 @@ that have a rule (`--unmatched deny`). The CA's permitted domains come from the 
 domain" step: the first rule for `localhost` is what lets the proxy impersonate it.
 
 ```sh
-sg role add reviewer  --unmatched deny
-sg role add developer --unmatched deny
-printf '%s' 'demo-secret-value' | sg secret add upstream-key --role developer --host localhost \
+sc role add reviewer  --unmatched deny
+sc role add developer --unmatched deny
+printf '%s' 'demo-secret-value' | sc secret add upstream-key --role developer --host localhost \
    --header Authorization --template 'Bearer {secret}'
-sg rule add --role reviewer --host localhost --methods GET \
+sc rule add --role reviewer --host localhost --methods GET \
    --header Authorization --template 'Bearer {secret}' --secret upstream-key
-sg rule ls
+sc rule ls
 ```
 
 ```
 role 'reviewer' created
 role 'developer' created
 secret 'upstream-key' stored with rule 1
-warning: the CA certificate changed: agents must reload it (sg ca export)
+warning: the CA certificate changed: agents must reload it (sc ca export)
 rule 2 created
 ID  ROLE       HOST       PATH  METHODS  KIND    TARGET         TEMPLATE         SECRET
 1   developer  localhost  *     *        header  Authorization  Bearer {secret}  1
@@ -106,16 +106,16 @@ ID  ROLE       HOST       PATH  METHODS  KIND    TARGET         TEMPLATE        
 ```
 
 The warning (on stderr) is the reload note: the CA certificate was re-issued because `localhost` was added, so agents must
-fetch it again (step 5 does, and `sg ca status` lists the domains). Without `--role`, `secret add` uses the only existing
+fetch it again (step 5 does, and `sc ca status` lists the domains). Without `--role`, `secret add` uses the only existing
 role, creates a role `default` if there is none, and fails if there are several roles.
 
-**5. Export the CA and issue tokens.** `sg token create` normally prints a ready-made `HTTPS_PROXY` block (see the
+**5. Export the CA and issue tokens.** `sc token create` normally prints a ready-made `HTTPS_PROXY` block (see the
 [CLI reference](cli-reference.md#the-environment-block)); `--json` is handier in a script.
 
 ```sh
-sg ca export > ca.pem
-REVIEWER="$(sg --json token create --machine laptop --role reviewer  | jq -r .token)"
-DEVELOPER="$(sg --json token create --machine laptop --role developer | jq -r .token)"
+sc ca export > ca.pem
+REVIEWER="$(sc --json token create --machine laptop --role reviewer  | jq -r .token)"
+DEVELOPER="$(sc --json token create --machine laptop --role developer | jq -r .token)"
 ```
 
 **6. Call the upstream through the proxy.** The password part of the proxy URL is the token; `--cacert` makes curl
@@ -139,7 +139,7 @@ did:
 
 ```sh
 cat upstream.log
-sg audit --limit 6
+sc audit --limit 6
 ```
 
 ```
@@ -154,8 +154,8 @@ TIME                  MACHINE  ROLE       METHOD   HOST       PATH         DECIS
 2026-10-16T20:10:34Z  laptop   reviewer   CONNECT  localhost  /            mitm       200     -
 ```
 
-The reviewer's `POST` was refused by the vault and never reached the upstream. Try `sg token revoke <id>` (ids from
-`sg token ls`) and repeat a request: it now gets `407`.
+The reviewer's `POST` was refused by the vault and never reached the upstream. Try `sc token revoke <id>` (ids from
+`sc token ls`) and repeat a request: it now gets `407`.
 
 **8. Stop and clean up:**
 
@@ -163,14 +163,14 @@ The reviewer's `POST` was refused by the vault and never reached the upstream. T
 kill "$SERVE_PID"; wait "$SERVE_PID"; kill "$UP_PID"; cd /; rm -rf "$DEMO"
 ```
 
-`sg serve` stops cleanly on `SIGINT` or `SIGTERM` (exit code 0) and removes its socket.
+`sc serve` stops cleanly on `SIGINT` or `SIGTERM` (exit code 0) and removes its socket.
 
 **With a real API** (example only, not part of the verified sequence above): a role with `--unmatched deny`, then
-`sg secret add gh --role reviewer --host api.github.com --methods GET --header Authorization --template 'Bearer {secret}'`
+`sc secret add gh --role reviewer --host api.github.com --methods GET --header Authorization --template 'Bearer {secret}'`
 with the real token on stdin, and `curl https://api.github.com/user` under the printed `HTTPS_PROXY`. Without `--upstream-ca`
 the vault trusts the system root store.
 
-Note for local demos: the block printed by `sg token create` sets `NO_PROXY=localhost,127.0.0.1`. If your test upstream is
+Note for local demos: the block printed by `sc token create` sets `NO_PROXY=localhost,127.0.0.1`. If your test upstream is
 `localhost`, drop that line, or the client will bypass the proxy and nothing will be injected.
 
 Next: [trusting the CA on your agents](operations.md#trusting-the-ca-on-agents), the [CLI reference](cli-reference.md), or
