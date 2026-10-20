@@ -82,13 +82,13 @@ agent never saw the secret.
 
 ## Install
 
-Pre-built binaries are attached to each [release](https://gitlab.habbi.cc/own-projects/secret-guardian/-/releases): a
+Pre-built binaries are attached to each [GitHub release](https://github.com/javanton/secret-custodian/releases): a
 **static Linux x86_64 binary** (musl), so it runs on any Linux distribution, including Alpine and minimal containers.
 Other platforms are not built; compile from source (above).
 
 ```sh
 VERSION=0.1.0   # see the releases page for the latest
-BASE="https://gitlab.habbi.cc/api/v4/projects/own-projects%2Fsecret-guardian/packages/generic/secret-custodian/$VERSION"
+BASE="https://github.com/javanton/secret-custodian/releases/download/v$VERSION"
 curl -fLO "$BASE/sg-v$VERSION-x86_64-linux.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS                       # must print: sg-v0.1.0-x86_64-linux.tar.gz: OK
