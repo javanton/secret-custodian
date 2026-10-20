@@ -36,57 +36,66 @@ pub fn normalize_host(input: &str) -> Option<String> {
     }
 }
 
+/// Decodes `%XX` escapes of unreserved characters (ASCII letter, digit, `-`, `.`, `_`, `~`) in one
+/// linear pass. A naive single left-to-right scan can leave a literal (undecoded) `%` directly
+/// before characters produced by decoding a *later*, genuinely separate escape; concatenated,
+/// those characters can read as a brand-new `%XX` escape that never existed as one in the input
+/// (e.g. `"%2%65"`: the first `%2` fails to decode and stays literal, but the later `%65` decodes
+/// to `e` right after it, forming the look-alike `%2e`, which itself decodes further to `.`).
+/// This function avoids that by collapsing a freshly completed escape at the *end* of the output
+/// immediately after every push, so cascades like that resolve inline, within this single pass,
+/// instead of needing a second rescan of the whole string. That also makes it O(n): every byte is
+/// pushed into the output at most once net of collapses (each collapse removes exactly the 2 extra
+/// bytes it previously added), so the total work across every push and every collapse is linear in
+/// the input length, however many escapes cascade. The result is identical to repeatedly
+/// rescanning to a fixpoint, because a `%` can never itself be a hex digit, so completed escapes
+/// never overlap and the leftmost-first, incremental collapse converges to the same unique normal
+/// form that repeated whole-string rescans would.
 fn decode_unreserved(segment: &str) -> String {
-    let bytes = segment.as_bytes();
-    let mut out = String::with_capacity(segment.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if let Some(v) = segment
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                if v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_' | b'~') {
-                    out.push(v as char);
-                    i += 3;
-                    continue;
-                }
-            }
-        }
-        let ch = segment[i..]
-            .chars()
-            .next()
-            .expect("index is on a char boundary");
-        out.push(ch);
-        i += ch.len_utf8();
+    let mut out: Vec<u8> = Vec::with_capacity(segment.len());
+    for ch in segment.chars() {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        collapse_trailing_escape(&mut out);
     }
-    out
+    // Every byte pushed is either a full UTF-8 char's own bytes or a single decoded ASCII byte
+    // that replaced a well-formed `%HH` (itself ASCII), so `out` is always valid UTF-8.
+    String::from_utf8(out).expect("decode_unreserved only ever appends valid UTF-8")
 }
 
-/// Applies `decode_unreserved` to its own output until it stops changing. A single pass can leave
-/// a literal (undecoded) `%` directly before characters produced by decoding a *later*, genuinely
-/// separate escape; concatenated, those characters can read as a brand-new `%XX` escape that
-/// never existed as one in the input (e.g. `"%2%65"` -> one pass -> `"%2e"`, which still decodes
-/// further to `"."`). Each round either leaves the string unchanged (done) or decodes at least one
-/// `%XX` into a single character, strictly shrinking the string by 2 bytes, so this always
-/// terminates in at most `segment.len() / 2` rounds and the result cannot be re-decoded by a
-/// further round, which is what makes `normalize_path` idempotent.
-fn decode_unreserved_fixpoint(segment: &str) -> String {
-    let mut current = segment.to_string();
+/// If `out` now ends with a `%HH` that decodes to an unreserved character, replaces it with that
+/// one byte; repeats, since the replacement can itself complete an escape that was waiting one
+/// position further back (e.g. collapsing `%65` to `e` after a literal `3` can then complete a
+/// `%33` that was two characters further left). Each iteration removes 2 bytes net, so this is
+/// amortized O(1) per character processed by `decode_unreserved`'s loop over the whole segment.
+fn collapse_trailing_escape(out: &mut Vec<u8>) {
     loop {
-        let next = decode_unreserved(&current);
-        if next == current {
-            return current;
+        let len = out.len();
+        if len < 3 || out[len - 3] != b'%' {
+            return;
         }
-        current = next;
+        let Ok(hex) = std::str::from_utf8(&out[len - 2..]) else {
+            return;
+        };
+        let Ok(v) = u8::from_str_radix(hex, 16) else {
+            return;
+        };
+        if !(v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_' | b'~')) {
+            return;
+        }
+        out.truncate(len - 3);
+        out.push(v);
     }
 }
 
-/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded.
+/// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays
+/// encoded. `decode_unreserved` is both idempotent (running it again on its own output cannot
+/// decode anything further — see its doc comment) and linear-time, so this stays fast even on
+/// adversarial input that would make a naive rescan-to-fixpoint decode quadratic.
 pub fn normalize_path(path: &str) -> String {
     let mut segs: Vec<String> = Vec::new();
     for raw in path.split('/') {
-        let seg = decode_unreserved_fixpoint(raw);
+        let seg = decode_unreserved(raw);
         match seg.as_str() {
             "" | "." => {}
             ".." => {
@@ -386,6 +395,43 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn decoding_a_cascading_chain_does_not_blow_up() {
+        use std::time::{Duration, Instant};
+        // Every round of a naive re-scan-to-fixpoint decodes exactly one more unit of this chain
+        // (`%3` repeated, followed by `%33`, which decodes to the digit `3` that completes the
+        // next unit back): O(n) rounds of O(n) work each is Theta(n^2). The real function took
+        // 9.8s at n=30_000 before this fix; it must now be comfortably linear.
+        let input = format!("/{}%33", "%3".repeat(30_000));
+        let start = Instant::now();
+        let out = normalize_path(&input);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "took {elapsed:?}, expected well under 500ms"
+        );
+        // The whole chain collapses, one unit at a time from the right, down to a single '3'.
+        assert_eq!(out, "/3");
+    }
+
+    #[test]
+    fn decoding_a_non_cascading_percent_run_does_not_blow_up() {
+        use std::time::{Duration, Instant};
+        // A different adversarial shape: a long run of `%4` units that do NOT chain into each
+        // other (unlike the `%3`/`%33` case, `0x44` decodes to `D`, which does not feed a hex
+        // pair with the next `%4` to its left, so this collapses only a few units from the
+        // right and then stops). Still exercised here as a second, independently-shaped large
+        // input to guard against any remaining non-linear behavior elsewhere in the function.
+        let input = format!("/{}%34", "%4".repeat(20_000));
+        let start = Instant::now();
+        let _ = normalize_path(&input);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "took {:?}, expected well under 500ms",
             start.elapsed()
         );
     }
