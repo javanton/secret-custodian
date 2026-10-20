@@ -369,7 +369,9 @@ sg --json audit --limit 1000 | jq -r 'group_by(.decision)[] | "\(.[0].decision)\
 The decisions and what they mean are in [proxy-internals.md](proxy-internals.md#audit-decisions). Failed authentication
 (`407`) writes **no** row, except for a validly signed token that is revoked or expired (`token-invalid`, at most one
 row per token per 60 s); for the rest use the agent-side error and `curl -v`. Rows never contain query
-strings, headers, tokens or secrets. The log grows without bound; see [pruning](#backups).
+strings, headers, tokens or secrets. The log grows without bound; see [pruning](#backups). An agent left running with an expired or revoked (still validly
+signed) token now writes about one row per minute per token (up to ~1440 rows/day/token) until the token is replaced
+or the agent stopped; this is bounded by the number of tokens ever issued.
 
 **Server logs** go to stderr (`journalctl --user -u secret-guardian` under systemd, `docker logs` in a container).
 The default level is `warn`; `RUST_LOG` overrides it (`RUST_LOG=debug`). The program logs very little by design: an

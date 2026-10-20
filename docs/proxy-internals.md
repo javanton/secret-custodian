@@ -298,7 +298,9 @@ what it means. The host column of an audit row is the CONNECT target or the requ
 (for CONNECT rows it is `/`). Authentication failures (`407`, CONNECT or plain HTTP) are not audited, with one exception: a token validly signed
 by this vault (signature and issuer verified) that is revoked or expired is audited as `token-invalid`, with the
 token's `jti`, machine and role, `method` as sent (`CONNECT` for tunnels), the host the request declared (untrusted,
-truncated to 255 characters) and path `/`. This is rate limited to **one row per `jti` per 60 s**
+truncated to 255 characters; method truncated to 32): the authority of the request target, i.e. the CONNECT
+authority or the absolute-form URI host, and **empty** for an origin-form request (`GET / HTTP/1.1` plus a `Host`
+header) and path `/`. This is rate limited to **one row per `jti` per 60 s**
 (`ServeOptions::auth_audit_interval`), tracked in an in-memory map of at most **4096** jtis; entries older than the
 interval are evicted to make room, and if the map is full of entries still inside their interval a *new* jti is not
 audited (bounded memory beats completeness). Anonymous failures (missing, duplicate, oversized or malformed

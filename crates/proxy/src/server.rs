@@ -303,11 +303,13 @@ fn audit_rejected<B>(req: &Request<B>, rejected: &Identity, state: &ProxyState, 
         return;
     }
     let host: String = req.uri().host().unwrap_or("").chars().take(255).collect();
+    // The method is untrusted too (extension methods): bounded like the host.
+    let method: String = req.method().as_str().chars().take(32).collect();
     audit(
         state,
         rejected,
         &host,
-        req.method().as_str(),
+        &method,
         "/",
         "token-invalid",
         Some(407),

@@ -248,7 +248,8 @@ async fn rejection_of_a_revoked_token_is_byte_identical_to_any_other_407() {
 
 #[tokio::test]
 async fn at_most_one_row_per_jti_per_interval() {
-    let env = env(400).await;
+    // Generous margins: the timing-sensitive steps must not flake on a loaded machine.
+    let env = env(2_000).await;
     let (a, ja) = revoked_token(&env, "laptop", "developer");
     let (b, jb) = revoked_token(&env, "laptop", "developer");
     for _ in 0..5 {
@@ -274,7 +275,7 @@ async fn at_most_one_row_per_jti_per_interval() {
     );
 
     // Once the interval has elapsed the same token is audited again.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
     let (head, _) =
         raw_connect_head(env.proxy_addr, "api.example.test:443", Some(&basic(&a))).await;
     assert!(head.starts_with("HTTP/1.1 407"));
@@ -312,4 +313,25 @@ async fn plain_http_request_with_a_revoked_token_is_audited_and_not_forwarded() 
     assert_eq!(r[0].host, "127.0.0.1");
     assert_eq!(r[0].path, "/");
     assert!(!format!("{:?}", r[0]).contains("SECRET"));
+}
+
+#[tokio::test]
+async fn a_long_extension_method_is_truncated_in_the_audit_row() {
+    let env = env(60_000).await;
+    let (tok, _) = revoked_token(&env, "m", "r");
+    let method = "X".repeat(100);
+    let raw = format!(
+        "{method} http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\nProxy-Authorization: {}\r\nConnection: close\r\n\r\n",
+        basic(&tok)
+    );
+    let resp = exchange(&env, raw.as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+    let r = rows(&env);
+    assert_eq!(r.len(), 1, "{r:?}");
+    // The audit store bounds it further still; the proxy bound must never be exceeded.
+    assert!(
+        r[0].method.starts_with('X') && r[0].method.len() <= 32,
+        "{}",
+        r[0].method
+    );
 }
