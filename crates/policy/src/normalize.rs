@@ -49,8 +49,9 @@ pub fn normalize_host(input: &str) -> Option<String> {
 /// bytes it previously added), so the total work across every push and every collapse is linear in
 /// the input length, however many escapes cascade. The result is identical to repeatedly
 /// rescanning to a fixpoint, because a `%` can never itself be a hex digit, so completed escapes
-/// never overlap and the leftmost-first, incremental collapse converges to the same unique normal
-/// form that repeated whole-string rescans would.
+/// never overlap, so the order in which they are resolved does not matter: this function always
+/// collapses the most recently completed (rightmost) escape and cascades leftward, which converges
+/// to the same unique normal form that repeated whole-string rescans would.
 fn decode_unreserved(segment: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(segment.len());
     for ch in segment.chars() {
@@ -421,11 +422,12 @@ mod tests {
     #[test]
     fn decoding_a_non_cascading_percent_run_does_not_blow_up() {
         use std::time::{Duration, Instant};
-        // A different adversarial shape: a long run of `%4` units that do NOT chain into each
-        // other (unlike the `%3`/`%33` case, `0x44` decodes to `D`, which does not feed a hex
-        // pair with the next `%4` to its left, so this collapses only a few units from the
-        // right and then stops). Still exercised here as a second, independently-shaped large
-        // input to guard against any remaining non-linear behavior elsewhere in the function.
+        // A different adversarial shape: a long run of `%4` units chained to a trailing `%34`.
+        // Unlike the `%3`/`%33` case, this does NOT cascade through every unit: `%34` -> `4`,
+        // `%44` -> `D`, `%4D` -> `M`, and then `%4M` is not a valid escape (`M` is not a hex
+        // digit), so only 3 collapses happen regardless of how many `%4` units precede them.
+        // Still exercised here as a second, independently-shaped large input to guard against
+        // any remaining non-linear behavior elsewhere in the function.
         let input = format!("/{}%34", "%4".repeat(20_000));
         let start = Instant::now();
         let _ = normalize_path(&input);
