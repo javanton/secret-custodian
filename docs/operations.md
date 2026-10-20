@@ -31,12 +31,66 @@ else at run time.
 
 ### Docker
 
-See [README: Docker](../README.md#docker) for the quick start. In short: `docker build -t secret-guardian:dev .`
-produces a Debian-slim image that runs as uid/gid `10001`, with `/data` (mode `0700`) as the volume, ports `8080`
-(proxy) and `9090` (web UI) exposed, `SG_SOCKET=/data/sg.sock` preset so that `docker exec <ctr> sg ...` works with no
-flags, and a health check that runs `sg ca status`. The default command is
+`docker build -t secret-guardian:dev .` produces a Debian-slim image that runs as uid/gid `10001`, with `/data` (mode
+`0700`) as the volume, ports `8080` (proxy) and `9090` (web UI) exposed, `SG_SOCKET=/data/sg.sock` preset so that
+`docker exec <ctr> sg ...` works with no flags, and a health check that runs `sg ca status`. The default command is
 `serve --data-dir /data --socket /data/sg.sock --key-file /run/secrets/sg_key --proxy-bind 0.0.0.0:8080 --admin-bind 0.0.0.0:9090`.
 `SIGTERM` stops it cleanly (exit code 0).
+
+**The key.** The default command reads the key from `/run/secrets/sg_key`. The file must be mode `0600` or `0400` and
+**readable by uid 10001**. This is the usual stumbling block: a Docker secret or bind mount of a host file keeps the
+host file's owner, so a key you created with your own uid is refused (verified):
+
+```
+error: cannot read key file /run/secrets/sg_key: Permission denied (os error 13)
+```
+
+Three ways out (the first and third were run):
+
+```sh
+# 1. generate the key inside a volume, owned by uid 10001, and mount that volume at /run/secrets
+docker volume create sg-key
+docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-guardian:dev \
+  -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
+docker run -d --name secret-guardian --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  -p 127.0.0.1:9090:9090 -v sg-key:/run/secrets:ro -v sg-data:/data secret-guardian:dev
+
+# 2. (compose example's route, needs root, not run here) chown the host file to the container user
+sudo chown 10001:10001 sg.key && sudo chmod 0400 sg.key
+
+# 3. no file at all: SG_MASTER_KEY (the same base64 value) and override the command without --key-file
+docker run -d --name secret-guardian -e SG_MASTER_KEY="$(cat sg.key)" -p 127.0.0.1:9090:9090 -v sg-data:/data \
+  secret-guardian:dev serve --data-dir /data --socket /data/sg.sock \
+  --proxy-bind 0.0.0.0:8080 --admin-bind 0.0.0.0:9090
+```
+
+Environment variables are visible in `docker inspect`; prefer the file. **Back the key up outside Docker**; losing it
+loses every secret. (Note: `docker run -v "$PWD":/out ... keygen --out /out/sg.key` fails with `Permission denied`
+unless that host directory is writable by uid 10001. Run `sg keygen` on the host, or use route 1.)
+
+**Compose.** Copy `docker-compose.example.yml` to `docker-compose.yml`, put the key where it says, and
+`docker compose up -d --build`. It builds the image, publishes the web UI on `127.0.0.1:9090` of the host only, does
+**not** publish the proxy (agents reach it as `http://secret-guardian:8080` over an internal Docker network with no
+internet route), and runs read-only, without capabilities, with resource limits. The file validates with
+`docker compose config`.
+
+**Using it.** The CLI runs inside the container over the in-container socket:
+
+```sh
+docker compose exec secret-guardian sg secret ls
+printf %s "$GITHUB_TOKEN" | docker compose exec -T secret-guardian sg secret add github
+docker compose exec secret-guardian sg token create --machine agent1 --role reviewer --proxy-url http://secret-guardian:8080
+docker compose exec secret-guardian sg ca export > sg-ca.pem
+docker compose exec secret-guardian sg login-url
+```
+
+`sg login-url` prints `http://localhost:9090/#t=...`; open it in a browser on the Docker host. The URL names the port
+the process bound *inside* the container, so if you publish the UI on a different host port, add
+`--admin-public-url http://localhost:<hostport>` to the command (or set `SG_ADMIN_PUBLIC_URL`): `sg login-url` and
+the `admin:` line then print that URL and its host:port is accepted as `Host`/`Origin` (otherwise the UI answers
+`421 unexpected Host header`). The container logs `WARNING: the admin interface is bound to 0.0.0.0:9090` at start:
+expected, because there is no remote login and the port must stay published to `127.0.0.1` only. More in
+[Containers and networking](#containers-and-networking) below.
 
 ## Directories and permissions
 
@@ -279,33 +333,79 @@ flowchart LR
 
 ## Trusting the CA on agents
 
-Only hosts for which the agent's role has a rule are re-signed by the vault CA; everything else (passthrough) shows
-the real certificate. Distribute the CA **per process** through environment variables, not in the system or browser
-trust store:
-
-| Variable | Used by |
-|---|---|
-| `SSL_CERT_FILE` | OpenSSL-based clients, Python's `ssl` default context, Ruby, many others |
-| `CURL_CA_BUNDLE` | curl (also `--cacert`) |
-| `REQUESTS_CA_BUNDLE` | Python `requests` |
-| `NODE_EXTRA_CA_CERTS` | Node.js (adds to the built-in roots) |
-
-Most of these **replace** the tool's trust store. With a file containing only the vault CA, TLS to passthrough hosts
-fails (verified: `curl: (60) SSL certificate problem: unable to get local issuer certificate` through a passthrough
-tunnel). Build a combined bundle when the agent also talks to hosts without rules:
+Give each agent process three things: the proxy URL with its token, the vault CA certificate, and (if needed) the
+proxy variables for plain HTTP. `sg token create` prints exactly this block with your token filled in (the user name
+before the colon is a label; only the password, the token, matters):
 
 ```sh
-sg ca export > sg-ca.pem
-cat /etc/pki/tls/certs/ca-bundle.crt sg-ca.pem > combined.pem     # Fedora/RHEL; Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
+sg ca export > sg-ca.pem                      # on the machine that runs the agent (or copy the file there)
+export HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080
+export HTTP_PROXY=$HTTPS_PROXY
+export SSL_CERT_FILE=$PWD/sg-ca.pem
+export CURL_CA_BUNDLE=$PWD/sg-ca.pem
+export REQUESTS_CA_BUNDLE=$PWD/sg-ca.pem
+export NODE_EXTRA_CA_CERTS=$PWD/sg-ca.pem
+```
+
+**Trust is per process, via environment variables, not the system store**, so the CA only works where you want it.
+Only hosts for which the agent's role has a rule are re-signed by the vault CA; everything else (passthrough) shows
+the real certificate. Four variables cover most tools:
+
+| Variable | Read by | Behaviour |
+|---|---|---|
+| `SSL_CERT_FILE` | OpenSSL-based programs, Python's `ssl`, Ruby and many others | **Replaces** the default bundle |
+| `CURL_CA_BUNDLE` | curl (also `--cacert`) | Replaces |
+| `REQUESTS_CA_BUNDLE` | Python `requests` | Replaces |
+| `NODE_EXTRA_CA_CERTS` | Node.js | **Adds** to the built-in roots |
+
+Because most of them replace the bundle, a file containing only the vault CA breaks TLS to hosts that are not
+intercepted (verified: a passthrough request fails with `unable to get local issuer certificate`). If the agent also
+talks to hosts without rules, point the variables at a combined file:
+
+```sh
+cat /etc/pki/tls/certs/ca-bundle.crt sg-ca.pem > combined.pem    # Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
 export SSL_CERT_FILE=$PWD/combined.pem CURL_CA_BUNDLE=$PWD/combined.pem REQUESTS_CA_BUNDLE=$PWD/combined.pem
 ```
 
-(Verified: with the combined bundle a passthrough request to `https://example.com` succeeded.) Re-run this whenever the CA gains a
-domain (the CLI prints `the CA certificate changed: agents must reload it`).
+(Verified: with the combined bundle a passthrough request to `https://example.com` succeeded.) Whenever a rule or secret
+adds a **new host** (the command prints `the CA certificate changed: agents must reload it`), export the certificate
+again and replace the file: a client holding the old one refuses the new name (`permitted subtree violation`). Removing
+a host does not require a reload.
 
-Known client problems: Java uses its own keystore (import the CA with `keytool`, or avoid the MITM for Java tools),
-certificate-pinned programs refuse the proxy, some Go programs ignore the variables. Python 3.13 and later reject the
-vault's leaf certificates (see the README, "Configure an agent").
+**curl** (verified):
+
+```sh
+HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080 CURL_CA_BUNDLE=$PWD/sg-ca.pem curl https://api.example.com/...
+```
+
+**Python `requests` / `urllib`**: honours `HTTPS_PROXY`, `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`. No extra code is needed:
+Python 3.13 and later (whose default `ssl` context enables `VERIFY_X509_STRICT`) works because the vault's leaf
+certificates carry an Authority Key Identifier (verified with Python 3.14.7, OpenSSL 3.5.7, with both `urllib` and
+`requests`).
+
+```sh
+HTTPS_PROXY=http://laptop:TOKEN@127.0.0.1:8080 SSL_CERT_FILE=$PWD/sg-ca.pem REQUESTS_CA_BUNDLE=$PWD/sg-ca.pem \
+  python3 -c 'import requests; print(requests.get("https://api.example.com/").text)'
+```
+
+**Node.js:** `NODE_EXTRA_CA_CERTS` works, but Node does not read `HTTPS_PROXY` by itself. On recent Node releases (tested with
+22.22) set `NODE_USE_ENV_PROXY=1` (or run `node --use-env-proxy`): `fetch` then goes through the proxy (it prints an
+experimental-feature warning). Without it, `fetch` connects directly (verified: it bypassed the proxy). Libraries such as
+`undici`'s `ProxyAgent` or `https-proxy-agent` also work.
+
+**AI agent CLIs:** most are Node or Python programs, so the same variables apply: `HTTPS_PROXY` plus
+`NODE_EXTRA_CA_CERTS` (Node) or `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` (Python). Start the agent from a shell, or a
+launcher script, that has them exported. This was not tested against any specific commercial agent CLI; check the
+tool's own documentation for proxy and CA support.
+
+**git:** honours `HTTPS_PROXY`, but takes its CA from `GIT_SSL_CAINFO` or `http.sslCAInfo`, not from `SSL_CERT_FILE`
+(verified: git failed with `SSL certificate problem` until `GIT_SSL_CAINFO` was set).
+
+**Tools known to ignore the proxy or the CA variables, or to refuse the vault's certificates:** programs with
+certificate pinning, Java (own trust store: import the CA with `keytool`; it also takes its proxy from
+`-Dhttps.proxyHost` properties, not `HTTPS_PROXY`; not tested here), some Go programs, anything that opens raw sockets
+or uses WebSockets, and browsers (which use the system store). Nothing is injected for traffic that bypasses the
+proxy, and the agent would then use whatever credentials it has itself.
 
 ## Routine tasks
 

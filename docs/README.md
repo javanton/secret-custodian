@@ -7,6 +7,7 @@ how to configure an agent), then the page for your role below.
 
 | Page | Contents |
 |---|---|
+| [quickstart.md](quickstart.md) | The full verified walkthrough: build, configure, call a real upstream, read the audit log. |
 | [cli-reference.md](cli-reference.md) | Every `sg` command, flag, default, env var, exit code, output example and error message; secret input rules; the `token create` environment block; TTL syntax. |
 | [operations.md](operations.md) | Installing from source and Docker, directories and permissions, key management, backups, upgrades, a systemd user service, containers and networking, trusting the CA on agents, routine tasks, observability, troubleshooting table. |
 | [policy-and-rules.md](policy-and-rules.md) | Roles, `Unmatched`, rule fields and validation, host/method matching, path judging and its closure argument, fail-closed side effects, examples (CLI and JSON). |
