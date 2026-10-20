@@ -43,6 +43,7 @@ scripts/e2e.sh                                 # real curl through the real prox
 scripts/e2e-docker.sh                          # same inside Docker (needs a reachable Docker daemon)
 cargo fmt --all --check                        # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # lints, warnings are errors
+cargo deny check                               # dependency advisories, licenses, bans (docs/dependency-hygiene.md)
 ```
 
 The workspace is warning-free under `clippy -D warnings` and `fmt --check` at this commit. The `node` test is

@@ -517,6 +517,7 @@ scripts/e2e.sh                                           # real curl through the
 scripts/e2e-docker.sh                                    # same in Docker (needs a Docker daemon)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check                                         # dependency advisories, licenses and bans (see docs/dependency-hygiene.md)
 ```
 
 The work follows a pipeline: brainstorm, then a **spec** in `docs/specs/` (design, threat model), then a **plan** in
