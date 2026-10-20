@@ -1,0 +1,70 @@
+[package]
+name = "sg-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: keeps the fuzz crate (nightly, libFuzzer) out of the main workspace.
+[workspace]
+
+[lib]
+name = "sg_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+sg-core = { path = "../crates/core" }
+sg-policy = { path = "../crates/policy" }
+sg-auth = { path = "../crates/auth" }
+sg-ca = { path = "../crates/ca" }
+tempfile = "3"
+base64 = "0.22"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "normalize_path"
+path = "fuzz_targets/normalize_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize_host"
+path = "fuzz_targets/normalize_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_judging"
+path = "fuzz_targets/path_judging.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_auth_header"
+path = "fuzz_targets/proxy_auth_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_verify"
+path = "fuzz_targets/token_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ca_domain"
+path = "fuzz_targets/ca_domain.rs"
+test = false
+doc = false
+bench = false

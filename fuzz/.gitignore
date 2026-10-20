@@ -1,0 +1,6 @@
+target/
+artifacts/
+# Corpus growth produced by fuzzing; only the hand-written seeds (seed-*) are tracked.
+corpus/*/*
+!corpus/*/seed-*
+coverage/
