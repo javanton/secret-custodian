@@ -29,4 +29,5 @@ tempfile.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
 base64.workspace = true
+ed25519-dalek.workspace = true
 tracing-subscriber.workspace = true

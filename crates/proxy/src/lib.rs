@@ -1,3 +1,4 @@
+mod authaudit;
 mod body;
 mod forward;
 mod ident;
@@ -52,6 +53,11 @@ pub struct ServeOptions {
     /// for this long is aborted and everything it holds (upstream slot, per-identity slot,
     /// in-flight accounting) is released (default 60 s).
     pub body_idle_timeout: Duration,
+    /// A request whose token is validly signed but revoked or expired is audited
+    /// (`token-invalid`, 407) at most once per token id (`jti`) per this interval (default 60 s).
+    /// At most 4096 jtis are tracked; if that many are inside their interval, a further new jti
+    /// is not audited (bounded memory beats completeness).
+    pub auth_audit_interval: Duration,
 }
 
 impl Default for ServeOptions {
@@ -64,6 +70,7 @@ impl Default for ServeOptions {
             max_tunnels_per_identity: 64,
             max_upstream_per_identity: 64,
             body_idle_timeout: Duration::from_secs(60),
+            auth_audit_interval: Duration::from_secs(60),
         }
     }
 }
@@ -80,6 +87,7 @@ pub async fn serve_with(
     let slots = Arc::new(Semaphore::new(opts.max_connections.max(1)));
     let tunnels = Arc::new(ident::IdentityCounters::default());
     let upstream_counts = Arc::new(ident::IdentityCounters::default());
+    let auth_audit = Arc::new(authaudit::AuthAuditLimiter::new(opts.auth_audit_interval));
     loop {
         // Take the slot before accepting, so excess clients queue in the kernel backlog.
         let permit = slots
@@ -106,6 +114,7 @@ pub async fn serve_with(
             body_idle_timeout: opts.body_idle_timeout,
             tunnels: tunnels.clone(),
             upstream: upstream_counts.clone(),
+            auth_audit: auth_audit.clone(),
         };
         // Shared with the tunnel tasks a CONNECT spawns: the slot is freed only when the last
         // of them ends.

@@ -11,14 +11,20 @@ const ISS: &str = "secret-guardian";
 const KEY_AAD: &[u8] = b"sg:token-signing-key";
 const HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 
+/// Why a token was refused.
+///
+/// `Expired` and `Revoked` carry the identity read from the claims of a token whose signature and
+/// issuer WERE verified: it exists only so the refusal can be audited. It is never a session; the
+/// caller must not treat it as an authenticated identity. `Invalid` covers everything else
+/// (malformed, wrong signature or issuer, unknown jti) and carries nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("invalid token")]
     Invalid,
     #[error("token expired")]
-    Expired,
+    Expired(Identity),
     #[error("token revoked")]
-    Revoked,
+    Revoked(Identity),
     #[error("ttl out of range")]
     InvalidTtl,
     #[error(transparent)]
@@ -214,26 +220,27 @@ impl TokenVerifier for TokenService {
         if claims.iss != ISS {
             return Err(AuthError::Invalid);
         }
+        let identity = Identity {
+            jti: claims.jti,
+            machine: claims.sub,
+            role: claims.role,
+        };
         if claims.exp.map(|e| now() >= e).unwrap_or(false) {
-            return Err(AuthError::Expired);
+            return Err(AuthError::Expired(identity));
         }
         let revoked: Option<Option<i64>> = self
             .vault
             .conn()
             .query_row(
                 "SELECT revoked_at FROM tokens WHERE jti = ?1",
-                [&claims.jti],
+                [&identity.jti],
                 |r| r.get(0),
             )
             .optional()?;
         match revoked {
             None => Err(AuthError::Invalid),
-            Some(Some(_)) => Err(AuthError::Revoked),
-            Some(None) => Ok(Identity {
-                jti: claims.jti,
-                machine: claims.sub,
-                role: claims.role,
-            }),
+            Some(Some(_)) => Err(AuthError::Revoked(identity)),
+            Some(None) => Ok(identity),
         }
     }
 }

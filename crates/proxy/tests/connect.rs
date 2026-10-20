@@ -395,7 +395,11 @@ struct CountingVerifier(AtomicUsize);
 impl TokenVerifier for CountingVerifier {
     fn verify(&self, _token: &str) -> Result<Identity, AuthError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Err(AuthError::Revoked)
+        Err(AuthError::Revoked(Identity {
+            jti: "j".into(),
+            machine: "m".into(),
+            role: "r".into(),
+        }))
     }
 }
 

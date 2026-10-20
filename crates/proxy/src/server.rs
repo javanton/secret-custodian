@@ -1,4 +1,5 @@
 use crate::{
+    authaudit::AuthAuditLimiter,
     ident::IdentityCounters,
     upstream::{ProxyBody, UpstreamError},
     ProxyState,
@@ -7,7 +8,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::{body::Incoming, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use sg_auth::{extract_proxy_token, Identity};
+use sg_auth::{extract_proxy_token, AuthError, Identity};
 use sg_core::audit::AuditEntry;
 use sg_policy::{get_role, has_rules_for_host, list_rules, normalize_host, Unmatched};
 use std::{
@@ -51,6 +52,8 @@ pub(crate) struct Limits {
     /// Live tunnels / upstream requests per token identity, shared by every connection.
     pub tunnels: Arc<IdentityCounters>,
     pub upstream: Arc<IdentityCounters>,
+    /// Rate limit of the audit of revoked/expired tokens, shared by every connection.
+    pub auth_audit: Arc<AuthAuditLimiter>,
 }
 
 /// The connection-cap slot. Cloned into every task a CONNECT spawns, so it is released only
@@ -257,19 +260,59 @@ fn proxy_auth_required() -> Response<ProxyBody> {
     r
 }
 
-fn authenticate<B>(req: &Request<B>, state: &ProxyState) -> Option<Session> {
+/// Who a failed authentication was for, when that is known: only a token with a valid signature
+/// and issuer that is revoked or expired. It is NEVER a session; its sole use is the rate-limited
+/// `token-invalid` audit row. Every other failure (missing, malformed, oversized, duplicated,
+/// wrongly signed, wrong issuer, unknown jti, verifier error) is anonymous and writes nothing.
+struct Rejected(Option<Identity>);
+
+fn authenticate<B>(req: &Request<B>, state: &ProxyState) -> Result<Session, Rejected> {
+    let anonymous = || Rejected(None);
     let mut values = req
         .headers()
         .get_all(hyper::header::PROXY_AUTHORIZATION)
         .iter();
-    let value = values.next()?;
+    let value = values.next().ok_or_else(anonymous)?;
     // Exactly one credential, and bounded, before any parsing or signature work.
     if values.next().is_some() || value.len() > MAX_PROXY_AUTH_LEN {
-        return None;
+        return Err(anonymous());
     }
-    let token = Zeroizing::new(extract_proxy_token(value.to_str().ok()?)?);
-    let identity = state.verifier.verify(&token).ok()?;
-    Some(Session { identity, token })
+    let token = Zeroizing::new(
+        value
+            .to_str()
+            .ok()
+            .and_then(extract_proxy_token)
+            .ok_or_else(anonymous)?,
+    );
+    match state.verifier.verify(&token) {
+        Ok(identity) => Ok(Session { identity, token }),
+        Err(AuthError::Expired(id) | AuthError::Revoked(id)) => Err(Rejected(Some(id))),
+        Err(_) => Err(anonymous()),
+    }
+}
+
+/// Audits (`token-invalid`, 407) a request whose token was validly signed but is revoked or
+/// expired, at most once per `jti` per interval and within a bounded map (see `AuthAuditLimiter`).
+/// `host` is whatever the request declared: untrusted, truncated. An audit write failure is
+/// logged like every other audit; the answer is the same 407 regardless.
+fn audit_rejected<B>(req: &Request<B>, rejected: &Identity, state: &ProxyState, limits: &Limits) {
+    if !limits
+        .auth_audit
+        .allow(&rejected.jti, std::time::Instant::now())
+    {
+        return;
+    }
+    let host: String = req.uri().host().unwrap_or("").chars().take(255).collect();
+    audit(
+        state,
+        rejected,
+        &host,
+        req.method().as_str(),
+        "/",
+        "token-invalid",
+        Some(407),
+        None,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -400,8 +443,14 @@ async fn handle_request(
     limits: Limits,
     slot: Slot,
 ) -> Response<ProxyBody> {
-    let Some(session) = authenticate(&req, &state) else {
-        return proxy_auth_required();
+    let session = match authenticate(&req, &state) {
+        Ok(s) => s,
+        Err(Rejected(rejected)) => {
+            if let Some(id) = &rejected {
+                audit_rejected(&req, id, &state, &limits);
+            }
+            return proxy_auth_required();
+        }
     };
     if req.method() == Method::CONNECT {
         connect(req, session, state, limits, slot).await

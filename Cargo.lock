@@ -1781,6 +1781,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "ed25519-dalek",
  "http",
  "http-body-util",
  "hyper",

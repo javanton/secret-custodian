@@ -74,7 +74,7 @@ fn expired_token_is_rejected() {
     let (_d, _v, s) = svc();
     let t = s.issue("m", "r", Some(Duration::from_secs(0))).unwrap();
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired)));
+    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired(_))));
 }
 
 #[test]
@@ -84,9 +84,9 @@ fn revoked_token_is_rejected_and_machine_revocation_counts() {
     let b = s.issue("laptop", "reviewer", None).unwrap();
     let c = s.issue("other", "reviewer", None).unwrap();
     s.revoke(&a.jti).unwrap();
-    assert!(matches!(s.verify(&a.token), Err(AuthError::Revoked)));
+    assert!(matches!(s.verify(&a.token), Err(AuthError::Revoked(_))));
     assert_eq!(s.revoke_machine("laptop").unwrap(), 1);
-    assert!(matches!(s.verify(&b.token), Err(AuthError::Revoked)));
+    assert!(matches!(s.verify(&b.token), Err(AuthError::Revoked(_))));
     assert!(s.verify(&c.token).is_ok());
 }
 
@@ -223,9 +223,12 @@ fn exp_in_the_past_present_and_future() {
             ),
         )
     };
-    assert!(matches!(s.verify(&mk(now - 10)), Err(AuthError::Expired)));
+    assert!(matches!(
+        s.verify(&mk(now - 10)),
+        Err(AuthError::Expired(_))
+    ));
     assert!(
-        matches!(s.verify(&mk(now)), Err(AuthError::Expired)),
+        matches!(s.verify(&mk(now)), Err(AuthError::Expired(_))),
         "exp == now is expired"
     );
     assert!(s.verify(&mk(now + 3600)).is_ok());
@@ -235,7 +238,7 @@ fn exp_in_the_past_present_and_future() {
 fn zero_ttl_token_is_immediately_expired() {
     let (_d, _v, s) = svc();
     let t = s.issue("m", "r", Some(Duration::from_secs(0))).unwrap();
-    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired)));
+    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired(_))));
 }
 
 #[test]
@@ -243,7 +246,7 @@ fn revoked_unexpired_token_reports_revoked() {
     let (_d, _v, s) = svc();
     let t = s.issue("m", "r", Some(Duration::from_secs(3600))).unwrap();
     s.revoke(&t.jti).unwrap();
-    assert!(matches!(s.verify(&t.token), Err(AuthError::Revoked)));
+    assert!(matches!(s.verify(&t.token), Err(AuthError::Revoked(_))));
 }
 
 #[test]
@@ -251,7 +254,7 @@ fn expiry_is_evaluated_before_the_revocation_lookup() {
     let (_d, _v, s) = svc();
     let t = s.issue("m", "r", Some(Duration::ZERO)).unwrap();
     s.revoke(&t.jti).unwrap();
-    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired)));
+    assert!(matches!(s.verify(&t.token), Err(AuthError::Expired(_))));
 }
 
 fn token_count(v: &Vault) -> i64 {
@@ -532,4 +535,41 @@ fn listing_reports_metadata_and_revocation() {
         (t.jti.as_str(), "m", "r")
     );
     assert!(l[0].expires_at.is_some() && l[0].revoked_at.is_some());
+}
+
+#[test]
+fn expired_and_revoked_errors_carry_the_verified_identity() {
+    let (_d, _v, s) = svc();
+    let e = s.issue("laptop", "dev", Some(Duration::ZERO)).unwrap();
+    match s.verify(&e.token) {
+        Err(AuthError::Expired(id)) => {
+            assert_eq!(
+                (id.jti.as_str(), id.machine.as_str(), id.role.as_str()),
+                (e.jti.as_str(), "laptop", "dev")
+            );
+        }
+        other => panic!("expected Expired, got {other:?}"),
+    }
+    let r = s.issue("ci", "reviewer", None).unwrap();
+    s.revoke(&r.jti).unwrap();
+    match s.verify(&r.token) {
+        Err(AuthError::Revoked(id)) => {
+            assert_eq!(
+                (id.jti.as_str(), id.machine.as_str(), id.role.as_str()),
+                (r.jti.as_str(), "ci", "reviewer")
+            );
+        }
+        other => panic!("expected Revoked, got {other:?}"),
+    }
+}
+
+#[test]
+fn error_display_text_is_unchanged() {
+    let id = sg_auth::Identity {
+        jti: "j".into(),
+        machine: "m".into(),
+        role: "r".into(),
+    };
+    assert_eq!(AuthError::Expired(id.clone()).to_string(), "token expired");
+    assert_eq!(AuthError::Revoked(id).to_string(), "token revoked");
 }
