@@ -1,4 +1,4 @@
-# Secret Guardian documentation
+# Secret Custodian documentation
 
 Index of the documentation. New here? Start with the [project README](../README.md) (what it is, a verified quick start,
 how to configure an agent), then the page for your role below.

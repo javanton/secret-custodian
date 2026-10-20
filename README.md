@@ -1,6 +1,6 @@
-# Secret Guardian
+# Secret Custodian
 
-Secret Guardian (`sg`) is a self-hosted credential vault for AI agents and other untrusted automation. Your agents
+Secret Custodian (`sg`) is a self-hosted credential vault for AI agents and other untrusted automation. Your agents
 make ordinary HTTP(S) requests through a local proxy; the proxy looks up the agent's role, and injects the real API
 key into the request on the way out. The agent never holds the key, never sees it, and cannot ask for it. It is one
 Rust binary (or one Docker image) with a CLI, an admin API and a small local web UI, and it keeps everything in a
@@ -69,7 +69,7 @@ flowchart LR
 ```sh
 cargo build --release -p sg
 export PATH="$PWD/target/release:$PATH"
-sg serve --key-file ~/.config/secret-guardian/sg.key   # first run creates the key (back it up)
+sg serve --key-file ~/.config/secret-custodian/sg.key   # first run creates the key (back it up)
 ```
 
 That prints a `proxy:` address, a one-time `admin:` login link for the web UI, and `ready`. From there: `sg role add`,
@@ -88,7 +88,7 @@ Other platforms are not built; compile from source (above).
 
 ```sh
 VERSION=0.1.0   # see the releases page for the latest
-BASE="https://gitlab.habbi.cc/api/v4/projects/own-projects%2Fsecret-guardian/packages/generic/secret-guardian/$VERSION"
+BASE="https://gitlab.habbi.cc/api/v4/projects/own-projects%2Fsecret-guardian/packages/generic/secret-custodian/$VERSION"
 curl -fLO "$BASE/sg-v$VERSION-x86_64-linux.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS                       # must print: sg-v0.1.0-x86_64-linux.tar.gz: OK
@@ -124,7 +124,7 @@ entirely) and the combined-bundle trick for agents that also talk to hosts witho
 ## Docker
 
 ```sh
-docker build -t secret-guardian:dev .
+docker build -t secret-custodian:dev .
 ```
 
 Runs as uid/gid `10001`, `/data` (mode `0700`) as its volume, ports `8080` (proxy) and `9090` (web UI).

@@ -98,7 +98,7 @@ fn tampered_payload_and_foreign_signer_are_rejected() {
     assert!(other.verify(&t.token).is_err());
     let parts: Vec<&str> = t.token.split('.').collect();
     let evil =
-        B64.encode(br#"{"iss":"secret-guardian","jti":"x","sub":"m","role":"developer","iat":1}"#);
+        B64.encode(br#"{"iss":"secret-custodian","jti":"x","sub":"m","role":"developer","iat":1}"#);
     assert!(s
         .verify(&format!("{}.{}.{}", parts[0], evil, parts[2]))
         .is_err());
@@ -109,7 +109,7 @@ fn alg_none_and_malformed_tokens_are_rejected() {
     let (_d, _v, s) = svc();
     let h = B64.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let p =
-        B64.encode(br#"{"iss":"secret-guardian","jti":"x","sub":"m","role":"developer","iat":1}"#);
+        B64.encode(br#"{"iss":"secret-custodian","jti":"x","sub":"m","role":"developer","iat":1}"#);
     assert!(s.verify(&format!("{h}.{p}.")).is_err());
     for bad in ["", "a", "a.b", "a.b.c", "....", "💥.💥.💥"] {
         assert!(s.verify(bad).is_err(), "{bad:?}");
@@ -136,7 +136,7 @@ fn forge_helper_control_case_is_accepted() {
     let tok = forge(
         &v,
         GOOD_HEADER,
-        r#"{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r","iat":1}"#,
+        r#"{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r","iat":1}"#,
     );
     assert!(s.verify(&tok).is_ok());
 }
@@ -153,7 +153,7 @@ fn token_from_one_vault_does_not_verify_on_another() {
 fn header_variants_with_valid_signature_are_rejected() {
     let (_d, v, s) = svc();
     register(&v, "j1");
-    let payload = r#"{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r","iat":1}"#;
+    let payload = r#"{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r","iat":1}"#;
     for h in [
         r#"{"alg": "EdDSA","typ":"JWT"}"#,
         r#"{"typ":"JWT","alg":"EdDSA"}"#,
@@ -186,7 +186,7 @@ fn unknown_jti_is_invalid_not_revoked() {
     let tok = forge(
         &v,
         GOOD_HEADER,
-        r#"{"iss":"secret-guardian","jti":"ghost","sub":"m","role":"r","iat":1}"#,
+        r#"{"iss":"secret-custodian","jti":"ghost","sub":"m","role":"r","iat":1}"#,
     );
     assert!(matches!(s.verify(&tok), Err(AuthError::Invalid)));
 }
@@ -196,10 +196,10 @@ fn missing_claims_and_wrong_types_are_rejected() {
     let (_d, v, s) = svc();
     register(&v, "j1");
     for p in [
-        r#"{"iss":"secret-guardian","jti":"j1","sub":"m","iat":1}"#,
-        r#"{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r"}"#,
-        r#"{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r","iat":"1"}"#,
-        r#"{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r","iat":1,"exp":"never"}"#,
+        r#"{"iss":"secret-custodian","jti":"j1","sub":"m","iat":1}"#,
+        r#"{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r"}"#,
+        r#"{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r","iat":"1"}"#,
+        r#"{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r","iat":1,"exp":"never"}"#,
         r#"[]"#,
         "not json",
         "",
@@ -219,7 +219,7 @@ fn exp_in_the_past_present_and_future() {
             &v,
             GOOD_HEADER,
             &format!(
-                r#"{{"iss":"secret-guardian","jti":"j1","sub":"m","role":"r","iat":1,"exp":{exp}}}"#
+                r#"{{"iss":"secret-custodian","jti":"j1","sub":"m","role":"r","iat":1,"exp":{exp}}}"#
             ),
         )
     };

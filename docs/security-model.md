@@ -1,6 +1,6 @@
 # Security model
 
-What Secret Guardian protects, from whom, how, and what it deliberately does not do. Sections: [Assets](#assets) ·
+What Secret Custodian protects, from whom, how, and what it deliberately does not do. Sections: [Assets](#assets) ·
 [Trust boundaries](#trust-boundaries) · [Attacker models](#attacker-models) · [Mitigations mapped to code](#mitigations-mapped-to-code) ·
 [Non-goals and residual risks](#non-goals-and-residual-risks) · [History of hardening](#history-of-hardening) ·
 [Deployment checklist](#deployment-checklist).

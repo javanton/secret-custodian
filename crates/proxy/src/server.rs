@@ -255,7 +255,7 @@ fn proxy_auth_required() -> Response<ProxyBody> {
     );
     r.headers_mut().insert(
         "proxy-authenticate",
-        "Basic realm=\"secret-guardian\"".parse().unwrap(),
+        "Basic realm=\"secret-custodian\"".parse().unwrap(),
     );
     r
 }

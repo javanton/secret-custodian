@@ -1,5 +1,5 @@
 "use strict";
-// Secret Guardian admin UI. No framework, no build step.
+// Secret Custodian admin UI. No framework, no build step.
 // Every piece of DOM is built with createElement/textContent (see el()); no markup is ever
 // parsed from a string, so server-supplied values cannot become HTML or script.
 // Authentication: the login token arrives in the URL fragment, is traded once for a session id
@@ -651,7 +651,7 @@ async function viewCa(root) {
           onclick: safe(async () => {
             const blob = await api("GET", "/ca/cert", undefined, { blob: true });
             const url = URL.createObjectURL(blob);
-            const a = el("a", { href: url, download: "secret-guardian-ca.pem" });
+            const a = el("a", { href: url, download: "secret-custodian-ca.pem" });
             document.body.append(a);
             a.click();
             a.remove();
@@ -667,10 +667,10 @@ async function viewCa(root) {
       "pre",
       {},
       [
-        "export SSL_CERT_FILE=/path/to/secret-guardian-ca.pem",
-        "export NODE_EXTRA_CA_CERTS=/path/to/secret-guardian-ca.pem",
-        "export REQUESTS_CA_BUNDLE=/path/to/secret-guardian-ca.pem",
-        "export CURL_CA_BUNDLE=/path/to/secret-guardian-ca.pem",
+        "export SSL_CERT_FILE=/path/to/secret-custodian-ca.pem",
+        "export NODE_EXTRA_CA_CERTS=/path/to/secret-custodian-ca.pem",
+        "export REQUESTS_CA_BUNDLE=/path/to/secret-custodian-ca.pem",
+        "export CURL_CA_BUNDLE=/path/to/secret-custodian-ca.pem",
       ].join("\n"),
     ),
   );

@@ -1,11 +1,11 @@
-# Example deployment of Secret Guardian. Copy to docker-compose.yml and adjust.
+# Example deployment of Secret Custodian. Copy to docker-compose.yml and adjust.
 #
 # Setup:
 #   1. Create the master key once and back it up (losing it means losing every stored secret).
 #      Easiest: `sg keygen --out sg.key` on the host (mode 0600, owned by you). Or generate it inside
 #      a volume as root and hand it to the container user (uid 10001), then mount that volume at
 #      /run/secrets instead of using the `secrets:` entry below:
-#        docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-guardian:dev \
+#        docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-custodian:dev \
 #          -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
 #      (A plain `docker run -v "$PWD":/out ... keygen --out /out/sg.key` fails with `Permission
 #      denied`: uid 10001 cannot write to your directory.)
@@ -18,11 +18,11 @@
 #      `docker inspect`.
 #   3. docker compose up -d --build
 #   4. Configure the vault with the CLI over the in-container admin socket:
-#        docker compose exec secret-guardian sg secret ls
-#        printf %s "$TOKEN" | docker compose exec -T secret-guardian sg secret add github
-#        docker compose exec secret-guardian sg token create --machine agent1 --role reviewer \
-#            --proxy-url http://secret-guardian:8080
-#      Web UI: docker compose exec secret-guardian sg login-url   (open the printed link on the host,
+#        docker compose exec secret-custodian sg secret ls
+#        printf %s "$TOKEN" | docker compose exec -T secret-custodian sg secret add github
+#        docker compose exec secret-custodian sg token create --machine agent1 --role reviewer \
+#            --proxy-url http://secret-custodian:8080
+#      Web UI: docker compose exec secret-custodian sg login-url   (open the printed link on the host,
 #      it points to http://localhost:9090). If you publish the UI on another host port, e.g.
 #      "127.0.0.1:19090:9090", add `--admin-public-url http://localhost:19090` to `command:` (or set
 #      SG_ADMIN_PUBLIC_URL): the printed link then names that URL and its Host is accepted, so
@@ -32,20 +32,20 @@
 #   * The admin UI has NO remote login: it is published on the host loopback only, and every session
 #     still needs a single-use login token from `sg login-url`.
 #   * Both ports live in the same container, so an agent container on the `agents` network CAN reach
-#     the admin port (secret-guardian:9090). That is why the proxy refuses to relay to its own ports
+#     the admin port (secret-custodian:9090). That is why the proxy refuses to relay to its own ports
 #     and the admin UI rejects unexpected Host/Origin headers and requires the login token. Keep
 #     untrusted code off the host's loopback and do not publish 9090 on other interfaces.
 #   * The `agents` network is `internal`: agents can only talk to the vault, never straight to the
 #     internet, so the proxy is the only way out. The vault itself also sits on `egress` to reach
 #     the upstream APIs.
 services:
-  secret-guardian:
-    image: secret-guardian:dev
+  secret-custodian:
+    image: secret-custodian:dev
     build: .
     restart: unless-stopped
     ports:
       - "127.0.0.1:9090:9090"   # admin UI, host loopback only
-    # The proxy (8080) is NOT published: agent containers reach it as http://secret-guardian:8080.
+    # The proxy (8080) is NOT published: agent containers reach it as http://secret-custodian:8080.
     volumes:
       - sg-data:/data
     tmpfs:
@@ -66,14 +66,14 @@ services:
 
   # Example agent: everything it sends over HTTP(S) goes through the vault, which injects credentials.
   # Create a token first (see step 4) and put the HTTPS_PROXY line it prints in the environment.
-  # The CA is exported with `docker compose exec secret-guardian sg ca export > sg-ca.pem`.
+  # The CA is exported with `docker compose exec secret-custodian sg ca export > sg-ca.pem`.
   #
   # agent:
   #   image: curlimages/curl
   #   command: ["curl", "-sS", "https://api.github.com/user"]
   #   networks: [agents]
   #   environment:
-  #     HTTPS_PROXY: "http://agent1:<TOKEN>@secret-guardian:8080"
+  #     HTTPS_PROXY: "http://agent1:<TOKEN>@secret-custodian:8080"
   #     SSL_CERT_FILE: /certs/sg-ca.pem
   #     CURL_CA_BUNDLE: /certs/sg-ca.pem
   #     NODE_EXTRA_CA_CERTS: /certs/sg-ca.pem

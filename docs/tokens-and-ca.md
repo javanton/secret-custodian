@@ -17,7 +17,7 @@ padding (`URL_SAFE_NO_PAD`):
 | Part | Content |
 |---|---|
 | header | The exact bytes `{"alg":"EdDSA","typ":"JWT"}` (constant `HEADER`). |
-| payload (claims) | JSON with `iss` = `"secret-guardian"`, `jti` (UUID v4), `sub` (the machine label), `role`, `iat` (issue time, Unix seconds) and optional `exp` (omitted when the token has no expiry). |
+| payload (claims) | JSON with `iss` = `"secret-custodian"`, `jti` (UUID v4), `sub` (the machine label), `role`, `iat` (issue time, Unix seconds) and optional `exp` (omitted when the token has no expiry). |
 | signature | Ed25519 signature (64 bytes) over the ASCII string `base64url(header) + "." + base64url(payload)`. |
 
 One token is valid for one role. A machine can have several tokens (for example `developer` and
@@ -56,7 +56,7 @@ also checks that the role exists (`unknown role`).
    with `verify_strict` over `header.payload` using the vault's verifying key. **The signature is verified before
    the claims are parsed.**
 4. Parse the claims as JSON (missing fields or wrong types: `Invalid`).
-5. `iss` must equal `secret-guardian` (`Invalid`).
+5. `iss` must equal `secret-custodian` (`Invalid`).
 6. If `exp` is present and `now >= exp`: `Expired`. This is evaluated **before** the revocation lookup
    (test `expiry_is_evaluated_before_the_revocation_lookup`).
 7. Look up `revoked_at` by `jti` in `tokens`: no row gives `Invalid` (a correctly signed token whose row is missing is
@@ -93,7 +93,7 @@ come from the signed claims, not from the row. `tokens.token_hash` is not consul
 The proxy adds its own bounds before calling it (`server.rs`, `authenticate`): there must be exactly one
 `Proxy-Authorization` header (duplicates give `407`), at most 8 KiB (`MAX_PROXY_AUTH_LEN`), and the value
 must be a valid header string. Any failure is `407 Proxy Authentication Required` with
-`Proxy-Authenticate: Basic realm="secret-guardian"`, and no audit row is written (the one exception is a validly signed token that is revoked or expired: `token-invalid`, rate limited to one row per `jti` per 60 s, with a response identical to any other `407`). A `403` is returned only
+`Proxy-Authenticate: Basic realm="secret-custodian"`, and no audit row is written (the one exception is a validly signed token that is revoked or expired: `token-invalid`, rate limited to one row per `jti` per 60 s, with a response identical to any other `407`). A `403` is returned only
 once the token is valid but the role does not exist or the host is denied.
 
 ### 1.6 What is stored
@@ -114,7 +114,7 @@ CA certificate properties (`ca_params`):
 
 | Property | Value |
 |---|---|
-| Subject | CN = `Secret Guardian CA` |
+| Subject | CN = `Secret Custodian CA` |
 | Basic constraints | CA, path length 0 (`Constrained(0)`), critical: it can only sign leaves |
 | Key usage | `keyCertSign`, `cRLSign` only |
 | Subject Key Identifier | SHA-256 based, derived from the CA public key, so it is the same in every re-issued certificate |

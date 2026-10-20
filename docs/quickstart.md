@@ -75,7 +75,7 @@ socket: /tmp/tmp.vINqLarwc9/sg.sock
 ready
 ```
 
-On a normal run you would write just `sg serve --key-file ~/.config/secret-guardian/sg.key`. The `admin:` line is a
+On a normal run you would write just `sg serve --key-file ~/.config/secret-custodian/sg.key`. The `admin:` line is a
 one-time login link for the web UI (see [admin-api.md](admin-api.md)).
 
 **4. Create roles, store a secret with its first rule, add another rule.** The secret comes from stdin, never from an

@@ -11,7 +11,7 @@ done
 docker info >/dev/null 2>&1 || { echo "docker daemon not reachable by this user" >&2; exit 2; }
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
 
-IMAGE="secret-guardian:e2e-$$"
+IMAGE="secret-custodian:e2e-$$"
 NAME="sg-e2e-$$"
 KEYVOL="sg-e2e-key-$$"
 DATAVOL="sg-e2e-data-$$"

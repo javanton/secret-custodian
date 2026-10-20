@@ -14,7 +14,7 @@ and never come out; the admin crate does not call the decrypting function at all
 
 | | Unix socket | Web (loopback HTTP) |
 |---|---|---|
-| Address | `--socket` / `SG_SOCKET`, default `$XDG_RUNTIME_DIR/secret-guardian.sock`, mode `0600` | `--admin-bind`, default `127.0.0.1:9090` |
+| Address | `--socket` / `SG_SOCKET`, default `$XDG_RUNTIME_DIR/secret-custodian.sock`, mode `0600` | `--admin-bind`, default `127.0.0.1:9090` |
 | Used by | `sg` CLI, `curl --unix-socket`, scripts | the browser UI |
 | Authentication | None of its own: whoever can open the socket is the operator. The socket must be in a `0700` directory owned by the server's user (checked when binding and by the CLI client). | One-time login token in the URL fragment, exchanged by `POST /login` for a session; every `/api/*` call needs `Authorization: Bearer <session>` |
 | Path prefix | none (`/secrets`) | `/api` (`/api/secrets`) |

@@ -90,7 +90,7 @@ publish-package:
         curl --fail --silent --show-error \
           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
           --upload-file "$f" \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-guardian/${VERSION}/$(basename "$f")"
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-custodian/${VERSION}/$(basename "$f")"
         echo "uploaded $(basename "$f")"
       done
 
@@ -106,10 +106,10 @@ create-release:
     - |
       set -eu
       VERSION="${CI_COMMIT_TAG#v}"
-      BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-guardian/${VERSION}"
+      BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/secret-custodian/${VERSION}"
       ARCHIVE="sg-${CI_COMMIT_TAG}-x86_64-linux.tar.gz"
       release-cli create \
-        --name "Secret Guardian ${CI_COMMIT_TAG}" \
+        --name "Secret Custodian ${CI_COMMIT_TAG}" \
         --tag-name "$CI_COMMIT_TAG" \
         --description "Static Linux x86_64 binary (musl). Verify the download with SHA256SUMS (sha256sum -c SHA256SUMS). Container image: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}" \
         --assets-link "{\"name\":\"${ARCHIVE}\",\"url\":\"${BASE}/${ARCHIVE}\",\"link_type\":\"package\"}" \

@@ -79,7 +79,7 @@ pub struct CaService {
 fn ca_params(domains: &[String]) -> Result<CertificateParams, CaError> {
     let mut p = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "Secret Guardian CA");
+    dn.push(DnType::CommonName, "Secret Custodian CA");
     p.distinguished_name = dn;
     // Random positive 16-byte serial, stored only inside the certificate: re-issued CA certificates
     // (same key, same subject) must not share issuer+serial.

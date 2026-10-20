@@ -6,7 +6,7 @@ use sg_cli::{ClientCommand, ClientOpts};
 use std::{path::PathBuf, process::ExitCode};
 
 const LONG_ABOUT: &str = "\
-Secret Guardian is a local credential vault for AI agents. Its proxy injects credentials into \
+Secret Custodian is a local credential vault for AI agents. Its proxy injects credentials into \
 requests according to the role of the agent's token, so the agent never sees the secret.";
 
 const AFTER_HELP: &str = "\
@@ -39,13 +39,13 @@ EXAMPLE WORKFLOW
 #[command(
     name = "sg",
     version,
-    about = "Secret Guardian: a vault whose proxy injects credentials so agents never see them",
+    about = "Secret Custodian: a vault whose proxy injects credentials so agents never see them",
     long_about = LONG_ABOUT,
     after_long_help = AFTER_HELP,
     after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Admin socket of a running `sg serve` (default: $XDG_RUNTIME_DIR/secret-guardian.sock; when
+    /// Admin socket of a running `sg serve` (default: $XDG_RUNTIME_DIR/secret-custodian.sock; when
     /// XDG_RUNTIME_DIR is unset, empty or relative: <data dir>/sg.sock)
     #[arg(long, global = true, env = "SG_SOCKET", value_name = "PATH")]
     socket: Option<PathBuf>,

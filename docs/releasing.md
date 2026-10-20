@@ -30,7 +30,7 @@ Dockerfile or anything in the container path.
    | Job | Result |
    |---|---|
    | `release-binary` | Builds the static `x86_64-unknown-linux-musl` binary with `scripts/package-release.sh`, which **fails if the tag differs from the `Cargo.toml` version**, if the binary is not statically linked, or if `sg --version` does not print the version. Produces `sg-vX.Y.Z-x86_64-linux.tar.gz` (binary, `LICENSE`, `README.md`) and `SHA256SUMS`. |
-   | `publish-package` | Uploads both files to the project's Generic Package Registry (`secret-guardian/<version>`). |
+   | `publish-package` | Uploads both files to the project's Generic Package Registry (`secret-custodian/<version>`). |
    | `create-release` | Creates the GitLab Release for the tag with links to both files. |
    | `publish-image` | Builds the `Dockerfile` and pushes `:vX.Y.Z` and `:latest` to the Container Registry. Needs a runner that exposes the Docker socket. |
 

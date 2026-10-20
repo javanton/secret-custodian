@@ -341,7 +341,7 @@ async fn forged_leaf_for_a_domain_outside_the_real_ca_constraints_is_refused() {
     let key = KeyPair::from_pem(std::str::from_utf8(&key_pem).unwrap()).unwrap();
     let mut p = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "Secret Guardian CA");
+    dn.push(rcgen::DnType::CommonName, "Secret Custodian CA");
     p.distinguished_name = dn;
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -580,7 +580,7 @@ fn real_signer(v: &Vault) -> (rcgen::Certificate, KeyPair) {
     let key = KeyPair::from_pem(std::str::from_utf8(&key_pem).unwrap()).unwrap();
     let mut p = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "Secret Guardian CA");
+    dn.push(rcgen::DnType::CommonName, "Secret Custodian CA");
     p.distinguished_name = dn;
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];

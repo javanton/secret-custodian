@@ -1,6 +1,6 @@
 # Architecture
 
-This page describes what Secret Guardian is, how the workspace is split into crates, how one injected
+This page describes what Secret Custodian is, how the workspace is split into crates, how one injected
 HTTPS request flows through the process, and why the main design decisions were taken. Everything here
 is derived from the code in `crates/` at the commit this documentation was written against; where a
 statement refers to a file, the file (and function) is cited so it can be checked.
@@ -15,7 +15,7 @@ Status: all eight workspace members are implemented; phase 1 is complete (what i
 
 ## 1. Purpose and threat model
 
-Secret Guardian is a self-hosted vault, written in Rust, that lets an AI agent make authenticated HTTP(S)
+Secret Custodian is a self-hosted vault, written in Rust, that lets an AI agent make authenticated HTTP(S)
 requests to external APIs without ever holding or being able to read the credential. The agent
 authenticates to a local proxy with a token that carries a **role**. The proxy intercepts the agent's
 HTTPS traffic (a CONNECT tunnel that is terminated with a certificate from a locally generated CA),
@@ -196,7 +196,7 @@ Step notes (all from the cited files):
 
 1. **Authentication** (`server.rs`, `authenticate`): exactly one `Proxy-Authorization` header, at most
    8 KiB, parsed by `sg_auth::extract_proxy_token`, then `TokenVerifier::verify`. Any failure returns
-   `407` with `Proxy-Authenticate: Basic realm="secret-guardian"`. **No audit row is written for a
+   `407` with `Proxy-Authenticate: Basic realm="secret-custodian"`. **No audit row is written for a
    failed authentication** (there is no identity to attribute it to), except for a validly signed token that is
    revoked or expired: `token-invalid`, 407, at most one row per `jti` per 60 s (see
    [proxy-internals.md](proxy-internals.md#audit-decisions)). A request that is not CONNECT

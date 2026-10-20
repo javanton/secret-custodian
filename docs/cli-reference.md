@@ -29,15 +29,15 @@ Accepted by every subcommand, before or after it (`sg --json audit` and `sg audi
 
 | Option | Env | Default | Meaning |
 |---|---|---|---|
-| `--socket <PATH>` | `SG_SOCKET` | `$XDG_RUNTIME_DIR/secret-guardian.sock`; if `XDG_RUNTIME_DIR` is unset, empty or relative: `<data dir>/sg.sock` | Admin socket. For `sg serve` it is where the socket is created; for client commands it is where to connect. |
+| `--socket <PATH>` | `SG_SOCKET` | `$XDG_RUNTIME_DIR/secret-custodian.sock`; if `XDG_RUNTIME_DIR` is unset, empty or relative: `<data dir>/sg.sock` | Admin socket. For `sg serve` it is where the socket is created; for client commands it is where to connect. |
 | `--json` | - | off | Print the raw JSON returned by the server instead of a table or a sentence. No effect on `serve` and `keygen`. |
 | `-h`, `--help` | - | - | Help. `sg <command> --help` for any subcommand. |
 | `-V`, `--version` | - | - | Prints `sg 0.1.0`. |
 
-Data directory default (used by `sg serve --data-dir`): `$XDG_DATA_HOME/secret-guardian`, else
-`$HOME/.local/share/secret-guardian`, else `/tmp/secret-guardian`. Empty or relative `XDG_DATA_HOME`/`HOME`
+Data directory default (used by `sg serve --data-dir`): `$XDG_DATA_HOME/secret-custodian`, else
+`$HOME/.local/share/secret-custodian`, else `/tmp/secret-custodian`. Empty or relative `XDG_DATA_HOME`/`HOME`
 are ignored. (Verified: with `XDG_RUNTIME_DIR` unset and `HOME=/x`, a client looks for
-`/x/.local/share/secret-guardian/sg.sock`.)
+`/x/.local/share/secret-custodian/sg.sock`.)
 
 Logging: `tracing` to stderr, default level `warn`, overridable with `RUST_LOG` (for example
 `RUST_LOG=sg_proxy=debug`). The code logs very little: upstream failures and internal errors (`warn`/`error`)
@@ -413,7 +413,7 @@ Points to know:
   of the exports. Each CA variable points at the file; most of them *replace* the tool's own trust store (see
   [README: Configure an agent](../README.md#configure-an-agent)).
 - Inside Docker the default `--proxy-url` is wrong for agents in other containers: pass
-  `--proxy-url http://secret-guardian:8080` (the service name).
+  `--proxy-url http://secret-custodian:8080` (the service name).
 
 With `--json` only the JSON is printed, without the block:
 

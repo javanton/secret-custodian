@@ -39,7 +39,7 @@ other than localhost:<bound port>, pass --admin-public-url: that URL is printed 
 
 Stop with SIGINT or SIGTERM (the socket file is removed); a second SIGINT forces the exit.")]
 pub struct ServeArgs {
-    /// Directory holding vault.db (created with mode 0700). Default: $XDG_DATA_HOME/secret-guardian
+    /// Directory holding vault.db (created with mode 0700). Default: $XDG_DATA_HOME/secret-custodian
     #[arg(long)]
     data_dir: Option<PathBuf>,
     /// Address of the credential-injecting proxy

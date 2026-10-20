@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use zeroize::Zeroizing;
 
-const ISS: &str = "secret-guardian";
+const ISS: &str = "secret-custodian";
 const KEY_AAD: &[u8] = b"sg:token-signing-key";
 const HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 

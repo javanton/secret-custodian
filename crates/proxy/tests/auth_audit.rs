@@ -170,7 +170,7 @@ async fn anonymous_and_invalid_credentials_write_no_audit_row() {
     let none_alg = format!(
         "{}.{}.",
         B64.encode(r#"{"alg":"none","typ":"JWT"}"#),
-        B64.encode(payload("secret-guardian", "j1"))
+        B64.encode(payload("secret-custodian", "j1"))
     );
     // Signed with the real key, but by another issuer / for a jti the vault never issued.
     env.vault
@@ -184,7 +184,7 @@ async fn anonymous_and_invalid_credentials_write_no_audit_row() {
     let unknown_jti = forge(
         &env,
         GOOD_HEADER,
-        &payload("secret-guardian", "never-issued"),
+        &payload("secret-custodian", "never-issued"),
     );
 
     let single = |tok: &str| connect_req("api.example.test:443", &[basic(tok)]);
@@ -217,7 +217,7 @@ async fn anonymous_and_invalid_credentials_write_no_audit_row() {
 
     // Control: the forged-token helper does produce a token the proxy accepts as authentic
     // (so the rejections above are due to the property under test).
-    let ok = forge(&env, GOOD_HEADER, &payload("secret-guardian", "reg"));
+    let ok = forge(&env, GOOD_HEADER, &payload("secret-custodian", "reg"));
     let resp = exchange(&env, &single(&ok)).await;
     assert!(!resp.starts_with("HTTP/1.1 407"), "{resp}");
 }

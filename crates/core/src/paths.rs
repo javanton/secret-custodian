@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Absolute fallback used when neither `XDG_DATA_HOME` nor `HOME` yields an absolute path.
-const FALLBACK_DIR: &str = "/tmp/secret-guardian";
+const FALLBACK_DIR: &str = "/tmp/secret-custodian";
 
 fn absolute(v: Option<OsString>) -> Option<PathBuf> {
     v.map(PathBuf::from).filter(|p| p.is_absolute())
@@ -10,23 +10,23 @@ fn absolute(v: Option<OsString>) -> Option<PathBuf> {
 
 fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
     if let Some(d) = absolute(xdg_data_home) {
-        return d.join("secret-guardian");
+        return d.join("secret-custodian");
     }
     if let Some(h) = absolute(home) {
-        return h.join(".local/share/secret-guardian");
+        return h.join(".local/share/secret-custodian");
     }
     PathBuf::from(FALLBACK_DIR)
 }
 
 fn socket_from(xdg_runtime_dir: Option<OsString>, data_dir: PathBuf) -> PathBuf {
     match absolute(xdg_runtime_dir) {
-        Some(d) => d.join("secret-guardian.sock"),
+        Some(d) => d.join("secret-custodian.sock"),
         None => data_dir.join("sg.sock"),
     }
 }
 
 /// Always returns an absolute path: empty or relative `XDG_DATA_HOME`/`HOME` are ignored and
-/// the last resort is `/tmp/secret-guardian`.
+/// the last resort is `/tmp/secret-custodian`.
 pub fn default_data_dir() -> PathBuf {
     data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
@@ -48,11 +48,11 @@ mod tests {
     fn data_dir_prefers_xdg_then_home() {
         assert_eq!(
             data_dir_from(os("/x"), os("/h")),
-            PathBuf::from("/x/secret-guardian")
+            PathBuf::from("/x/secret-custodian")
         );
         assert_eq!(
             data_dir_from(None, os("/h")),
-            PathBuf::from("/h/.local/share/secret-guardian")
+            PathBuf::from("/h/.local/share/secret-custodian")
         );
     }
 
@@ -60,7 +60,7 @@ mod tests {
     fn empty_or_relative_vars_are_ignored() {
         assert_eq!(
             data_dir_from(os(""), os("/h")),
-            PathBuf::from("/h/.local/share/secret-guardian")
+            PathBuf::from("/h/.local/share/secret-custodian")
         );
         assert_eq!(
             data_dir_from(os("rel"), os("")),
@@ -72,10 +72,10 @@ mod tests {
 
     #[test]
     fn socket_ignores_empty_runtime_dir() {
-        let data = PathBuf::from("/d/secret-guardian");
+        let data = PathBuf::from("/d/secret-custodian");
         assert_eq!(
             socket_from(os("/run/user/1"), data.clone()),
-            PathBuf::from("/run/user/1/secret-guardian.sock")
+            PathBuf::from("/run/user/1/secret-custodian.sock")
         );
         assert_eq!(socket_from(os(""), data.clone()), data.join("sg.sock"));
         assert_eq!(socket_from(None, data.clone()), data.join("sg.sock"));

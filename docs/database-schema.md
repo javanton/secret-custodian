@@ -1,6 +1,6 @@
 # Database schema
 
-Secret Guardian stores everything in one SQLite file. The schema is the constant `SCHEMA` in
+Secret Custodian stores everything in one SQLite file. The schema is the constant `SCHEMA` in
 `crates/core/src/schema.rs`; it is applied once, by `Vault::init` (`crates/core/src/vault.rs`).
 This page lists every table and column, who writes and reads it, what is encrypted (and with which
 AAD), and what the code does on failure. See also [architecture.md](architecture.md) and
@@ -240,8 +240,8 @@ value, no token signing key and no CA private key. The test `database_file_never
   the vault is open. The WAL can contain recent committed pages that have not yet been checkpointed
   into the main file; treat all three files as one unit (all ciphertext-only for secrets, as above).
 - The directory that holds the file is not created or chmod-ed by `sg-core`. `paths::default_data_dir`
-  only computes a path (`$XDG_DATA_HOME/secret-guardian`, else `$HOME/.local/share/secret-guardian`, else
-  `/tmp/secret-guardian`; empty or relative variables are ignored). Creating and securing the directory
+  only computes a path (`$XDG_DATA_HOME/secret-custodian`, else `$HOME/.local/share/secret-custodian`, else
+  `/tmp/secret-custodian`; empty or relative variables are ignored). Creating and securing the directory
   is done by `sg serve` (`prepare_data_dir` in `crates/sg/src/serve.rs`): it creates the directory and any missing
   parents with mode `0700`, tightens a looser directory it owns (`note: tightened <dir> to mode 0700`) and refuses
   one owned by another user.

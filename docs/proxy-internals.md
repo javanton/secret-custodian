@@ -64,7 +64,7 @@ Authentication happens first, on every request the proxy listener receives (CONN
    send.
 3. The token is verified (`TokenService::verify`): signature first, then issuer, then expiry, then the database
    lookup of the token id for revocation. Details: [tokens-and-ca.md](tokens-and-ca.md#13-verification-order).
-4. Any failure is `407 Proxy Authentication Required`, header `Proxy-Authenticate: Basic realm="secret-guardian"`,
+4. Any failure is `407 Proxy Authentication Required`, header `Proxy-Authenticate: Basic realm="secret-custodian"`,
    body `proxy authentication required`. The response is byte-identical for every failure, so a client cannot tell "revoked" from "invalid". **No audit
    row is written**, with one exception: a token whose signature and issuer are valid but that is revoked or expired
    is audited as `token-invalid` (407), see [Audit decisions](#audit-decisions). The identity read from such a token

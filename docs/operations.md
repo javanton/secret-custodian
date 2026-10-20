@@ -1,6 +1,6 @@
 # Operations guide
 
-Installing, running and looking after a Secret Guardian instance. Commands were run against the real binary;
+Installing, running and looking after a Secret Custodian instance. Commands were run against the real binary;
 the symptoms in the [troubleshooting table](#troubleshooting) were provoked on purpose and the messages copied.
 Sections: [Installing](#installing) · [Directories and permissions](#directories-and-permissions) ·
 [Key management](#key-management) · [Backups](#backups) · [Upgrades](#upgrades) (including the [rules migration](#upgrading-from-a-version-without-required-rules)) ·
@@ -17,7 +17,7 @@ use) and a C compiler (SQLite is bundled and compiled). The end-to-end script al
 `python3`; the Docker image needs only Docker.
 
 ```sh
-git clone <your clone URL> secret-guardian && cd secret-guardian
+git clone <your clone URL> secret-custodian && cd secret-custodian
 cargo build --release -p sg --locked        # binary: target/release/sg
 install -m 0755 target/release/sg ~/.local/bin/sg
 sg --version                                # sg 0.1.0
@@ -31,7 +31,7 @@ else at run time.
 
 ### Docker
 
-`docker build -t secret-guardian:dev .` produces a Debian-slim image that runs as uid/gid `10001`, with `/data` (mode
+`docker build -t secret-custodian:dev .` produces a Debian-slim image that runs as uid/gid `10001`, with `/data` (mode
 `0700`) as the volume, ports `8080` (proxy) and `9090` (web UI) exposed, `SG_SOCKET=/data/sg.sock` preset so that
 `docker exec <ctr> sg ...` works with no flags, and a health check that runs `sg ca status`. The default command is
 `serve --data-dir /data --socket /data/sg.sock --key-file /run/secrets/sg_key --proxy-bind 0.0.0.0:8080 --admin-bind 0.0.0.0:9090`.
@@ -50,17 +50,17 @@ Three ways out (the first and third were run):
 ```sh
 # 1. generate the key inside a volume, owned by uid 10001, and mount that volume at /run/secrets
 docker volume create sg-key
-docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-guardian:dev \
+docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-custodian:dev \
   -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'
-docker run -d --name secret-guardian --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
-  -p 127.0.0.1:9090:9090 -v sg-key:/run/secrets:ro -v sg-data:/data secret-guardian:dev
+docker run -d --name secret-custodian --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  -p 127.0.0.1:9090:9090 -v sg-key:/run/secrets:ro -v sg-data:/data secret-custodian:dev
 
 # 2. (compose example's route, needs root, not run here) chown the host file to the container user
 sudo chown 10001:10001 sg.key && sudo chmod 0400 sg.key
 
 # 3. no file at all: SG_MASTER_KEY (the same base64 value) and override the command without --key-file
-docker run -d --name secret-guardian -e SG_MASTER_KEY="$(cat sg.key)" -p 127.0.0.1:9090:9090 -v sg-data:/data \
-  secret-guardian:dev serve --data-dir /data --socket /data/sg.sock \
+docker run -d --name secret-custodian -e SG_MASTER_KEY="$(cat sg.key)" -p 127.0.0.1:9090:9090 -v sg-data:/data \
+  secret-custodian:dev serve --data-dir /data --socket /data/sg.sock \
   --proxy-bind 0.0.0.0:8080 --admin-bind 0.0.0.0:9090
 ```
 
@@ -70,18 +70,18 @@ unless that host directory is writable by uid 10001. Run `sg keygen` on the host
 
 **Compose.** Copy `docker-compose.example.yml` to `docker-compose.yml`, put the key where it says, and
 `docker compose up -d --build`. It builds the image, publishes the web UI on `127.0.0.1:9090` of the host only, does
-**not** publish the proxy (agents reach it as `http://secret-guardian:8080` over an internal Docker network with no
+**not** publish the proxy (agents reach it as `http://secret-custodian:8080` over an internal Docker network with no
 internet route), and runs read-only, without capabilities, with resource limits. The file validates with
 `docker compose config`.
 
 **Using it.** The CLI runs inside the container over the in-container socket:
 
 ```sh
-docker compose exec secret-guardian sg secret ls
-printf %s "$GITHUB_TOKEN" | docker compose exec -T secret-guardian sg secret add github
-docker compose exec secret-guardian sg token create --machine agent1 --role reviewer --proxy-url http://secret-guardian:8080
-docker compose exec secret-guardian sg ca export > sg-ca.pem
-docker compose exec secret-guardian sg login-url
+docker compose exec secret-custodian sg secret ls
+printf %s "$GITHUB_TOKEN" | docker compose exec -T secret-custodian sg secret add github
+docker compose exec secret-custodian sg token create --machine agent1 --role reviewer --proxy-url http://secret-custodian:8080
+docker compose exec secret-custodian sg ca export > sg-ca.pem
+docker compose exec secret-custodian sg login-url
 ```
 
 `sg login-url` prints `http://localhost:9090/#t=...`; open it in a browser on the Docker host. The URL names the port
@@ -96,10 +96,10 @@ expected, because there is no remote login and the port must stay published to `
 
 | Path | Mode | Owner | Why it matters |
 |---|---|---|---|
-| Data directory (default `$XDG_DATA_HOME/secret-guardian`, else `~/.local/share/secret-guardian`) | `0700` | the server's user | Holds the database. `sg serve` creates it `0700` (and missing parents), tightens a looser directory you own (printing `note: tightened ... to mode 0700`) and refuses one owned by someone else |
+| Data directory (default `$XDG_DATA_HOME/secret-custodian`, else `~/.local/share/secret-custodian`) | `0700` | the server's user | Holds the database. `sg serve` creates it `0700` (and missing parents), tightens a looser directory you own (printing `note: tightened ... to mode 0700`) and refuses one owned by someone else |
 | `vault.db`, `vault.db-wal`, `vault.db-shm` | `0600` | the server's user | Ciphertext plus plaintext metadata (rule hosts, names, audit). The main file is created `0600` before SQLite opens it; SQLite gives the sidecar files the same mode |
 | Key file | `0600` (**enforced**: any group/other bit is refused) | the server's user | The master key. Anyone who can read it plus the database owns all secrets |
-| Admin socket (default `$XDG_RUNTIME_DIR/secret-guardian.sock`, else `<data dir>/sg.sock`) | socket `0600` in a directory that is `0700` and owned by the server's user | the server's user | The socket **is** the admin credential. The server refuses to create it in a directory open to others, and the CLI refuses to use one |
+| Admin socket (default `$XDG_RUNTIME_DIR/secret-custodian.sock`, else `<data dir>/sg.sock`) | socket `0600` in a directory that is `0700` and owned by the server's user | the server's user | The socket **is** the admin credential. The server refuses to create it in a directory open to others, and the CLI refuses to use one |
 | Exported CA certificate (`sg ca export`) | anything | - | Public; distribute freely, but only to the agents that need it |
 
 Logging: warnings and errors go to stderr (default `RUST_LOG=warn`); only connection-level `debug` events exist beyond
@@ -122,7 +122,7 @@ was created with.
 
 | Source | How | Notes |
 |---|---|---|
-| Key file | `sg keygen --out ~/.config/secret-guardian/sg.key` once, then `sg serve --key-file <file>` (or `SG_KEY_FILE`) | Base64 of 32 random bytes, mode `0600`. Best for services and containers (Docker secret) |
+| Key file | `sg keygen --out ~/.config/secret-custodian/sg.key` once, then `sg serve --key-file <file>` (or `SG_KEY_FILE`) | Base64 of 32 random bytes, mode `0600`. Best for services and containers (Docker secret) |
 | Environment variable | `SG_MASTER_KEY=<same base64>` | Never a flag (flags show up in `ps`). Visible to the same user via `/proc/<pid>/environ`, and in `docker inspect` (verified). Prefer the file route |
 | Passphrase | `sg serve --passphrase` | Argon2id-derived. Prompted on every start (twice the first time), so it cannot run unattended; strength is the passphrase's |
 
@@ -191,7 +191,7 @@ opened normally). Do this only with the server stopped.
   changes the schema would need to bring its own migration; until one exists no upgrade path is promised.
 - Always take a [backup](#backups) before replacing the binary, and keep the previous binary.
 - Source: `git pull`, `cargo build --release -p sg --locked`, replace the binary, restart (`systemctl --user restart
-  secret-guardian`). Agents see the proxy disappear for a moment; open tunnels are dropped, and tokens, CA and rules
+  secret-custodian`). Agents see the proxy disappear for a moment; open tunnels are dropped, and tokens, CA and rules
   persist.
 - Docker: rebuild the image, `docker compose up -d --build`; the named volume keeps the data and the key stays a
   secret. `docker stop` sends `SIGTERM` and the server exits cleanly within seconds.
@@ -220,14 +220,14 @@ A user service keeps the vault running under your login (and, with lingering, wi
 `$XDG_RUNTIME_DIR` for the socket and the default data directory, and gives you `journalctl --user`.
 
 ```ini
-# ~/.config/systemd/user/secret-guardian.service
+# ~/.config/systemd/user/secret-custodian.service
 [Unit]
-Description=Secret Guardian vault (credential-injecting proxy)
+Description=Secret Custodian vault (credential-injecting proxy)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/sg serve --key-file %h/.config/secret-guardian/sg.key
+ExecStart=%h/.local/bin/sg serve --key-file %h/.config/secret-custodian/sg.key
 Restart=on-failure
 RestartSec=2
 # Files the service creates are private to the user.
@@ -249,13 +249,13 @@ WantedBy=default.target
 Set-up:
 
 ```sh
-mkdir -p ~/.config/secret-guardian ~/.local/bin ~/.config/systemd/user
-chmod 700 ~/.config/secret-guardian
+mkdir -p ~/.config/secret-custodian ~/.local/bin ~/.config/systemd/user
+chmod 700 ~/.config/secret-custodian
 install -m 0755 target/release/sg ~/.local/bin/sg
-sg keygen --out ~/.config/secret-guardian/sg.key
+sg keygen --out ~/.config/secret-custodian/sg.key
 # write the unit file above, then:
 systemctl --user daemon-reload
-systemctl --user enable --now secret-guardian
+systemctl --user enable --now secret-custodian
 sg ca status                      # works without flags: XDG_RUNTIME_DIR is set for user services
 sg login-url
 loginctl enable-linger "$USER"    # optional: keep running when logged out
@@ -287,20 +287,20 @@ flowchart LR
         AG["Agent container"]
     end
     subgraph egress["Docker network: egress"]
-        SG["secret-guardian container"]
+        SG["secret-custodian container"]
     end
     NET["Upstream APIs"]
 
-    AG -- "http://secret-guardian:8080 with token" --> SG
+    AG -- "http://secret-custodian:8080 with token" --> SG
     SG --> NET
     BR -- "127.0.0.1:9090 only" --> SG
 ```
 
-- The **proxy** (8080) is not published to the host; agent containers reach it as `http://secret-guardian:8080` over an
+- The **proxy** (8080) is not published to the host; agent containers reach it as `http://secret-custodian:8080` over an
   `internal` Docker network that has no route to the internet, so the proxy is the only way out. Create tokens with
-  `--proxy-url http://secret-guardian:8080` so the printed `HTTPS_PROXY` line is right.
+  `--proxy-url http://secret-custodian:8080` so the printed `HTTPS_PROXY` line is right.
 - The **web UI** (9090) is published to `127.0.0.1:9090` of the host only. Both ports live in the same container, so an
-  agent on the `agents` network *can* reach `secret-guardian:9090`; that is why the proxy refuses to relay to its own
+  agent on the `agents` network *can* reach `secret-custodian:9090`; that is why the proxy refuses to relay to its own
   ports, the UI checks `Host`/`Origin` and everything needs a one-time login token. Do not publish 9090 on any other
   interface.
 - If you publish the UI on another host port (`-p 127.0.0.1:19090:9090`) add `--admin-public-url http://localhost:19090`
@@ -308,8 +308,8 @@ flowchart LR
   `Host`/`Origin` allowlist, so `--admin-allowed-host` is only needed for additional names. The web listener is plain HTTP and
   `Origin` must be `http://<allowed host>`, so `--admin-public-url` rejects `https://` URLs at start-up (a TLS-terminating
   reverse proxy in front of the UI is not supported: browser writes would carry an `https://` `Origin` and be refused).
-- Run the CLI inside the container: `docker compose exec secret-guardian sg secret ls`; secrets via
-  `printf %s "$TOKEN" | docker compose exec -T secret-guardian sg secret add github`.
+- Run the CLI inside the container: `docker compose exec secret-custodian sg secret ls`; secrets via
+  `printf %s "$TOKEN" | docker compose exec -T secret-custodian sg secret add github`.
 - Hardening used by the example and verified by the Docker end-to-end script: read-only root filesystem, `tmpfs`
   `/tmp`, `cap_drop: [ALL]`, `no-new-privileges`, resource limits, non-root uid 10001.
 - **Key delivery pitfall.** The default command reads `/run/secrets/sg_key`. A Docker secret (or any bind mount) of a
@@ -321,7 +321,7 @@ flowchart LR
   ```
 
   Fixes: (a) generate the key *inside* a volume and hand it to uid 10001:
-  `docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-guardian:dev -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'`,
+  `docker run --rm --user 0 --entrypoint sh -v sg-key:/k secret-custodian:dev -c 'sg keygen --out /k/sg_key && chown 10001:10001 /k/sg_key && chmod 0400 /k/sg_key'`,
   then mount the volume read-only at `/run/secrets`; (b) `sudo chown 10001:10001 sg.key && sudo chmod 0400 sg.key` on the
   host (the compose example's route; not run here because it needs root); (c) pass `SG_MASTER_KEY` and drop `--key-file`
   from the command. Routes (a) and (c) were run and work. Also note that
@@ -473,7 +473,7 @@ strings, headers, tokens or secrets. The log grows without bound; see [pruning](
 signed) token now writes about one row per minute per token (up to ~1440 rows/day/token) until the token is replaced
 or the agent stopped; this is bounded by the number of tokens ever issued.
 
-**Server logs** go to stderr (`journalctl --user -u secret-guardian` under systemd, `docker logs` in a container).
+**Server logs** go to stderr (`journalctl --user -u secret-custodian` under systemd, `docker logs` in a container).
 The default level is `warn`; `RUST_LOG` overrides it (`RUST_LOG=debug`). The program logs very little by design: an
 upstream failure (`WARN sg_proxy::forward: upstream failure error=connect failed: Connection refused (os error 111)
 host=localhost`), failed accepts, failed audit writes and internal errors; at `debug`, dropped connections. There are

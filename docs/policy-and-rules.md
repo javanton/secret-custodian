@@ -1,6 +1,6 @@
 # Policy and rules
 
-This page explains how Secret Guardian decides what to do with a request: roles, the `Unmatched`
+This page explains how Secret Custodian decides what to do with a request: roles, the `Unmatched`
 policy, rules and their validation, host and method matching, and in detail how request paths are
 judged. Sources: `crates/policy/src/{model,store,matcher,normalize,render}.rs`,
 `crates/proxy/src/{server,forward,inject}.rs`, and the tests in `crates/policy/` and
