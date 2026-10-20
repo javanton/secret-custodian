@@ -189,7 +189,7 @@ fn get_root(addr: std::net::SocketAddr) -> String {
 fn serve_options_defaults_are_bounded() {
     let o = AdminServeOptions::default();
     assert_eq!(o.max_connections, 256);
-    assert_eq!(o.header_read_timeout, Duration::from_secs(10));
+    assert_eq!(o.header_read_timeout, Duration::from_secs(3));
     assert_eq!(o.max_connection_lifetime, Duration::from_secs(3600));
 }
 

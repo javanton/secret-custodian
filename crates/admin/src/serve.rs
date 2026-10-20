@@ -26,6 +26,9 @@ pub struct AdminServeOptions {
     /// Connections served at once; further clients wait in the kernel accept backlog.
     pub max_connections: usize,
     /// Time a client gets to send a complete request head (also between keep-alive requests).
+    /// Short, because this listener is loopback-only (effectively instant round trips): a long
+    /// timeout lets another local process exhaust `max_connections` with idle connections and
+    /// deny the web UI/API to the operator for that long, repeatably.
     pub header_read_timeout: Duration,
     /// A connection is closed this long after it was accepted, however active it is.
     pub max_connection_lifetime: Duration,
@@ -35,7 +38,7 @@ impl Default for AdminServeOptions {
     fn default() -> Self {
         Self {
             max_connections: 256,
-            header_read_timeout: Duration::from_secs(10),
+            header_read_timeout: Duration::from_secs(3),
             max_connection_lifetime: Duration::from_secs(3600),
         }
     }

@@ -23,7 +23,7 @@ and never come out; the admin crate does not call the decrypting function at all
 | Origin check | no | yes, on `POST /login` and on every write under `/api` |
 | Static UI | no | yes (`/`, `/app.js`, `/style.css`) |
 | Security headers | no | yes, on every response |
-| Connection limits | 256 concurrent, 10 s to send a request head, 1 h maximum connection lifetime | same |
+| Connection limits | 256 concurrent, 3 s to send a request head, 1 h maximum connection lifetime | same |
 
 Why two kinds of trust: a browser can be pointed at `127.0.0.1:9090` by any web page, so the web listener
 needs real authentication and request validation; a Unix socket with mode `0600` cannot be reached by a web page
