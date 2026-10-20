@@ -5,6 +5,7 @@ members = ["crates/core", "crates/policy", "crates/auth", "crates/ca", "crates/p
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [workspace.dependencies]
 sg-core = { path = "crates/core" }
@@ -36,7 +37,6 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 time = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }

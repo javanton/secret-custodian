@@ -1,7 +1,7 @@
 use crate::keys::{resolve_key, KeySource};
 use anyhow::{anyhow, bail, Context};
 use clap::Args;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use sg_admin::{
     allowed_hosts_for, bind_unix, is_loopback_bind, serve_unix_with, serve_web_with,
     AdminServeOptions, AppState, Sessions,
@@ -219,7 +219,7 @@ fn load_roots(files: &[PathBuf]) -> anyhow::Result<Vec<CertificateDer<'static>>>
     for p in files {
         let pem = std::fs::read(p).with_context(|| format!("cannot read {}", p.display()))?;
         let mut found = 0;
-        for c in rustls_pemfile::certs(&mut pem.as_slice()) {
+        for c in CertificateDer::pem_slice_iter(&pem) {
             roots.push(c.with_context(|| format!("{} is not valid PEM", p.display()))?);
             found += 1;
         }

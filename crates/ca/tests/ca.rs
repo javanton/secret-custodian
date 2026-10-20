@@ -2,7 +2,9 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, GeneralSubtree, IsCa, KeyPair,
     KeyUsagePurpose, NameConstraints,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{
+    pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+};
 use sg_ca::*;
 use sg_core::{crypto, KeyInput, Vault};
 use std::sync::Arc;
@@ -25,10 +27,8 @@ fn ca() -> (tempfile::TempDir, Arc<Vault>, CaService) {
 
 fn roots(pem: &str) -> rustls::RootCertStore {
     let mut store = rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
-        store
-            .add(CertificateDer::from(c.unwrap().to_vec()))
-            .unwrap();
+    for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        store.add(c.unwrap()).unwrap();
     }
     store
 }
@@ -187,7 +187,7 @@ fn private_key_is_not_stored_in_clear() {
 use x509_parser::prelude::*;
 
 fn pem_to_der(pem: &str) -> Vec<u8> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .unwrap()
         .unwrap()

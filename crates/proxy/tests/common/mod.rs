@@ -2,7 +2,7 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use sg_auth::TokenService;
 use sg_auth::TokenVerifier;
 use sg_ca::CaService;
@@ -517,10 +517,8 @@ pub async fn tunnel_tls(
         });
     }
     let mut roots = rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut env.ca.cert_pem().as_bytes()) {
-        roots
-            .add(CertificateDer::from(c.unwrap().to_vec()))
-            .unwrap();
+    for c in CertificateDer::pem_slice_iter(env.ca.cert_pem().as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
     }
     let mut cfg = rustls::ClientConfig::builder_with_provider(sg_ca::crypto_provider())
         .with_safe_default_protocol_versions()

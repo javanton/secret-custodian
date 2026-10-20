@@ -1,0 +1,45 @@
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = []
+
+[licenses]
+# Every license actually used by a dependency (`cargo deny list`); anything else fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    # r-efi is a UEFI-firmware binding pulled in transitively only on *-windows-* targets;
+    # we only ever build for Linux, so it is never compiled, but it is still graphed.
+    "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own workspace crates depend on each other by path with no version, which the wildcard
+# check otherwise flags; that is the normal shape of a Cargo workspace, not an unpinned dependency.
+allow-wildcard-paths = true
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
