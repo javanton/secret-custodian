@@ -153,7 +153,7 @@ se confirma en el plan.
    excepciones (tampoco `localhost`, ni con puerto explícito); un host sin reglas sigue la política
    del rol (6.4) y, bajo `passthrough`, se reenvía sin inyección.
 8. Un CONNECT o una petición de forma absoluta mal formados (`400`) de un agente autenticado se
-   auditan con decisión `bad-request` y la identidad; la autenticación fallida (`407`) no escribe nada.
+   auditan con decisión `bad-request` y la identidad; la autenticación fallida (`407`) no escribe nada, salvo un token con firma válida pero revocado o caducado (ver §8).
 
 ### 6.2 Reglas
 
@@ -427,7 +427,13 @@ bloque de su primera regla (obligatorio) y «Add another rule».
 - `tracing` estructurado; los valores secretos y los tokens nunca se registran.
 - El audit log se escribe de forma síncrona cuando se ha recibido la cabecera de respuesta del
   destino y antes de devolverla al agente (si el proxy rechaza la petición, antes de devolver el
-  rechazo). No se escribe fila de audit para la autenticación fallida (`407`); los destinos CONNECT o de
+  rechazo). Los fallos de autenticación (`407`) no se auditan, salvo el de un token con firma y emisor
+  válidos pero revocado o caducado: decisión `token-invalid`, estado `407`, con la identidad del
+  token (`jti`, máquina, rol) y como mucho una fila por `jti` cada 60 s (mapa en memoria acotado
+  a 4096 entradas; si está lleno de entradas vigentes, un `jti` nuevo no se audita). Un cliente
+  anónimo (sin token, mal formado, firma o emisor incorrectos, `jti` desconocido) no puede por
+  tanto llenar el audit. La respuesta es idéntica a cualquier otro `407` (no hay oráculo entre
+  «revocado» e «inválido»). Los destinos CONNECT o de
   forma absoluta mal formados (`400`) de un agente autenticado se auditan como `bad-request` con
   su identidad. Si la escritura del audit falla, se registra
   en el log y no bloquea una petición ya reenviada. Los cuerpos de respuesta truncados se

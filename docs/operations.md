@@ -367,7 +367,8 @@ sg --json audit --limit 1000 | jq -r 'group_by(.decision)[] | "\(.[0].decision)\
 ```
 
 The decisions and what they mean are in [proxy-internals.md](proxy-internals.md#audit-decisions). Failed authentication
-(`407` at CONNECT) writes **no** row; use the agent-side error and `curl -v` for those. Rows never contain query
+(`407`) writes **no** row, except for a validly signed token that is revoked or expired (`token-invalid`, at most one
+row per token per 60 s); for the rest use the agent-side error and `curl -v`. Rows never contain query
 strings, headers, tokens or secrets. The log grows without bound; see [pruning](#backups).
 
 **Server logs** go to stderr (`journalctl --user -u secret-guardian` under systemd, `docker logs` in a container).

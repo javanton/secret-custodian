@@ -57,9 +57,9 @@ Counts are `passed` per binary from the workspace run (unit tests are the `src/`
 |---|---|---|---|
 | `sg-core` | 20 | `audit` (10), `vault` (24) | 54 |
 | `sg-policy` | 58 (+1 ignored) | `conn_api` (3), `policy` (20) | 81 (+1 ignored) |
-| `sg-auth` | 4 | `tokens` (30) | 34 |
+| `sg-auth` | 4 | `tokens` (32) | 36 |
 | `sg-ca` | 0 | `ca` (37) | 37 |
-| `sg-proxy` | 14 | `connect` (20), `hardening` (12), `inject` (26), `limits` (18), `netpolicy` (13), `no_leaks` (1), `plain_and_streaming` (29), `review_fixes` (10) | 143 |
+| `sg-proxy` | 19 | `auth_audit` (7), `connect` (20), `hardening` (12), `inject` (26), `limits` (18), `netpolicy` (13), `no_leaks` (1), `plain_and_streaming` (29), `review_fixes` (10) | 155 |
 | `sg-admin` | 2 | `api` (28), `hygiene` (2), `ops` (3), `serve` (14), `sessions` (11), `web_assets` (5, one of which runs the 13 `node` tests), `web_guard` (17) | 82 |
 | `sg-cli` | 20 | `client` (8), `run` (36) | 64 |
 | `sg` | 13 | `cli_e2e` (14) | 27 |
@@ -78,6 +78,9 @@ Counts are `passed` per binary from the workspace run (unit tests are the `src/`
 - **`sg-ca`**: name constraints verified by a real rustls client (forged leaf outside the domains refused, forged IP
   leaf refused), domain validation, probe, re-issue with the same key, leaf cache bound and validity.
 - **`sg-proxy`**:
+  - `auth_audit`: a revoked or expired signed token is audited once (`token-invalid`, 407) with its identity; garbage,
+    foreign-key, `alg=none`, wrong-issuer, unknown-jti, missing, duplicate and oversized credentials write no row; the
+    407 is byte-identical in every case; one row per `jti` per interval; plain HTTP is audited and not forwarded.
   - `connect`: 407/403/502/400 paths, passthrough, IPv6 literals, concurrent tunnels, audit before response, no echo of
     tokens or secret names, oversized or duplicate `Proxy-Authorization`, header timeout, connection cap.
   - `inject`: header and query injection, agent credentials discarded, restricted-path traversal cases, normalized

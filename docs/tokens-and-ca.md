@@ -61,6 +61,8 @@ also checks that the role exists (`unknown role`).
    (test `expiry_is_evaluated_before_the_revocation_lookup`).
 7. Look up `revoked_at` by `jti` in `tokens`: no row gives `Invalid` (a correctly signed token whose row is missing is
    not accepted), a non-null `revoked_at` gives `Revoked`, otherwise the `Identity` is returned.
+   `Expired` and `Revoked` carry the `Identity` of the verified claims, only so the proxy can audit the refusal; it is
+   never used as a session.
 
 So verification is offline except for that one `SELECT` by `jti`. The `role` and `sub` that become the identity
 come from the signed claims, not from the row. `tokens.token_hash` is not consulted.
@@ -91,7 +93,7 @@ come from the signed claims, not from the row. `tokens.token_hash` is not consul
 The proxy adds its own bounds before calling it (`server.rs`, `authenticate`): there must be exactly one
 `Proxy-Authorization` header (duplicates give `407`), at most 8 KiB (`MAX_PROXY_AUTH_LEN`), and the value
 must be a valid header string. Any failure is `407 Proxy Authentication Required` with
-`Proxy-Authenticate: Basic realm="secret-guardian"`, and no audit row is written. A `403` is returned only
+`Proxy-Authenticate: Basic realm="secret-guardian"`, and no audit row is written (the one exception is a validly signed token that is revoked or expired: `token-invalid`, rate limited to one row per `jti` per 60 s, with a response identical to any other `407`). A `403` is returned only
 once the token is valid but the role does not exist or the host is denied.
 
 ### 1.6 What is stored

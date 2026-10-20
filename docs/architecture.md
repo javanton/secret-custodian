@@ -163,7 +163,7 @@ sequenceDiagram
     P->>Au: extract_proxy_token, verify(token)
     Au->>V: SELECT revoked_at FROM tokens WHERE jti
     Au-->>P: Identity (jti, machine, role)
-    Note over P: no or bad token: 407, no audit row
+    Note over P: no or bad token: 407, no audit row (revoked or expired signed token: AUDIT token-invalid, rate limited)
     P->>Po: get_role(role), list_rules(role), has_rules_for_host(host)
     P->>C: is_host_permitted(host)
     P->>V: AUDIT decision=mitm status=200
@@ -197,7 +197,9 @@ Step notes (all from the cited files):
 1. **Authentication** (`server.rs`, `authenticate`): exactly one `Proxy-Authorization` header, at most
    8 KiB, parsed by `sg_auth::extract_proxy_token`, then `TokenVerifier::verify`. Any failure returns
    `407` with `Proxy-Authenticate: Basic realm="secret-guardian"`. **No audit row is written for a
-   failed authentication** (there is no identity to attribute it to). A request that is not CONNECT
+   failed authentication** (there is no identity to attribute it to), except for a validly signed token that is
+   revoked or expired: `token-invalid`, 407, at most one row per `jti` per 60 s (see
+   [proxy-internals.md](proxy-internals.md#audit-decisions)). A request that is not CONNECT
    is handled as plain HTTP (`server.rs`, `plain`): credentials are never injected into it, so it is either
    forwarded untouched (host without rules under a `passthrough` role) or refused; see
    [proxy-internals.md](proxy-internals.md#plain-http-absolute-form).

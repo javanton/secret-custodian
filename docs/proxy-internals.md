@@ -18,7 +18,7 @@ of two ways, and nothing else is accepted:
 ```mermaid
 flowchart TD
     A["Agent request"] --> B{"Valid Proxy-Authorization?"}
-    B -- "no" --> R407["407, no audit row"]
+    B -- "no" --> R407["407; audit row only for a revoked or expired signed token"]
     B -- "yes" --> C{"CONNECT or absolute http?"}
     C -- "CONNECT" --> D{"Role exists and target well formed?"}
     D -- "no" --> R4["400 or 403, audited"]
@@ -65,7 +65,10 @@ Authentication happens first, on every request the proxy listener receives (CONN
 3. The token is verified (`TokenService::verify`): signature first, then issuer, then expiry, then the database
    lookup of the token id for revocation. Details: [tokens-and-ca.md](tokens-and-ca.md#13-verification-order).
 4. Any failure is `407 Proxy Authentication Required`, header `Proxy-Authenticate: Basic realm="secret-guardian"`,
-   body `proxy authentication required`. **No audit row is written** (there is no identity to attribute it to).
+   body `proxy authentication required`. The response is byte-identical for every failure, so a client cannot tell "revoked" from "invalid". **No audit
+   row is written**, with one exception: a token whose signature and issuer are valid but that is revoked or expired
+   is audited as `token-invalid` (407), see [Audit decisions](#audit-decisions). The identity read from such a token
+   is used only for that row; it never becomes a session.
 
 **Per-request revocation.** The raw token is kept for the life of a MITM tunnel and **verified again before every
 inner request**. A revoked or expired token gets `407` (audit `token-invalid`, with the identity) and the tunnel is
@@ -292,7 +295,15 @@ The last row is why an agent cannot use the proxy to reach the admin web UI or t
 
 Every `decision` string the proxy can write (found by grepping `crates/proxy/src`), with the HTTP status recorded and
 what it means. The host column of an audit row is the CONNECT target or the request host; `path` has no query string
-(for CONNECT rows it is `/`). Authentication failures (`407` at CONNECT) are never audited.
+(for CONNECT rows it is `/`). Authentication failures (`407`, CONNECT or plain HTTP) are not audited, with one exception: a token validly signed
+by this vault (signature and issuer verified) that is revoked or expired is audited as `token-invalid`, with the
+token's `jti`, machine and role, `method` as sent (`CONNECT` for tunnels), the host the request declared (untrusted,
+truncated to 255 characters) and path `/`. This is rate limited to **one row per `jti` per 60 s**
+(`ServeOptions::auth_audit_interval`), tracked in an in-memory map of at most **4096** jtis; entries older than the
+interval are evicted to make room, and if the map is full of entries still inside their interval a *new* jti is not
+audited (bounded memory beats completeness). Anonymous failures (missing, duplicate, oversized or malformed
+credentials, wrong signature or issuer, unknown jti) stay unaudited on purpose: an unauthenticated client must not be
+able to fill the audit log.
 
 | Decision | Status | Where | Meaning |
 |---|---|---|---|
@@ -307,7 +318,7 @@ what it means. The host column of an audit row is the CONNECT target or the requ
 | `target-denied` | 403 | CONNECT, inside a tunnel, plain HTTP | Network policy refused the destination address |
 | `identity-limit` | 429 | CONNECT, inside a tunnel | The token holds the maximum number of tunnels (64) or concurrent upstream requests (64) |
 | `bad-request` | 400 | CONNECT, plain HTTP | Malformed target from an authenticated agent (`host` may be the unparsed hint, truncated to 255 characters) |
-| `token-invalid` | 407 | inside a tunnel | The token was revoked or expired while the tunnel was open; the tunnel is closed |
+| `token-invalid` | 407 | at request time, or inside a tunnel | A validly signed token that is revoked or expired: at CONNECT or on a plain request (rate limited, one row per `jti` per 60 s), or while a tunnel was open (every time; the tunnel is closed) |
 | `method-refused` | 405 | inside a tunnel / plain | `TRACE`, `TRACK` or `CONNECT` |
 | `host-mismatch` | 421 | inside a tunnel / plain | `Host` or authority differs from the CONNECT target |
 | `forbidden` | 403 | inside a tunnel / plain | No rule authorises this method and path, or `COPY`/`MOVE` without an explicit method |
@@ -335,7 +346,7 @@ name or a rule.
 | 403 | `refusing to inject credentials over plain HTTP` | plain request to a host with an applicable rule | `plaintext-refused` |
 | 403 | `destination not allowed` | network policy | `target-denied` |
 | 405 | `method not allowed` | TRACE, TRACK, CONNECT inside a tunnel | `method-refused` |
-| 407 | `proxy authentication required` | missing, duplicate, oversized, malformed or invalid credentials (with `Proxy-Authenticate`); and token revoked mid-tunnel (no header) | none / `token-invalid` |
+| 407 | `proxy authentication required` | missing, duplicate, oversized, malformed or invalid credentials (with `Proxy-Authenticate`); a revoked or expired token gets the same response; and token revoked mid-tunnel (no header) | none, or `token-invalid` for a revoked or expired signed token |
 | 421 | `Host does not match the CONNECT target` | host consistency | `host-mismatch` |
 | 429 | `too many open tunnels for this token` / `too many concurrent requests for this token` (with `Retry-After: 1`) | per-identity budgets | `identity-limit` |
 | 502 | `the CA does not permit <host>; its domains follow the rules: re-create the rule or restart `sg serve`, then reload the CA certificate` | CONNECT to a ruled host the CA does not permit | `ca-not-permitted` |
