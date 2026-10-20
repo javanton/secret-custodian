@@ -6,13 +6,14 @@ key into the request on the way out. The agent never holds the key, never sees i
 Rust binary (or one Docker image) with a CLI, an admin API and a small local web UI, and it keeps everything in a
 single encrypted SQLite file.
 
-Status: phase 1 is complete and tested (see [Status](#status)). There is no license file yet (see [License](#license)).
+Status: phase 1 is complete and tested (see [Status](#status)). [MIT licensed](LICENSE). Linux only.
 
 ## Contents
 
 - [Why](#why)
 - [How it works](#how-it-works)
 - [Try it](#try-it) — build and run the verified [quickstart](docs/quickstart.md)
+- [Install](#install) — pre-built binary, or build from source
 - [Configure an agent](#configure-an-agent) — trust the CA, set the proxy ([full guide](docs/operations.md#trusting-the-ca-on-agents))
 - [Docker](#docker) ([full guide](docs/operations.md#docker))
 - [CLI and web UI](#cli-and-web-ui) ([CLI reference](docs/cli-reference.md), [admin API](docs/admin-api.md))
@@ -79,6 +80,30 @@ trust its CA ([next section](#configure-an-agent)).
 upstream, with the exact output, roles with different permissions, a refused request, and the audit log proving the
 agent never saw the secret.
 
+## Install
+
+Pre-built binaries are attached to each [release](https://gitlab.habbi.cc/own-projects/secret-guardian/-/releases): a
+**static Linux x86_64 binary** (musl), so it runs on any Linux distribution, including Alpine and minimal containers.
+Other platforms are not built; compile from source (above).
+
+```sh
+VERSION=0.1.0   # see the releases page for the latest
+BASE="https://gitlab.habbi.cc/api/v4/projects/own-projects%2Fsecret-guardian/packages/generic/secret-guardian/$VERSION"
+curl -fLO "$BASE/sg-v$VERSION-x86_64-linux.tar.gz"
+curl -fLO "$BASE/SHA256SUMS"
+sha256sum -c SHA256SUMS                       # must print: sg-v0.1.0-x86_64-linux.tar.gz: OK
+tar xzf "sg-v$VERSION-x86_64-linux.tar.gz"
+install -m 0755 "sg-v$VERSION-x86_64-linux/sg" ~/.local/bin/sg
+```
+
+Most Linux systems already ship an unrelated `/usr/bin/sg` (from shadow-utils: "run a command with another group").
+Make sure `~/.local/bin` comes first in your `PATH` (check with `which -a sg`), or install the binary under another
+name such as `sgv`.
+
+The release also publishes a Docker image as `:vX.Y.Z` and `:latest` (see [Docker](#docker)). The checksum file
+protects against a corrupted download, not against a compromised release page: for that, build from source and
+compare. [docs/releasing.md](docs/releasing.md) documents the pipeline that produces these.
+
 ## Configure an agent
 
 Give each agent process three things: the proxy URL with its token, the vault CA certificate, and (if needed) the
@@ -144,6 +169,7 @@ Full threat model, attacker analysis and the complete limitations list: [docs/se
 | [docs/security-model.md](docs/security-model.md) | Assets, attackers, mitigations, residual risks, hardening history, checklist |
 | [docs/operations.md](docs/operations.md) | Install, permissions, keys, backups, upgrades, systemd, Docker, trusting the CA, troubleshooting |
 | [docs/dependency-hygiene.md](docs/dependency-hygiene.md) | `cargo-deny`/`cargo-audit` configuration, what they check, how to run them locally |
+| [docs/releasing.md](docs/releasing.md) | CI pipeline, publishing a version, the static binary, package registry and Docker image |
 | [docs/testing.md](docs/testing.md) | Test strategy, inventory, end-to-end scripts, known gaps |
 | [docs/architecture.md](docs/architecture.md) | Crates, request sequence, concurrency, design decisions |
 | [docs/database-schema.md](docs/database-schema.md) | Tables, columns, permissions, WAL, backup |
@@ -197,5 +223,4 @@ verifier with per-agent tokens; injection into request bodies and request signin
 
 ## License
 
-There is no `LICENSE` file in this repository yet, so no license is granted: all rights are reserved by default until the author
-adds one. If you want to use or contribute to the project, ask first.
+[MIT](LICENSE), copyright (c) 2026 Javier Anton.

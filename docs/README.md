@@ -30,6 +30,7 @@ how to configure an agent), then the page for your role below.
 |---|---|
 | [testing.md](testing.md) | Test strategy, inventory per crate (542 tests), what the end-to-end scripts assert, how the security regression tests are organised, how to add tests, known gaps. |
 | [dependency-hygiene.md](dependency-hygiene.md) | `cargo-deny`/`cargo-audit` configuration, what they check, how to run them locally. |
+| [releasing.md](releasing.md) | The CI pipeline, how to publish a version (tag `vX.Y.Z`), the static musl binary, package registry, release and Docker image, building the package locally. |
 | [Spec](specs/2026-10-16-secret-guardian-vault.md) | Approved-for-review design: purpose, threat model, storage, tokens, proxy, CA, admin, phases (in Spanish). Where it differs from the code, the code wins. |
 | [Plan](plans/2026-10-16-secret-guardian-vault.md) | Step-by-step implementation plan for phase 1 (in Spanish); a historical reference. |
 

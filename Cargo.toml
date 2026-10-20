@@ -5,6 +5,7 @@ members = ["crates/core", "crates/policy", "crates/auth", "crates/ca", "crates/p
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]
