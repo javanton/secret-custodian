@@ -63,11 +63,30 @@ fn decode_unreserved(segment: &str) -> String {
     out
 }
 
+/// Applies `decode_unreserved` to its own output until it stops changing. A single pass can leave
+/// a literal (undecoded) `%` directly before characters produced by decoding a *later*, genuinely
+/// separate escape; concatenated, those characters can read as a brand-new `%XX` escape that
+/// never existed as one in the input (e.g. `"%2%65"` -> one pass -> `"%2e"`, which still decodes
+/// further to `"."`). Each round either leaves the string unchanged (done) or decodes at least one
+/// `%XX` into a single character, strictly shrinking the string by 2 bytes, so this always
+/// terminates in at most `segment.len() / 2` rounds and the result cannot be re-decoded by a
+/// further round, which is what makes `normalize_path` idempotent.
+fn decode_unreserved_fixpoint(segment: &str) -> String {
+    let mut current = segment.to_string();
+    loop {
+        let next = decode_unreserved(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
 /// Resolves `.`/`..`, decodes escapes of unreserved characters, collapses `//`. Encoded `/` stays encoded.
 pub fn normalize_path(path: &str) -> String {
     let mut segs: Vec<String> = Vec::new();
     for raw in path.split('/') {
-        let seg = decode_unreserved(raw);
+        let seg = decode_unreserved_fixpoint(raw);
         match seg.as_str() {
             "" | "." => {}
             ".." => {
@@ -326,6 +345,49 @@ mod tests {
     fn non_ascii_after_percent_does_not_panic() {
         assert_eq!(normalize_path("/%é"), "/%é");
         assert_eq!(normalize_path("/é%e"), "/é%e");
+    }
+
+    #[test]
+    fn decoding_cannot_assemble_a_new_escape() {
+        for p in [
+            "%2%65",
+            "/api/v1/%2%65%2e/admin",
+            "/%2%65%2e",
+            "/a%%32e",
+            "%2%65%2e%65",
+        ] {
+            let once = normalize_path(p);
+            let twice = normalize_path(&once);
+            assert_eq!(
+                twice, once,
+                "not idempotent for {p:?}: {once:?} -> {twice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_examples_hold() {
+        assert_eq!(normalize_path("/repos/../admin"), "/admin");
+        assert_eq!(normalize_path("/repos/%2e%2e/admin"), "/admin");
+        assert_eq!(normalize_path("//repos///x"), "/repos/x");
+        assert_eq!(normalize_path("/a%2Fb"), "/a%2Fb");
+        assert_eq!(normalize_path("/%41pi"), "/Api");
+        assert_eq!(normalize_path("/repos/%2e%2e%2f.."), "/repos/..%2f..");
+        assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn large_percent_run_does_not_blow_up() {
+        let input = "%".repeat(8192);
+        let start = std::time::Instant::now();
+        let once = normalize_path(&input);
+        let twice = normalize_path(&once);
+        assert_eq!(twice, once);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "took too long: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

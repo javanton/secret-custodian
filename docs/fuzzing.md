@@ -57,12 +57,6 @@ Turn the minimised input into a regular unit test next to the code under test, t
    corpus growth from runs is git-ignored.
 4. Keep an iteration cheap (cap sizes) and assert real invariants, not just "does not panic".
 
-## Known failing invariant
-
-`normalize_path` currently fails its idempotence assertion (for example the input `%2%65`, a 5-byte input). Until that is fixed, `scripts/fuzz.sh` exits
-non-zero on that target. To explore the remaining invariants meanwhile, run the target with
-`SG_FUZZ_SKIP_IDEMPOTENCE=1`.
-
 ## Limits
 
 - Fuzzing finds inputs that violate an assertion or crash; it cannot prove their absence. A clean run

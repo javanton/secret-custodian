@@ -18,10 +18,6 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
-    // SG_FUZZ_SKIP_IDEMPOTENCE=1 lets a run get past the known non-idempotence (report finding
-    // F-1, e.g. "/%2%65") to keep exploring the other invariants.
-    if std::env::var_os("SG_FUZZ_SKIP_IDEMPOTENCE").is_none() {
-        let twice = normalize_path(&once);
-        assert_eq!(twice, once, "not idempotent for {input:?}");
-    }
+    let twice = normalize_path(&once);
+    assert_eq!(twice, once, "not idempotent for {input:?}");
 });
